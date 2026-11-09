@@ -1,0 +1,77 @@
+# artifacts Helm chart — EXAMPLE values. Replace every placeholder with your own.
+# Nothing in this file points at a real deployment.
+
+# ---- login (oauth2-proxy) --------------------------------------------------------------
+# Digest-pinned image; any OIDC provider works (the example issuer below is Entra).
+image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1@sha256:f6a4aa83a27e316114bf79664302b1ffb2cc8ce697fb479273af4feb3fb16fe3
+# OIDC issuer. Example: a single-tenant Entra app with a placeholder tenant id.
+oidcIssuer: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0
+# Keys client-id, client-secret, cookie-secret. Create out of band; never in git.
+secretName: oauth2-proxy-artifacts
+cookieExpire: 8h
+cookieCsrfExpire: 1h        # login -> callback window (CSRF cookie)
+oidcPrompt: select_account  # show the account picker; avoids silent 403 on shared browsers
+
+# ---- the artifacts host ---------------------------------------------------------------
+artifactsHost: artifacts.example.com
+# Extra hostnames served with the same routes (e.g. a future public name).
+artifactsExtraHosts: []
+
+# Set true when this host becomes reachable from the public internet. The chart REFUSES
+# to render with publicExposure=true and artifactsGate.anonymousPubEnabled=true at the
+# same time: anonymous pub/ is only safe on a host that is not publicly reachable.
+publicExposure: false
+
+# Namespaces the chart deploys into (routes live with the MinIO service because that is
+# where the IngressRoute TLS secrets are).
+namespaces:
+  sso: sso
+  minio: minio
+
+# ---- MinIO ----------------------------------------------------------------------------
+minio:
+  namespace: minio
+  service: minio
+  port: 9000
+  bucket: artifacts
+  tlsSecret: artifacts-minio-tls       # cert for the MinIO service (used by the old host pattern; optional)
+  gateTlsSecret: artifacts-gate-tls    # cert served on the artifacts host routes
+
+# ---- artifact-gate --------------------------------------------------------------------
+artifactsGate:
+  # Serve <bucket>/pub/ anonymously (straight from MinIO, no login). Safe ONLY while the
+  # host is not publicly reachable. Keep false for any public host. See README.
+  anonymousPubEnabled: false
+
+gate:
+  # The gate code itself is mounted from ConfigMap <sso>/artifact-gate-code, recreated
+  # from gate/gate.py on every deploy, e.g.:
+  #   kubectl -n sso create configmap artifact-gate-code --from-file=gate/gate.py \
+  #     --dry-run=client -o yaml | kubectl apply -f -
+  image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
+  # forwardAuth decision listener: the gate serves /_gate/auth and /_gate/plugin/authz
+  # ONLY on this port, which no public route points at. The public surface stays on 8080.
+  authPort: 8081
+  s3SecretName: artifact-gate-s3        # keys access-key, secret-key (least-privilege gate user)
+  keysSecretName: artifact-gate-keys    # key hmac-key (signs CSRF + approve/deny tokens)
+  slackSecretName: artifact-gate-slack  # key bot-token (optional; gate logs instead if absent)
+
+# ---- plugins (docs/plugins.md) ----------------------------------------------------------
+# Each entry renders one route on the artifacts host and gets the bucket prefix
+# _plugins/<name>/ with its own least-privilege S3 user (created by the bootstrap Job
+# from the Secret plugin-<name>-s3, keys access-key/secret-key).
+# Example:
+#   plugins:
+#     - name: canvas
+#       pathPrefix: /_canvas/     # must start with /_
+#       service: artifact-canvas
+#       port: 8080
+#       namespace: sso            # optional; defaults to namespaces.sso
+plugins: []
+
+# ---- bootstrap Job (bucket, ILM, policies, users) ---------------------------------------
+bootstrap:
+  enabled: true
+  image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+  # MinIO admin credentials the Job uses (keys access-key/secret-key, in namespaces.minio).
+  adminSecretName: minio-bootstrap-admin

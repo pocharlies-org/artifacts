@@ -1,0 +1,114 @@
+{{- /* The login proxy for the artifacts host. Same image and hardening as a classic
+       oauth2-proxy deployment, but NO --allowed-group: ANY user of the IdP gets a session
+       here; who reads what is decided per artifact by artifact-gate (gate/gate.py) from the
+       artifact's .acl.json. Own prefix, redirect URL and cookie so its callback never lands
+       on another proxy (and vice versa). */ -}}
+{{- $sso := .Values.namespaces.sso }}
+{{- $slug := "artifacts" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy-{{ $slug }}
+  namespace: {{ $sso }}
+  labels:
+    app.kubernetes.io/name: oauth2-proxy
+    app.kubernetes.io/instance: {{ $slug }}
+    app.kubernetes.io/part-of: artifacts
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: oauth2-proxy
+      app.kubernetes.io/instance: {{ $slug }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: oauth2-proxy
+        app.kubernetes.io/instance: {{ $slug }}
+        app.kubernetes.io/part-of: artifacts
+    spec:
+      automountServiceAccountToken: false   # oauth2-proxy never talks to the Kubernetes API
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: oauth2-proxy
+          image: {{ .Values.image }}
+          args:
+            - --provider=oidc
+            - --oidc-issuer-url={{ .Values.oidcIssuer }}
+            # --email-domain=* is NOT an open door: the real boundary is the IdP the issuer URL
+            # pins (in the Entra example, a SINGLE-TENANT app, so only accounts of that tenant can
+            # ever complete a login here). If the app registration is ever made multi-tenant (or
+            # the issuer swapped for a common/multi-tenant endpoint), tighten --email-domain to the
+            # tenant's verified domain(s) BEFORE that change ships.
+            - --email-domain=*
+            - --oidc-email-claim=preferred_username
+            - --oidc-groups-claim=groups
+            # no --allowed-group: IdP membership is the gate's "signed in" test; the artifact ACL decides access
+            - --scope=openid email profile
+            - --code-challenge-method=S256
+            - --proxy-prefix=/oauth2-{{ $slug }}
+            - --redirect-url=https://{{ .Values.artifactsHost }}/oauth2-{{ $slug }}/callback
+            # host-only cookie (no --cookie-domain); redirects (rd=) accepted only to this host
+            - --whitelist-domain={{ .Values.artifactsHost }}
+            - --cookie-secure=true
+            - --cookie-name=_oauth2_proxy_{{ $slug }}
+            - --cookie-samesite=lax
+            - --cookie-expire={{ .Values.cookieExpire }}
+            - --cookie-csrf-expire={{ .Values.cookieCsrfExpire }}
+            - --reverse-proxy=true
+            - --set-xauthrequest=true
+            - --pass-access-token=false
+            - --skip-provider-button=true
+            - --prompt={{ .Values.oidcPrompt }}
+            - --http-address=0.0.0.0:4180
+            - --upstream=static://202
+            - --silence-ping-logging=true
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: client-id}
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: client-secret}
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.secretName }}, key: cookie-secret}
+          ports:
+            - {name: http, containerPort: 4180, protocol: TCP}
+          livenessProbe:
+            httpGet: {path: /ping, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /ping, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy-{{ $slug }}
+  namespace: {{ $sso }}
+  labels:
+    app.kubernetes.io/name: oauth2-proxy
+    app.kubernetes.io/instance: {{ $slug }}
+    app.kubernetes.io/part-of: artifacts
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: oauth2-proxy
+    app.kubernetes.io/instance: {{ $slug }}
+  ports:
+    - {name: http, port: 4180, targetPort: http, protocol: TCP}

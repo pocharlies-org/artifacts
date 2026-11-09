@@ -1,0 +1,102 @@
+# artifacts — local dev stack: MinIO + artifact-gate + Dex (OIDC) + oauth2-proxy + Caddy.
+# Everything on http://127.0.0.1 (Caddy on :8080). Laptop-only; the credentials here are
+# fixed dev placeholders, never for a real deployment.
+#
+#   docker compose up -d
+#   docker compose up bootstrap          # one-shot: bucket, ILM, anonymous pub/
+#   ./e2e.sh                             # full end-to-end (publish, reads, negatives)
+name: artifacts
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "127.0.0.1:9000:9000"    # S3 API (the publisher writes here)
+      - "127.0.0.1:9001:9001"    # console
+    volumes: [minio-data:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  bootstrap:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on: {minio: {condition: service_healthy}}
+    entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+    volumes:
+      - ./bootstrap.sh:/bootstrap/bootstrap.sh:ro
+    restart: "no"
+
+  dex:
+    image: dexidp/dex:v2.41.1
+    command: ["dex", "serve", "/dex/config.yaml"]
+    environment:
+      # Dex issuer must match what oauth2-proxy validates against. host.docker.internal
+      # is reachable from the containers (Docker Desktop) and from the host via :5556.
+      DEX_ISSUER: http://host.docker.internal:5556/dex
+    ports:
+      - "127.0.0.1:5556:5556"
+    volumes:
+      - ./config/dex-config.yaml:/dex/config.yaml:ro
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+    command:
+      - --provider=oidc
+      - --oidc-issuer-url=http://host.docker.internal:5556/dex
+      - --email-domain=*
+      - --oidc-email-claim=preferred_username
+      - --oidc-groups-claim=groups
+      - --scope=openid email profile groups
+      - --code-challenge-method=S256
+      - --client-id=artifacts-dev
+      - --client-secret=artifacts-dev-secret-not-a-real-secret
+      - --cookie-secret=dev-cookie-secret-0123456789abcdef
+      - --cookie-secure=false
+      - --cookie-name=_oauth2_proxy_artifacts
+      - --cookie-samesite=lax
+      - --proxy-prefix=/oauth2
+      - --redirect-url=http://127.0.0.1:8080/oauth2/callback
+      - --whitelist-domain=127.0.0.1:8080
+      - --reverse-proxy=true
+      - --set-xauthrequest=true
+      - --skip-provider-button=true
+      # the e2e authenticates with an id_token as Authorization: Bearer instead of a
+      # browser cookie; the proxy validates it against the same issuer.
+      - --skip-jwt-bearer-tokens=true
+      - --http-address=0.0.0.0:4180
+      - --upstream=static://202
+    depends_on: [dex]
+
+  gate:
+    image: python:3.12-slim
+    command: ["python3", "/app/gate.py"]
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      GATE_BUCKET: artifacts
+      OAUTH2_AUTH_URL: http://oauth2-proxy:4180/oauth2/auth
+      PUBLIC_HOST: 127.0.0.1:8080
+      GATE_ANONYMOUS_PUB_ENABLED: "true"
+      GATE_AUTH_PORT: "8081"
+      HMAC_KEY_FILE: /secrets/hmac-key
+    volumes:
+      - ../../gate/gate.py:/app/gate.py:ro
+      - ./secrets/dev-hmac-key:/secrets/hmac-key:ro
+    depends_on: {minio: {condition: service_healthy}}
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on: [gate, oauth2-proxy]
+
+volumes:
+  minio-data: {}

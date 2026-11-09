@@ -1,0 +1,41 @@
+{{- /* Plugin routes (docs/plugins.md §2): one route per enabled plugin, on the artifacts
+       host. The core never proxies plugin traffic itself — traefik sends matching requests
+       straight to the plugin service. A plugin's pathPrefix must start with `/_` so it can
+       never shadow an artifact path (`/<bucket>/...`), the gate surface (`/_gate/`) or the
+       login surface (`/oauth2-artifacts/`). */ -}}
+{{- $m := .Values.minio }}
+{{- $hosts := prepend (default (list) .Values.artifactsExtraHosts) .Values.artifactsHost }}
+{{- $hm := list }}
+{{- range $h := $hosts }}{{ $hm = append $hm (printf "Host(`%s`)" $h) }}{{ end }}
+{{- $hostMatch := printf "(%s)" (join " || " $hm) }}
+{{- range $p := .Values.plugins }}
+{{- $name := required "each plugin needs a name" $p.name }}
+{{- $prefix := required (printf "plugin %s needs a pathPrefix (e.g. /_%s/)" $name $name) $p.pathPrefix }}
+{{- if not (hasPrefix "/_" $prefix) }}
+  {{- fail (printf "plugin %s: pathPrefix must start with /_ (got %s) so it cannot shadow artifact, gate or login paths" $name $prefix) }}
+{{- end }}
+{{- if or (eq $prefix "/_gate/") (eq $prefix "/_gate") (eq $prefix "/_plugins/") (eq $prefix "/_plugins") (eq $prefix "/oauth2-artifacts/") }}
+  {{- fail (printf "plugin %s: pathPrefix %s collides with a reserved core path" $name $prefix) }}
+{{- end }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: artifacts-plugin-{{ $name }}
+  namespace: {{ $m.namespace }}
+  labels:
+    app.kubernetes.io/part-of: artifacts
+    artifacts.pocharlies.org/plugin: {{ $name }}
+spec:
+  entryPoints: [websecure]
+  tls:
+    secretName: {{ $m.gateTlsSecret }}
+  routes:
+    - kind: Rule
+      priority: 700
+      match: {{ $hostMatch }} && PathPrefix(`{{ $prefix }}`)
+      services:
+        - name: {{ required (printf "plugin %s needs a service" $name) $p.service }}
+          namespace: {{ default $.Values.namespaces.sso $p.namespace }}
+          port: {{ required (printf "plugin %s needs a port" $name) $p.port }}
+{{- end }}

@@ -1,0 +1,23 @@
+# Dex for the local dev stack: one static user, password grant enabled so the e2e can
+# obtain an id_token without a browser. The password is a fixed dev placeholder.
+issuer: ${DEX_ISSUER}
+storage:
+  type: memory
+web:
+  http: 0.0.0.0:5556
+oauth2:
+  clientID: artifacts-dev
+  clientSecret: artifacts-dev-secret-not-a-real-secret
+enablePasswordDB: true
+staticPasswords:
+  - email: "test@example.com"
+    # bcrypt of "test-password" (dev only)
+    hash: "$2a$10$jBIY5t1en/2umGuVZX/EZOFaR17ROfctS1iFlRQM0osvj7Et/vrNS"
+    username: "test"
+    userID: "11111111-2222-4333-8444-555555555555"
+staticClients:
+  - id: artifacts-dev
+    secret: artifacts-dev-secret-not-a-real-secret
+    name: artifacts dev
+    redirectURIs:
+      - "http://127.0.0.1:8080/oauth2/callback"

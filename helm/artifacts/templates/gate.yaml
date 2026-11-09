@@ -1,0 +1,124 @@
+{{- /* artifact-gate. Single-file stdlib service (gate/gate.py) mounted from the ConfigMap
+       <sso>/artifact-gate-code, recreated from git on every deploy (see values.yaml "gate").
+       Lives in the sso namespace because traefik must be able to watch its routes there.
+
+       Two listeners, one process: the public surface (request-access: /_gate/request|approve|deny,
+       405 on writes) is served on 8080 = the port the public IngressRoute points at; the decision
+       endpoints /_gate/auth and /_gate/plugin/authz exist ONLY on values.gate.authPort (8081),
+       which no public route references. The gate itself 404s both on the public listener, so even
+       a misrouted route cannot drive a decision.
+
+       Secrets (all created outside git, see README):
+         <sso>/artifact-gate-s3     access-key/secret-key: least-privilege S3 user (GetObject on
+                                    the bucket; PutObject only on the per-directory .acl.json files and _gate/ state).
+         <sso>/artifact-gate-keys   hmac-key: signs CSRF + approve/deny tokens.
+         <sso>/artifact-gate-slack  bot-token: optional; without it the gate logs notifications
+                                    instead of sending DMs. */ -}}
+{{- $sso := .Values.namespaces.sso }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: artifact-gate
+  namespace: {{ $sso }}
+  labels:
+    app.kubernetes.io/name: artifact-gate
+    app.kubernetes.io/part-of: artifacts
+spec:
+  replicas: 1
+  strategy: {type: Recreate}   # the grant_access serialisation (gate/gate.py _grant_lock) is an
+                               # in-process threading lock: two gate pods would race on the same ACL
+                               # read-modify-write. Recreate guarantees a rollout never runs two gates.
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: artifact-gate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: artifact-gate
+        app.kubernetes.io/part-of: artifacts
+    spec:
+      automountServiceAccountToken: false   # the gate never talks to the Kubernetes API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000   # the hmac-key secret is mode 0400: kubelet chowns it to this group so the
+                        # gate (uid 1000) can read it without making it world-readable
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gate
+          image: {{ .Values.gate.image }}
+          command: ["python3", "/app/gate.py"]
+          env:
+            - name: MINIO_ENDPOINT
+              value: http://{{ .Values.minio.service }}.{{ .Values.minio.namespace }}.svc.cluster.local:{{ .Values.minio.port }}
+            - name: GATE_BUCKET
+              value: {{ .Values.minio.bucket }}
+            - name: OAUTH2_AUTH_URL
+              value: http://oauth2-proxy-artifacts.{{ $sso }}.svc.cluster.local:4180/oauth2-artifacts/auth
+            - name: PUBLIC_HOST
+              value: {{ .Values.artifactsHost }}
+            - name: GATE_ANONYMOUS_PUB_ENABLED
+              value: {{ .Values.artifactsGate.anonymousPubEnabled | quote }}
+            - name: HMAC_KEY_FILE
+              value: /secrets/hmac-key
+            - name: GATE_AUTH_PORT
+              value: {{ .Values.gate.authPort | quote }}
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.gate.s3SecretName }}, key: access-key}
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.gate.s3SecretName }}, key: secret-key}
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.gate.slackSecretName }}, key: bot-token, optional: true}
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}   # public request-access surface
+            - {name: auth, containerPort: {{ .Values.gate.authPort }}, protocol: TCP}  # forwardAuth only
+          livenessProbe:
+            httpGet: {path: /_gate/healthz, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /_gate/healthz, port: http}
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - {name: code, mountPath: /app, readOnly: true}
+            - {name: hmac-key, mountPath: /secrets, readOnly: true}
+      volumes:
+        - name: code
+          configMap:
+            name: artifact-gate-code
+            defaultMode: 0444
+        - name: hmac-key
+          secret:
+            secretName: {{ .Values.gate.keysSecretName }}
+            defaultMode: 0400
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: artifact-gate
+  namespace: {{ $sso }}
+  labels:
+    app.kubernetes.io/name: artifact-gate
+    app.kubernetes.io/part-of: artifacts
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: artifact-gate
+  ports:
+    - {name: http, port: 8080, targetPort: http, protocol: TCP}   # referenced by the public routes
+    - {name: auth, port: {{ .Values.gate.authPort }}, targetPort: auth, protocol: TCP}  # forwardAuth target

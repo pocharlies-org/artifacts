@@ -1,0 +1,80 @@
+{{- /* Middlewares for the artifacts host (watched by traefik).
+
+       gate-auth        forwardAuth to artifact-gate: the gate authenticates via oauth2-proxy-artifacts
+                        and decides against the artifact's .acl.json. Its 4xx (401/403/404/405) and body
+                        are passed through to the browser by traefik.
+                        Points at the DECISION listener values.gate.authPort (8081), a port no public
+                        IngressRoute references: the decision endpoint is structurally separate from
+                        the public request-access surface on 8080, and the gate itself 404s the
+                        decision paths on 8080, so a misrouted route cannot drive it.
+       artifacts-errors turns the gate's 401 into a 302 to the proxy's sign_in.
+       artifacts-csp    CSP `sandbox` on every artifact served by MinIO. It is ordered INSIDE gate-auth
+                        (route middleware list [errors, gate-auth, csp]) so it only touches upstream
+                        responses: the gate's deny/confirmation pages keep their own stricter CSP, and
+                        `sandbox` (which blocks form submission without allow-forms) cannot break the
+                        "Request access" button.
+       artifacts-strip  drops the (large) session cookies and X-Auth-Request-* headers before MinIO:
+                        MinIO rejects requests whose headers total > 8 KB with 400 MetadataTooLarge. */ -}}
+{{- $sso := .Values.namespaces.sso }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: gate-auth
+  namespace: {{ $sso }}
+  labels:
+    app.kubernetes.io/part-of: artifacts
+spec:
+  forwardAuth:
+    address: http://artifact-gate.{{ $sso }}.svc.cluster.local:{{ .Values.gate.authPort }}/_gate/auth
+    trustForwardHeader: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: artifacts-errors
+  namespace: {{ $sso }}
+  labels:
+    app.kubernetes.io/part-of: artifacts
+spec:
+  errors:
+    status: ["401"]
+    statusRewrites:
+      "401": 302
+    query: /oauth2-artifacts/sign_in?rd={url}
+    service:
+      name: oauth2-proxy-artifacts
+      namespace: {{ $sso }}
+      port: 4180
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: artifacts-csp
+  namespace: {{ $sso }}
+  labels:
+    app.kubernetes.io/part-of: artifacts
+spec:
+  headers:
+    customResponseHeaders:
+      # No HTML/JS of an artifact may run in the origin of the host or reach its cookies.
+      # `sandbox` alone (no allow-same-origin) blocks same-origin fetch, cookies and storage;
+      # allow-scripts is set because artifacts here are self-contained reports with inline JS.
+      # allow-forms is NOT set, so the gate deny page keeps its own CSP and its form works.
+      Content-Security-Policy: sandbox allow-scripts
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: artifacts-strip-to-minio
+  namespace: {{ $sso }}
+  labels:
+    app.kubernetes.io/part-of: artifacts
+spec:
+  headers:
+    customRequestHeaders:
+      Cookie: ""
+      X-Auth-Request-User: ""
+      X-Auth-Request-Email: ""
+      X-Auth-Request-Preferred-Username: ""
+      X-Auth-Request-Groups: ""

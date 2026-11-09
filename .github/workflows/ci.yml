@@ -1,0 +1,40 @@
+name: ci
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: unit tests (gate + mcp lib)
+        run: python3 -I -m unittest discover -s tests -p 'test_*.py' -v
+      - name: e2e tests (fake MinIO + fake oauth2-proxy)
+        run: python3 -I -m unittest discover -s tests -p 'e2e_*.py' -v
+      - name: shell syntax
+        run: bash -n cli/publish.sh deploy/compose/e2e.sh deploy/compose/bootstrap.sh
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: helm lint
+        run: helm lint helm/artifacts
+      - name: helm template (example values, no plugins)
+        run: helm template t helm/artifacts -f helm/artifacts/values.yaml >/dev/null
+      - name: helm template (with one plugin)
+        run: |
+          helm template t helm/artifacts -f helm/artifacts/values.yaml \
+            --set 'plugins[0].name=canvas' \
+            --set 'plugins[0].pathPrefix=/_canvas/' \
+            --set 'plugins[0].service=artifact-canvas' \
+            --set 'plugins[0].port=8080' \
+            | grep -q '/_canvas/'
+      - name: helm template refuses anonymous pub on a public host
+        run: |
+          helm template t helm/artifacts -f helm/artifacts/values.yaml \
+              --set artifactsGate.anonymousPubEnabled=true --set publicExposure=true 2>&1 \
+            | grep -q 'anonymousPubEnabled'

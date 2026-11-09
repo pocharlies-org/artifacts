@@ -1,0 +1,62 @@
+# Caddyfile — replicates the Traefik IngressRoute rules of the Helm chart for the local
+# stack (see helm/artifacts/templates/artifacts-routes.yaml). Host is 127.0.0.1.
+#   1. writes to the bucket        -> gate (405 before any login)
+#   2. anonymous pub/ GET/HEAD     -> MinIO (no .acl.json, no trailing-slash listings)
+#   3. artifact GET/HEAD           -> forwardAuth to the gate's decision listener, then MinIO
+#   4. /_gate/* (not auth/healthz) -> gate
+#   5. /oauth2/*                   -> oauth2-proxy
+{
+	admin off
+}
+
+:80 {
+	@write path /artifacts/*
+	handle @write {
+		reverse_proxy gate:8080
+	}
+
+	@pub path /artifacts/pub/*
+	handle @pub {
+		@pubbad path_regexp bad '\.acl\.json$|/$'
+		respond @pubbad 404
+		header Content-Security-Policy "sandbox allow-scripts"
+		reverse_proxy minio:9000 {
+			header_up -Cookie
+			header_up -X-Auth-Request-User
+			header_up -X-Auth-Request-Email
+			header_up -X-Auth-Request-Preferred-Username
+			header_up -X-Auth-Request-Groups
+		}
+	}
+
+	@gated path /artifacts/*
+	handle @gated {
+		forward_auth gate:8081 {
+			uri /_gate/auth
+			copy_headers Cookie Authorization
+			@needsauth status 401
+			handle_response @needsauth {
+				redir "http://127.0.0.1:8080/oauth2/sign_in?rd={uri}" 302
+			}
+		}
+		header Content-Security-Policy "sandbox allow-scripts"
+		reverse_proxy minio:9000 {
+			header_up -Cookie
+			header_up -X-Auth-Request-User
+			header_up -X-Auth-Request-Email
+			header_up -X-Auth-Request-Preferred-Username
+			header_up -X-Auth-Request-Groups
+		}
+	}
+
+	@gateapi path /_gate/* !/_gate/auth !/_gate/healthz
+	handle @gateapi {
+		reverse_proxy gate:8080
+	}
+
+	handle /oauth2/* {
+		reverse_proxy oauth2-proxy:4180
+	}
+
+	respond 404
+}

@@ -1,0 +1,165 @@
+{{- /* Bootstrap Job: creates the bucket, the ILM expiry rules, the bucket policies and the
+       least-privilege S3 users. Runs as a helm hook after install/upgrade; it is idempotent
+       (rules and policies are recreated from this chart's definitions on every run).
+
+       ILM: one expiry rule per ttl tag (1/7/14/30 days) plus a bucket-wide 90-day catch-all
+       for untagged objects. The catch-all has no prefix filter, so it also covers the plugin
+       prefixes _plugins/<name>/ (docs/plugins.md §4: plugin data dies with the bucket sweep
+       even if a plugin forgets its own cleanup).
+
+       Users (credentials come from Secrets, never from git):
+         artifact-gate    from <sso ns sibling> gate.s3SecretName: GetObject + GetObjectTagging
+                          on the bucket, PutObject only on the per-directory .acl.json files and _gate/*.
+         artifact-publisher (optional, bootstrap.publisherSecretName): Put/Get/Tagging on the
+                          bucket + ListBucket. The publisher CLI/MCP use this user.
+         plugin-<name>    (per enabled plugin) from plugin-<name>-s3: Get/Put/Delete/Tagging on
+                          _plugins/<name>/ only (docs/plugins.md §3). */ -}}
+{{- if .Values.bootstrap.enabled }}
+{{- $m := .Values.minio }}
+{{- $b := $m.bucket }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: artifacts-bootstrap
+  namespace: {{ $m.namespace }}
+  labels:
+    app.kubernetes.io/part-of: artifacts
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: artifacts
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bootstrap
+          image: {{ .Values.bootstrap.image }}
+          command: ["/bin/sh", "-ec"]
+          env:
+            - {name: HOME, value: /tmp}
+            - {name: MINIO_ENDPOINT, value: "http://{{ $m.service }}.{{ $m.namespace }}.svc.cluster.local:{{ $m.port }}"}
+            - {name: BUCKET, value: {{ $b | quote }}}
+            - {name: ANON_PUB, value: {{ .Values.artifactsGate.anonymousPubEnabled | quote }}}
+            - {name: PLUGIN_NAMES, value: {{ range .Values.plugins }}{{ required "each plugin needs a name" .name }} {{ end }}}
+          args:
+            - |
+              set -eu
+              ADMIN_ID=$(cat /secrets/admin/access-key)
+              ADMIN_SECRET=$(cat /secrets/admin/secret-key)
+              mc alias set local "$MINIO_ENDPOINT" "$ADMIN_ID" "$ADMIN_SECRET"
+
+              # ---- bucket -----------------------------------------------------------
+              mc mb -p "local/$BUCKET" >/dev/null 2>&1 || true
+
+              # ---- ILM: recreate the rules from this chart (idempotent) ---------------
+              mc ilm rule rm --all --force "local/$BUCKET" >/dev/null 2>&1 || true
+              for d in 1 7 14 30; do
+                mc ilm rule add --expire-days "$d" --tags "ttl=$d" "local/$BUCKET" >/dev/null
+              done
+              # 90-day catch-all, no prefix filter: covers everything, including _plugins/.
+              mc ilm rule add --expire-days 90 "local/$BUCKET" >/dev/null
+
+              # ---- anonymous pub/ (only while the host is not publicly exposed) --------
+              if [ "$ANON_PUB" = "true" ]; then
+                cat > /tmp/anonymous-pub.json <<JSON
+              {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::${BUCKET}/pub/*"]}]}
+              JSON
+                mc anonymous set-json /tmp/anonymous-pub.json "local/$BUCKET" >/dev/null
+              else
+                mc anonymous none "local/$BUCKET" >/dev/null
+              fi
+
+              # ---- policies (recreate + re-attach: idempotent) -------------------------
+              put_policy() { # $1=name $2=file
+                mc admin policy rm "local/$1" --force >/dev/null 2>&1 || true
+                mc admin policy create "local/$1" "$2" >/dev/null
+              }
+              ensure_user() { # $1=user $2=secret-dir $3=policy
+                id_file="$2/access-key"; secret_file="$2/secret-key"
+                [ -f "$id_file" ] || id_file=""
+                user_id="${3#plugin-}"; [ -n "$id_file" ] && user_id=$(cat "$id_file")
+                [ -f "$secret_file" ] || { echo "skip user $1: $secret_file missing"; return 0; }
+                mc admin user rm "local/$1" >/dev/null 2>&1 || true
+                mc admin user add "local/$1" "$(cat "$secret_file")" >/dev/null
+                mc admin policy attach "local/$3" --user "$1" >/dev/null
+              }
+
+              cat > /tmp/policy-gate.json <<JSON
+              {"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
+                {"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::${BUCKET}/*/.acl.json","arn:aws:s3:::${BUCKET}/_gate/*"]}]}
+              JSON
+              put_policy artifact-gate /tmp/policy-gate.json
+              ensure_user artifact-gate /secrets/gate artifact-gate
+
+              cat > /tmp/policy-publisher.json <<JSON
+              {"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:PutObject","s3:PutObjectTagging","s3:GetObject","s3:GetObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
+                {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"]}]}
+              JSON
+              put_policy artifact-publisher /tmp/policy-publisher.json
+              if [ -d /secrets/publisher ]; then
+                ensure_user artifact-publisher /secrets/publisher artifact-publisher
+              fi
+
+              # ---- per-plugin least-privilege users (docs/plugins.md §3) ---------------
+              for name in $PLUGIN_NAMES; do
+                cat > "/tmp/policy-plugin-$name.json" <<JSON
+              {"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:GetObjectTagging","s3:PutObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/_plugins/${name}/*"]},
+                {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"],"Condition":{"StringLike":{"s3:prefix":["_plugins/${name}/*"]}}}]}
+              JSON
+                put_policy "plugin-$name" "/tmp/policy-plugin-$name.json"
+                ensure_user "plugin-$name" "/secrets/plugins/$name" "plugin-$name"
+              done
+
+              echo "artifacts bootstrap done: bucket=$BUCKET anon_pub=$ANON_PUB plugins=[$PLUGIN_NAMES]"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 128Mi}
+          volumeMounts:
+            - {name: admin, mountPath: /secrets/admin, readOnly: true}
+            - {name: gate, mountPath: /secrets/gate, readOnly: true}
+            {{- if .Values.bootstrap.publisherSecretName }}
+            - {name: publisher, mountPath: /secrets/publisher, readOnly: true}
+            {{- end }}
+            {{- range .Values.plugins }}
+            - {name: plugin-{{ required "each plugin needs a name" .name }}, mountPath: /secrets/plugins/{{ .name }}, readOnly: true}
+            {{- end }}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: admin
+          secret: {secretName: {{ .Values.bootstrap.adminSecretName }}, defaultMode: 0400}
+        - name: gate
+          secret: {secretName: {{ .Values.gate.s3SecretName }}, defaultMode: 0400}
+        {{- if .Values.bootstrap.publisherSecretName }}
+        - name: publisher
+          secret: {secretName: {{ .Values.bootstrap.publisherSecretName }}, defaultMode: 0400, optional: true}
+        {{- end }}
+        {{- range .Values.plugins }}
+        - name: plugin-{{ required "each plugin needs a name" .name }}
+          secret:
+            secretName: {{ default (printf "plugin-%s-s3" .name) .secretName }}
+            defaultMode: 0400
+            optional: true
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+{{- end }}
