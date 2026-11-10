@@ -59,17 +59,17 @@ class TestBucketPath(unittest.TestCase):
 
     def test_default_bucket_accepts_artifacts_path(self):
         self.assertEqual(gate.key_from_path("/artifacts/pub/x.html"), "pub/x.html")
-        self.assertIsNone(gate.key_from_path("/cb-artifacts/pub/x.html"))
+        self.assertIsNone(gate.key_from_path("/team-reports/pub/x.html"))
 
     def test_non_default_bucket_accepts_its_own_prefix(self):
-        m = load_gate_with_bucket("cb-artifacts")
-        self.assertEqual(m.BUCKET_PATH, "/cb-artifacts/")
-        self.assertEqual(m.key_from_path("/cb-artifacts/u/r/index.html"), "u/r/index.html")
+        m = load_gate_with_bucket("team-reports")
+        self.assertEqual(m.BUCKET_PATH, "/team-reports/")
+        self.assertEqual(m.key_from_path("/team-reports/u/r/index.html"), "u/r/index.html")
         self.assertIsNone(m.key_from_path("/artifacts/u/r/index.html"))
 
     def test_non_default_bucket_bad_key_still_guarded(self):
-        m = load_gate_with_bucket("cb-artifacts")
-        self.assertTrue(m._bad_key(m.key_from_path("/cb-artifacts/_plugins/c/x")))
+        m = load_gate_with_bucket("team-reports")
+        self.assertTrue(m._bad_key(m.key_from_path("/team-reports/_plugins/c/x")))
         # bucket-root listing: key_from_path yields "", _bad_key rejects it
 
 

@@ -106,8 +106,10 @@ plugins:
 
 - Routes are matched **above** the artifact routes (higher priority), so a plugin owns
   its whole prefix.
-- Reserved prefixes a plugin may not claim: `/_gate`, `/_plugins`, `/oauth2-artifacts/`
-  (the chart fails to render).
+- Reserved prefixes a plugin may not claim: `/_gate/`, `/_plugins/`, `/oauth2-artifacts/`.
+  Traefik `PathPrefix` is a plain string prefix, so the chart fails to render both a
+  prefix **under** a reserved path (`/_gate/x/`) and one that **covers** it (`/_gate`,
+  `/_ga`, `/_`), as well as a prefix without the trailing `/`.
 - The core never proxies plugin traffic itself beyond this route, and never rewrites it.
   WebSockets are the plugin's business (the chart route is plain pass-through).
 - A plugin's own pages must not weaken the artifact isolation: artifact content is

@@ -9,7 +9,7 @@
 {{- range $h := $hosts }}{{ $hm = append $hm (printf "Host(`%s`)" $h) }}{{ end }}
 {{- $hostMatch := printf "(%s)" (join " || " $hm) }}
 {{- range $p := .Values.plugins }}
-{{- $name := required "each plugin needs a name" $p.name }}
+{{- $name := required "each plugin needs a name" $p.name | toString }}
 {{- if not (regexMatch "^[a-z0-9-]+$" $name) }}
   {{- fail (printf "plugin name %q must match ^[a-z0-9-]+$" $name) }}
 {{- end }}
@@ -17,8 +17,16 @@
 {{- if not (hasPrefix "/_" $prefix) }}
   {{- fail (printf "plugin %s: pathPrefix must start with /_ (got %s) so it cannot shadow artifact, gate or login paths" $name $prefix) }}
 {{- end }}
-{{- if or (hasPrefix "/_gate/" $prefix) (hasPrefix "/_plugins/" $prefix) (hasPrefix "/oauth2-artifacts/" $prefix) }}
-  {{- fail (printf "plugin %s: pathPrefix %s collides with a reserved core path" $name $prefix) }}
+{{- if not (hasSuffix "/" $prefix) }}
+  {{- fail (printf "plugin %s: pathPrefix must end with / (got %s): Traefik PathPrefix is a string prefix" $name $prefix) }}
+{{- end }}
+{{- /* Reserved core paths. Traefik PathPrefix is a plain string prefix, so a plugin collides
+       both when its prefix sits UNDER a reserved path (/_gate/x/) and when it COVERS one
+       (/_gate, /_ga, /_): either way it would shadow the core route. */ -}}
+{{- range $r := list "/_gate/" "/_plugins/" "/oauth2-artifacts/" }}
+{{- if or (hasPrefix $r $prefix) (hasPrefix $prefix $r) }}
+  {{- fail (printf "plugin %s: pathPrefix %s collides with the reserved core path %s" $name $prefix $r) }}
+{{- end }}
 {{- end }}
 ---
 apiVersion: traefik.io/v1alpha1

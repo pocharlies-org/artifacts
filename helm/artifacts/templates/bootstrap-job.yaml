@@ -17,6 +17,14 @@
 {{- if .Values.bootstrap.enabled }}
 {{- $m := .Values.minio }}
 {{- $b := $m.bucket }}
+{{- $pluginNames := list }}
+{{- range $p := .Values.plugins }}
+{{- $n := required "each plugin needs a name" $p.name | toString }}
+{{- if not (regexMatch "^[a-z0-9-]+$" $n) }}
+  {{- fail (printf "plugin name %q must match ^[a-z0-9-]+$ (split unquoted in a shell loop)" $n) }}
+{{- end }}
+{{- $pluginNames = append $pluginNames $n }}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -52,7 +60,7 @@ spec:
             - {name: MINIO_ENDPOINT, value: "http://{{ $m.service }}.{{ $m.namespace }}.svc.cluster.local:{{ $m.port }}"}
             - {name: BUCKET, value: {{ $b | quote }}}
             - {name: ANON_PUB, value: {{ .Values.artifactsGate.anonymousPubEnabled | quote }}}
-            - {name: PLUGIN_NAMES, value: {{ range $i, $p := .Values.plugins }}{{ if $i }},{{ end }}{{- $n := required "each plugin needs a name" $p.name -}}{{- if not (regexMatch "^[a-z0-9-]+$" $n) -}}{{- fail (printf "plugin name %q must match ^[a-z0-9-]+$ (used unquoted in a shell loop)" $n) -}}{{- end -}}{{- $n }}{{ end }}}
+            - {name: PLUGIN_NAMES, value: {{ join "," $pluginNames | quote }}}
           args:
             - |
               set -eu
