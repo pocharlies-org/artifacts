@@ -71,10 +71,11 @@ check "anonymous pub dir is no MinIO XML" 0 "$(curl -s "$BASE/artifacts/pub/$RUN
 
 # ---- gated read: 302 without login -------------------------------------------------------
 RUN2="e2e-priv-$(date +%s)"
-ARTIFACTS_ACCESS_KEY=minioadmin ARTIFACTS_SECRET_KEY=minioadmin \
+# published with the non-root publisher user (bootstrap.sh): artifact + .acl.json writes work
+ARTIFACTS_ACCESS_KEY=artifact-publisher ARTIFACTS_SECRET_KEY=artifact-publisher-dev-password \
   ARTIFACTS_WRITE_BASE="$S3" ARTIFACTS_READ_BASE="$BASE" \
   bash ../../cli/publish.sh -u test@example.com -r "$RUN2" -t 1 -a e2e -s compose /tmp/e2e-note.md >/dev/null \
-  || { echo "CLI private publish failed"; exit 1; }
+  || { echo "CLI private publish (publisher user) failed"; exit 1; }
 GATED_URL="$BASE/artifacts/u/$RUN2/index.html"
 check "gated read redirects to login" 302 "$(curl -s -o /dev/null -w '%{http_code}' "$GATED_URL")"
 
@@ -182,6 +183,19 @@ for probe in "mc cat e2e-read/artifacts/u/$RUN2/.acl.json" "mc cat e2e-read/arti
   else echo "PASS: read user denied: ${probe%% e2e-read*} ${probe##* }"; fi
 done
 mc_admin "mc alias rm e2e-read >/dev/null" || true
+# the publisher user: writes artifacts and their .acl.json, never _plugins/ or _gate/
+if mc_admin "mc alias set e2e-pub http://localhost:9000 artifact-publisher artifact-publisher-dev-password >/dev/null
+  mc stat e2e-pub/artifacts/u/$RUN2/.acl.json >/dev/null"; then
+  echo "PASS: publisher wrote the artifact's .acl.json"; else echo "FAIL: publisher .acl.json missing"; fail=1; fi
+for probe in "echo x | mc pipe e2e-pub/artifacts/_plugins/canvas/e2e-probe.bin" \
+             "echo x | mc pipe e2e-pub/artifacts/_plugins/e2e-probe.bin" \
+             "echo x | mc pipe e2e-pub/artifacts/_gate/e2e-probe.json" \
+             "echo x | mc pipe e2e-pub/artifacts/_gate/req/e2e-probe.json"; do
+  if mc_admin "$probe >/dev/null 2>&1"; then echo "FAIL: publisher allowed: $probe"; fail=1
+  else echo "PASS: publisher denied: ${probe##* }"; fi
+done
+check "publisher probes left no object" 0 "$(mc_admin "mc find local/artifacts --name 'e2e-probe*' 2>/dev/null | wc -l" | tr -d ' ')"
+mc_admin "mc alias rm e2e-pub >/dev/null" || true
 
 # ---- bootstrap-job regression: two-arg `mc admin user add` against real MinIO -----------
 # (helm/artifacts/templates/bootstrap-job.yaml uses the same command shape; the one-arg

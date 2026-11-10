@@ -53,6 +53,7 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
 ## Quick start (laptop, Docker Compose)
 
 ```bash
+git clone https://github.com/pocharlies-org/artifacts.git && cd artifacts
 cd deploy/compose
 python3 -m venv .venv && .venv/bin/pip install markdown   # publisher renders .md inputs
 export PATH="$PWD/.venv/bin:$PATH"   # (a plain `pip install` works too; e2e.sh does this itself)
@@ -77,8 +78,10 @@ ARTIFACTS_WRITE_BASE=http://127.0.0.1:9000 ARTIFACTS_READ_BASE=http://127.0.0.1:
 
 > The compose stack is a **dev/demo** stack with fixed low-entropy dev secrets — never
 > expose it beyond localhost (all ports bind `127.0.0.1`). The gate runs with the two
-> non-root users `bootstrap.sh` creates (`artifact-gate`, `artifact-reader`); MinIO root
-> (`minioadmin`) is used only by `bootstrap.sh` and by the example publisher commands. MinIO runs from
+> non-root users `bootstrap.sh` creates (`artifact-gate`, `artifact-reader`); it also creates
+> `artifact-publisher` / `artifact-publisher-dev-password` (the chart's publisher policy, no
+> `_gate/` or `_plugins/` writes). MinIO root (`minioadmin`) is used only by `bootstrap.sh`
+> and by the example publisher commands. MinIO runs from
 > `bitnamilegacy/minio` (digest-pinned): a **frozen legacy mirror**, because the
 > original `minio/minio`/`minio/mc` RELEASE tags were removed from Docker Hub; it
 > bundles the `mc` client at `/opt/bitnami/minio-client/bin/mc`.
@@ -131,7 +134,9 @@ Prerequisites and what the chart does:
   on `artifacts/*`, PutObject only on `*/.acl.json` and `_gate/*`; ACL/state work),
   `artifact-gate-read` (GetObject on `artifacts/*` with an explicit Deny on `_gate/*`,
   `_plugins/*` and every `.acl.json`; signs the forwarded reads only),
-  `artifact-publisher` (optional), and one `plugin-<name>` per declared plugin.
+  `artifact-publisher` (optional; Put/Get/tagging on `artifacts/*` including `.acl.json`,
+  ListBucket, explicit Deny on `_gate/*` and `_plugins/*`), and one `plugin-<name>` per
+  declared plugin.
 - Gate secrets (`artifact-gate-s3`, `artifact-gate-read-s3`, keys `access-key` /
   `secret-key`, two **different** users; optional `artifact-gate-slack`) are created out of
   band — nothing secret goes through git. The S3 ones are needed in the gate's namespace

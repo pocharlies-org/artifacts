@@ -15,7 +15,8 @@
                           with an explicit Deny on _gate/*, _plugins/* and every .acl.json, nothing
                           else. Signs ONLY the forwarded artifact reads.
          artifact-publisher (optional, bootstrap.publisherSecretName): Put/Get/Tagging on the
-                          bucket + ListBucket. The publisher CLI/MCP use this user.
+                          bucket + ListBucket, explicit Deny on _gate/* and _plugins/*
+                          (keeps the .acl.json writes publishing needs). The publisher CLI/MCP use this user.
          plugin-<name>    (per enabled plugin) from plugin-<name>-s3: Get/Put/Delete/Tagging on
                           _plugins/<name>/ only (docs/plugins.md §3). */ -}}
 {{- if .Values.bootstrap.enabled }}
@@ -138,10 +139,13 @@ spec:
               put_policy artifact-gate-read /tmp/policy-gate-read.json
               ensure_user artifact-gate-read /secrets/gate-read artifact-gate-read
 
+              # publisher: writes artifacts and their .acl.json (publishing needs it), never gate
+              # state (_gate/) or plugin storage (_plugins/): explicit Deny on both
               cat > /tmp/policy-publisher.json <<JSON
               {"Version":"2012-10-17","Statement":[
                 {"Effect":"Allow","Action":["s3:PutObject","s3:PutObjectTagging","s3:GetObject","s3:GetObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
-                {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"]}]}
+                {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"]},
+                {"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::${BUCKET}/_gate/*","arn:aws:s3:::${BUCKET}/_plugins/*"]}]}
               JSON
               put_policy artifact-publisher /tmp/policy-publisher.json
               if [ -d /secrets/publisher ]; then

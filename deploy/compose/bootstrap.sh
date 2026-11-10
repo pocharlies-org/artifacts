@@ -1,6 +1,6 @@
 #!/bin/sh
-# bootstrap.sh — one-shot local stack setup: bucket, ILM expiry rules, anonymous pub/ and the
-# two non-root S3 users the gate runs with. Mirrors the Helm bootstrap Job
+# bootstrap.sh — one-shot local stack setup: bucket, ILM expiry rules, anonymous pub/, the
+# two non-root S3 users the gate runs with and a non-root publisher user. Mirrors the Helm bootstrap Job
 # (helm/artifacts/templates/bootstrap-job.yaml). Root (minioadmin) is used HERE ONLY, to set
 # things up; the gate never holds it.
 set -eu
@@ -12,6 +12,8 @@ export PATH="/opt/bitnami/minio-client/bin:$PATH"
 : "${GATE_PASSWORD:=artifact-gate-dev-password}"
 : "${READ_USER:=artifact-reader}"
 : "${READ_PASSWORD:=artifact-reader-dev-password}"
+: "${PUBLISHER_USER:=artifact-publisher}"
+: "${PUBLISHER_PASSWORD:=artifact-publisher-dev-password}"
 mc alias set local http://minio:9000 minioadmin minioadmin
 mc mb -p "local/$BUCKET" >/dev/null 2>&1 || true
 
@@ -41,6 +43,15 @@ cat > /tmp/policy-gate-read.json <<JSON
   {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
   {"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::${BUCKET}/_gate/*","arn:aws:s3:::${BUCKET}/_plugins/*","arn:aws:s3:::${BUCKET}/*/.acl.json","arn:aws:s3:::${BUCKET}/.acl.json"]}]}
 JSON
+# Publisher user (same policy as the Helm bootstrap Job): writes artifacts and their
+# .acl.json (publishing needs it), lists the bucket, and has an explicit Deny on gate state
+# (_gate/) and plugin storage (_plugins/). e2e.sh publishes with it and checks the Deny.
+cat > /tmp/policy-publisher.json <<JSON
+{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["s3:PutObject","s3:PutObjectTagging","s3:GetObject","s3:GetObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
+  {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"]},
+  {"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::${BUCKET}/_gate/*","arn:aws:s3:::${BUCKET}/_plugins/*"]}]}
+JSON
 # `policy create` overwrites an existing policy; `user add` updates the secret; attach is
 # idempotent. Form: mc admin <cmd> ALIAS NAME ... (never ALIAS/NAME).
 mc admin policy create local artifact-gate /tmp/policy-gate.json >/dev/null
@@ -49,6 +60,9 @@ mc admin user add local "$GATE_USER" "$GATE_PASSWORD" >/dev/null
 mc admin policy attach local artifact-gate --user "$GATE_USER" >/dev/null
 mc admin user add local "$READ_USER" "$READ_PASSWORD" >/dev/null
 mc admin policy attach local artifact-gate-read --user "$READ_USER" >/dev/null
+mc admin policy create local artifact-publisher /tmp/policy-publisher.json >/dev/null
+mc admin user add local "$PUBLISHER_USER" "$PUBLISHER_PASSWORD" >/dev/null
+mc admin policy attach local artifact-publisher --user "$PUBLISHER_USER" >/dev/null
 
 # Plugin users (docs/plugins.md §3, same policy as the Helm bootstrap Job): PLUGIN_USERS is
 # `<name>:<secret>[,<name>:<secret>...]` (dev placeholders from the plugin's compose file).
@@ -70,4 +84,4 @@ JSON
   mc admin policy attach local "plugin-$name" --user "plugin-$name" >/dev/null
   PLUGINS_DONE="$PLUGINS_DONE plugin-$name"
 done
-echo "bootstrap done: bucket=$BUCKET users=$GATE_USER,$READ_USER plugins=[${PLUGINS_DONE# }]"
+echo "bootstrap done: bucket=$BUCKET users=$GATE_USER,$READ_USER,$PUBLISHER_USER plugins=[${PLUGINS_DONE# }]"
