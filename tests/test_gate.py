@@ -18,6 +18,8 @@ import unittest
 # gate.py reads env at import time (required vars); give it inert values first.
 os.environ.setdefault("MINIO_ACCESS_KEY", "test-ak")
 os.environ.setdefault("MINIO_SECRET_KEY", "test-sk-not-a-secret")
+os.environ.setdefault("GATE_READ_ACCESS_KEY", "test-read-ak")
+os.environ.setdefault("GATE_READ_SECRET_KEY", "test-read-sk-not-a-secret")
 os.environ.setdefault("OAUTH2_AUTH_URL", "http://oauth2.test.invalid/oauth2-artifacts/auth")
 os.environ.setdefault("HMAC_KEY_B64", base64.b64encode(b"k" * 32).decode())
 # ephemeral ports so _build_servers() never collides with a real gate or another test (Warning 5)
@@ -385,6 +387,46 @@ class SigV4Test(unittest.TestCase):
                                                      "AK", "SK"))
         self.assertIsNone(gate.upstream_auth_headers(
             "GET", "h", "/artifacts/u/r/a.html?response-content-type=text/html", "AK", "SK"))
+
+    def test_query_allow_list_refuses_everything_today(self):
+        # finding 1: allow-list, not deny-list. The allowed set is empty, so every query form
+        # (MinIO handlers, case/percent/NUL/space variants, duplicates, ';', a bare '?') is
+        # refused and nothing is signed.
+        self.assertEqual(gate._ALLOWED_QUERY_KEYS, frozenset())
+        for q in ("lambdaArn=arn:minio:s3-object-lambda::x:webhook", "acl", "ACL", "%61cl",
+                  "acl%00", "%20acl", "acl&acl", "v=1&v=2", "acl;x=1", "x=1;acl", ";", "",
+                  "v=2", "tab=", "uploads", "X-Amz-Expires=60", "+acl", "&", "=x"):
+            self.assertIsNone(gate.upstream_auth_headers(
+                "GET", "h", "/artifacts/u/r/a.html?" + q, "AK", "SK"), repr(q))
+            self.assertIsNone(gate._allowed_query_pairs(q), repr(q))
+
+    def test_query_allow_list_parser_when_a_key_is_allowed(self):
+        # the parser stays strict for an allowed key: exact raw form only, once, no ';'
+        old = gate._ALLOWED_QUERY_KEYS
+        gate._ALLOWED_QUERY_KEYS = frozenset({"v"})
+        try:
+            self.assertEqual(gate._allowed_query_pairs("v=2"), [("v", "2")])
+            for q in ("V=2", "%76=2", "v=1&v=2", "v=2;acl", "v=2&acl", "v%00=2", " v=2"):
+                self.assertIsNone(gate._allowed_query_pairs(q), repr(q))
+            # signed over the exact query sent
+            h = gate.upstream_auth_headers("GET", "h", "/artifacts/u/r/a.html?v=2", "AK", "SK",
+                                           amzdate="20260101T000000Z")
+            want = gate.sigv4_headers("GET", "h", "/artifacts/u/r/a.html", [("v", "2")], None,
+                                      b"", "AK", "SK", amzdate="20260101T000000Z")
+            self.assertEqual(h["Authorization"], want["Authorization"])
+            bare = gate.sigv4_headers("GET", "h", "/artifacts/u/r/a.html", [], None, b"",
+                                      "AK", "SK", amzdate="20260101T000000Z")
+            self.assertNotEqual(h["Authorization"], bare["Authorization"])
+        finally:
+            gate._ALLOWED_QUERY_KEYS = old
+
+    def test_refused_client_headers(self):
+        # finding 5: x-amz-*/x-minio-* from the visitor never ride next to the gate's signature
+        self.assertEqual(gate.refused_client_headers(
+            {"X-Amz-Date": "x", "x-minio-extract": "true", "X-AMZ-Checksum-Mode": "ENABLED",
+             "Cookie": "c", "Authorization": "Bearer t", "X-Forwarded-Uri": "/a"}),
+            ["x-amz-checksum-mode", "x-amz-date", "x-minio-extract"])
+        self.assertEqual(gate.refused_client_headers({"Cookie": "c", "X-Amzn-Trace-Id": "1"}), [])
         h = gate.upstream_auth_headers("HEAD", "h", "/artifacts/u/r/a%20b.html", "AK", "SK",
                                        amzdate="20260101T000000Z")
         want = gate.sigv4_headers("HEAD", "h", "/artifacts/u/r/a b.html", [], None, b"",
@@ -485,6 +527,38 @@ class DomainSeparationTest(unittest.TestCase):
         self.assertIsNotNone(gate.check_action_token(at, KEY, NOW))
         ct = gate.make_csrf("u@example.com", CsrfTest.ART, KEY, NOW)
         self.assertTrue(gate.check_csrf(ct, KEY, "u@example.com", CsrfTest.ART, NOW))
+
+
+class ReadSigningUserTest(unittest.TestCase):
+    """finding 4: forwarded reads are signed by a dedicated read-only user, never the gate user."""
+
+    def _load(self, **env):
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "artifact_gate_readuser", os.path.join(_ROOT, "gate", "gate.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_read_user_is_separate(self):
+        self.assertEqual(gate.READ_ACCESS_KEY, "test-read-ak")
+        self.assertNotEqual(gate.READ_ACCESS_KEY, gate.MINIO_ACCESS_KEY)
+
+    def test_same_user_refused_at_startup(self):
+        with self.assertRaises(RuntimeError):
+            self._load(GATE_READ_ACCESS_KEY=os.environ["MINIO_ACCESS_KEY"])
+
+    def test_missing_read_user_refused_at_startup(self):
+        with self.assertRaises(RuntimeError):
+            self._load(GATE_READ_ACCESS_KEY="")
 
 
 class BuildServersTest(unittest.TestCase):

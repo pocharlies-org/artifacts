@@ -97,7 +97,7 @@ artifacts host:
 
 ```yaml
 plugins:
-  - name: canvas          # [a-z0-9-]+; route prefix and storage prefix derive from it
+  - name: canvas          # DNS-1123 label ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$; route and storage prefix derive from it
     pathPrefix: /_canvas/ # must start with /_ and end with /
     service: artifact-canvas
     port: 8080

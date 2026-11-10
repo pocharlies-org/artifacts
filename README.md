@@ -32,10 +32,16 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   deny elsewhere. The same function answers forwardAuth and the plugin authz API.
 - **Signed upstream reads**: the bucket has no anonymous read policy outside `pub/`. On
   allow, the gate answers forwardAuth with SigV4 headers (`Authorization`, `X-Amz-Date`,
-  `X-Amz-Content-Sha256`) for that exact method, host, path and query, signed with its own
-  read-only S3 user; the proxy copies them onto the MinIO request (Traefik
-  `authResponseHeaders`, Caddy `copy_headers`). Queries that would change what S3 does
-  (`?acl`, `?tagging`, `?versionId`, `response-*` overrides, …) are refused with 404.
+  `X-Amz-Content-Sha256`) for that exact method, host, path and query, signed with a
+  **dedicated read-signing S3 user** (`GATE_READ_ACCESS_KEY`: `s3:GetObject` on the bucket,
+  explicit Deny on `_gate/*`, `_plugins/*` and every `.acl.json`, nothing else); the proxy
+  copies them onto the MinIO request (Traefik `authResponseHeaders`, Caddy `copy_headers`).
+  The gate's other S3 user (`MINIO_ACCESS_KEY`) does the ACL/state work and never signs a
+  forwarded read; neither is MinIO root.
+- **No query strings, no client S3 headers**: the query allow-list is empty, so any `?` on
+  an artifact read (`?acl`, `?lambdaArn=`, `?versionId`, `response-*`, even `?v=2` or a bare
+  `?`) answers 404 and is never signed. A forwarded read carrying any `x-amz-*` or
+  `x-minio-*` request header is refused with 400 before the gate signs anything.
 - **Two listeners, one process**: `:8080` public (request-access pages, approve/deny
   links, health) and `:8081` internal (decision endpoints only: `/_gate/auth`,
   `/_gate/plugin/authz`). The public routes never reach the decision listener.
@@ -51,7 +57,7 @@ cd deploy/compose
 python3 -m venv .venv && .venv/bin/pip install markdown   # publisher renders .md inputs
 export PATH="$PWD/.venv/bin:$PATH"   # (a plain `pip install` works too; e2e.sh does this itself)
 docker compose up -d          # MinIO + Dex (test user) + oauth2-proxy + gate + Caddy
-docker compose up bootstrap   # bucket, ILM rules, anonymous pub/ policy
+docker compose up bootstrap   # bucket, ILM rules, anonymous pub/ policy, gate S3 users
 ./e2e.sh                      # publishes with the real CLI, checks reads and negatives
 ```
 
@@ -66,7 +72,9 @@ ARTIFACTS_WRITE_BASE=http://127.0.0.1:9000 ARTIFACTS_READ_BASE=http://127.0.0.1:
 ```
 
 > The compose stack is a **dev/demo** stack with fixed low-entropy dev secrets — never
-> expose it beyond localhost (all ports bind `127.0.0.1`). MinIO runs from
+> expose it beyond localhost (all ports bind `127.0.0.1`). The gate runs with the two
+> non-root users `bootstrap.sh` creates (`artifact-gate`, `artifact-reader`); MinIO root
+> (`minioadmin`) is used only by `bootstrap.sh` and by the example publisher commands. MinIO runs from
 > `bitnamilegacy/minio` (digest-pinned): a **frozen legacy mirror**, because the
 > original `minio/minio`/`minio/mc` RELEASE tags were removed from Docker Hub; it
 > bundles the `mc` client at `/opt/bitnami/minio-client/bin/mc`.
@@ -90,10 +98,14 @@ Prerequisites and what the chart does:
   --dry-run=client -o yaml | kubectl apply -f -`), same cadence as the chart.
 - The bootstrap Job (helm hook) creates the bucket, the ILM rules, the anonymous `pub/`
   policy, and the least-privilege S3 users: `artifact-gate` (GetObject + GetObjectTagging
-  on `artifacts/*`, PutObject only on `*/.acl.json` and `_gate/*`), `artifact-publisher`
-  (optional), and one `plugin-<name>` per declared plugin.
-- Gate secrets (`artifact-gate-s3`, optional `artifact-gate-slack`) are created out of
-  band — nothing secret goes through git.
+  on `artifacts/*`, PutObject only on `*/.acl.json` and `_gate/*`; ACL/state work),
+  `artifact-gate-read` (GetObject on `artifacts/*` with an explicit Deny on `_gate/*`,
+  `_plugins/*` and every `.acl.json`; signs the forwarded reads only),
+  `artifact-publisher` (optional), and one `plugin-<name>` per declared plugin.
+- Gate secrets (`artifact-gate-s3`, `artifact-gate-read-s3`, keys `access-key` /
+  `secret-key`, two **different** users; optional `artifact-gate-slack`) are created out of
+  band — nothing secret goes through git. The S3 ones are needed in the gate's namespace
+  (`namespaces.sso`) and in the bootstrap Job's (`minio.namespace`).
 
 ## Publishing
 
@@ -127,7 +139,8 @@ Everything is environment-driven; nothing is hardcoded.
 |---|---|---|
 | `GATE_BUCKET` | `artifacts` | bucket served |
 | `MINIO_ENDPOINT` | — | S3 endpoint (path-style) |
-| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | required | least-privilege gate user |
+| `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | required | least-privilege gate user (ACL + `_gate/` state work) |
+| `GATE_READ_ACCESS_KEY` / `GATE_READ_SECRET_KEY` | required | read-signing user: signs forwarded reads only; must differ from the gate user (the gate refuses to start otherwise) |
 | `OAUTH2_AUTH_URL` | required | oauth2-proxy `/auth` URL |
 | `HMAC_KEY_B64` / `HMAC_KEY_FILE` | `/secrets/hmac-key` | signs approve/deny tokens |
 | `PUBLIC_HOST` | `artifacts.example.com` | host used in generated links |
@@ -161,7 +174,31 @@ Everything is environment-driven; nothing is hardcoded.
 `oidcIssuer`, `secretName`, `artifactsHost` / `artifactsExtraHosts`, `publicExposure`
 (must be `true` only for real public hosts), `artifactsGate.anonymousPubEnabled`
 (chart refuses `true` together with `publicExposure`), `minio.*`, `gate.*`,
-`bootstrap.*`, and `plugins: []` — see `docs/plugins.md`.
+`bootstrap.*`, and `plugins: []` — see `docs/plugins.md`. `gate.s3SecretName` /
+`gate.readS3SecretName` name the gate user and the read-signing user secrets. Plugin
+names must be DNS-1123 labels (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`): the chart refuses
+anything else.
+
+## Security notes
+
+- **SigV4 replay window**: the headers the gate hands to the proxy are a normal SigV4
+  signature over one read (method, Host, path, empty query). MinIO accepts a signature
+  for about **15 minutes** around its `X-Amz-Date`, so anyone who captures that header
+  set can replay that exact read in that window. They never reach the visitor; keep it
+  that way:
+  - keep proxy access logs from recording request headers. Traefik's default
+    `accessLog.fields.headers.defaultMode: drop` is correct; do not switch it to `keep`
+    (or `keep` `Authorization`), and do not log forwardAuth responses at debug level in
+    production. Caddy redacts `Authorization` in access logs unless `log_credentials`
+    is enabled; leave it off.
+  - the read-signing user can only `GetObject` outside `_gate/`, `_plugins/` and the
+    ACLs, so a replayed signature reads at most the artifact it was issued for.
+- **Edge before MinIO**: query strings and client `x-amz-*` / `x-minio-*` headers never
+  reach MinIO on a gated read (see "How it works"). The anonymous `pub/` rule serves
+  straight from MinIO without the gate: there the anonymous bucket policy is the only
+  authority, and `.acl.json` / trailing-slash paths are refused at the proxy.
+- **Never MinIO root at runtime**: the gate uses two least-privilege users; root is
+  only for the bootstrap.
 
 ## Plugins
 
@@ -174,7 +211,7 @@ public API other plugins build against: **[docs/plugins.md](docs/plugins.md)**.
 python3 -I -m unittest discover -s tests              # unit (gate + mcp lib)
 python3 -I -m unittest discover -s tests -p 'e2e_*.py' # e2e vs fake MinIO + fake proxy
 helm lint helm/artifacts && helm template t helm/artifacts -f helm/artifacts/values.yaml
-cd deploy/compose && docker compose up -d && ./e2e.sh  # full stack (Docker required)
+cd deploy/compose && docker compose up -d && docker compose up bootstrap && ./e2e.sh  # full stack (Docker required)
 ```
 
 ## Layout

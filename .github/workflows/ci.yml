@@ -41,7 +41,8 @@ jobs:
       - name: helm template refuses reserved or malformed plugin prefixes and names
         run: |
           for spec in canvas:/_gate/x/ canvas:/_plugins/x/ canvas:/oauth2-artifacts/x \
-                      canvas:/_gate canvas:/_ canvas:/_canvas Canvas_1:/_c/; do
+                      canvas:/_gate canvas:/_ canvas:/_canvas Canvas_1:/_c/ \
+                      canvas-:/_canvas-/ -canvas:/_canvas/ -:/_x/ can--:/_c/; do
             if helm template t helm/artifacts -f helm/artifacts/values.yaml \
                 --set-string "plugins[0].name=${spec%%:*}" --set "plugins[0].pathPrefix=${spec#*:}" \
                 --set plugins[0].service=s --set plugins[0].port=8080 >/dev/null 2>&1; then
@@ -54,3 +55,18 @@ jobs:
               --set-string 'plugins[0].name=123' --set 'plugins[0].pathPrefix=/_c123/' \
               --set plugins[0].service=s --set plugins[0].port=8080 \
             | grep -q 'name: PLUGIN_NAMES, value: "123"'
+      - name: helm template accepts an inner '-' in a plugin name (DNS-1123 label)
+        run: |
+          helm template t helm/artifacts -f helm/artifacts/values.yaml \
+              --set-string 'plugins[0].name=can-vas' --set 'plugins[0].pathPrefix=/_can-vas/' \
+              --set plugins[0].service=s --set plugins[0].port=8080 \
+            | grep -q 'name: artifacts-plugin-can-vas'
+      - name: helm template wires the read-signing user (gate env + bootstrap Job)
+        run: |
+          out=$(helm template t helm/artifacts -f helm/artifacts/values.yaml)
+          echo "$out" | grep -q 'name: GATE_READ_ACCESS_KEY'
+          echo "$out" | grep -q 'secretName: artifact-gate-read-s3'
+          echo "$out" | grep -q 'ensure_user artifact-gate-read /secrets/gate-read artifact-gate-read'
+          if helm template t helm/artifacts -f helm/artifacts/values.yaml --set gate.readS3SecretName= >/dev/null 2>&1; then
+            echo "rendered without a read-signing user"; exit 1
+          fi

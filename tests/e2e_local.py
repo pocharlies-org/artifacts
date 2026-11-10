@@ -153,6 +153,7 @@ class E2ETest(unittest.TestCase):
         os.environ.update({
             "MINIO_ENDPOINT": f"http://127.0.0.1:{mport}",
             "MINIO_ACCESS_KEY": "gate", "MINIO_SECRET_KEY": "gate-secret",
+            "GATE_READ_ACCESS_KEY": "reader", "GATE_READ_SECRET_KEY": "reader-secret",
             "OAUTH2_AUTH_URL": f"http://127.0.0.1:{pport}/oauth2-artifacts/auth",
             "HMAC_KEY_B64": "a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s=",  # 32 bytes, test-only fixture key
             "SLACK_BOT_TOKEN": "",  # -> LogNotifier (no external calls)
@@ -218,10 +219,12 @@ class E2ETest(unittest.TestCase):
             st, _, h = self._auth_h(uri, "alice", host="reports.example.org", method=method)
             self.assertEqual(st, 200)
             auth = h.get("Authorization", "")
-            self.assertTrue(auth.startswith("AWS4-HMAC-SHA256 Credential=gate/"), auth)
+            # finding 4: the dedicated read-signing user, never the gate (ACL/state) user
+            self.assertTrue(auth.startswith("AWS4-HMAC-SHA256 Credential=reader/"), auth)
+            self.assertNotIn("Credential=gate/", auth)
             self.assertIn("SignedHeaders=host;x-amz-content-sha256;x-amz-date", auth)
             want = self.gate.sigv4_headers(method, "reports.example.org", uri, [], None, b"",
-                                           "gate", "gate-secret", amzdate=h["X-Amz-Date"])
+                                           "reader", "reader-secret", amzdate=h["X-Amz-Date"])
             self.assertEqual(auth, want["Authorization"])
             self.assertEqual(h["X-Amz-Content-Sha256"], want["x-amz-content-sha256"])
 
@@ -239,13 +242,44 @@ class E2ETest(unittest.TestCase):
             st, _, h = self._auth_h("/artifacts/team/secret/report.html?" + q, "alice")
             self.assertEqual(st, 404, q)
             self.assertNotIn("Authorization", h, q)
-        st, _, h = self._auth_h("/artifacts/team/secret/report.html?v=2&tab=", "alice")
+
+    def test_query_allow_list_every_query_refused(self):
+        # finding 1: ?lambdaArn= used to reach MinIO's GetObjectLambdaHandler signed by the
+        # gate. The allow-list is empty: every query form answers the same 404, unsigned, for an
+        # allowed reader (alice) on GET and HEAD.
+        for q in ("lambdaArn=arn:minio:s3-object-lambda::x:webhook", "acl", "ACL", "%61cl",
+                  "acl%00", "%20acl", "acl&acl", "v=1&v=2", "acl;x=1", ";", "", "v=2&tab="):
+            for method in ("GET", "HEAD"):
+                st, _, h = self._auth_h("/artifacts/team/secret/report.html?" + q, "alice",
+                                        method=method)
+                self.assertEqual(st, 404, (q, method))
+                self.assertNotIn("Authorization", h, q)
+                self.assertNotIn("X-Amz-Date", h, q)
+        # the same read without a query is still allowed and signed
+        st, _, h = self._auth_h("/artifacts/team/secret/report.html", "alice")
         self.assertEqual(st, 200)
-        want = self.gate.sigv4_headers("GET", "artifacts.test.invalid",
-                                       "/artifacts/team/secret/report.html",
-                                       [("v", "2"), ("tab", "")], None, b"",
-                                       "gate", "gate-secret", amzdate=h["X-Amz-Date"])
-        self.assertEqual(h["Authorization"], want["Authorization"])
+        self.assertIn("Authorization", h)
+
+    def test_client_s3_headers_refused_before_signing(self):
+        # finding 5: x-amz-*/x-minio-* from the visitor are refused (400) before identity or
+        # signing, for allowed readers too, and nothing is signed.
+        for hdr, val in (("X-Amz-Server-Side-Encryption-Customer-Algorithm", "AES256"),
+                         ("X-Amz-Checksum-Mode", "ENABLED"), ("x-amz-date", "20260101T000000Z"),
+                         ("X-Minio-Extract", "true"), ("X-MINIO-Source-Proxy-Request", "true")):
+            st, body, h = http(self.auth_base + "/_gate/auth",
+                               headers={"X-Forwarded-Method": "GET",
+                                        "X-Forwarded-Uri": "/artifacts/team/secret/report.html",
+                                        hdr: val},
+                               cookie="sid=alice")
+            self.assertEqual(st, 400, hdr)
+            self.assertNotIn("Authorization", h, hdr)
+            self.assertNotIn("X-Amz-Date", h, hdr)
+        # anonymous with the header: refused the same way (before the identity call)
+        st, _, _ = http(self.auth_base + "/_gate/auth",
+                        headers={"X-Forwarded-Method": "GET",
+                                 "X-Forwarded-Uri": "/artifacts/team/secret/report.html",
+                                 "X-Amz-Checksum-Mode": "ENABLED"})
+        self.assertEqual(st, 400)
 
     def test_anonymous_gets_401(self):
         st, _, _ = self.auth("/artifacts/pub/free/index.html", None)
@@ -416,6 +450,57 @@ class E2ETest(unittest.TestCase):
         with OBJECTS_LOCK:
             self.assertEqual(OBJECTS["team/secret/.acl.json"], acl_before)
             self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rec['id']}.json"])["status"], "deny")
+
+    def _pending_request(self, requester):
+        rid = self.gate.REQUESTS.create(requester, "/artifacts/team/secret/report.html",
+                                        "owner@example.com", 1_800_000_000)
+        return rid
+
+    def _post_action(self, endpoint, token):
+        return http(self.base + f"/_gate/{endpoint}", method="POST",
+                    data=urllib.parse.urlencode({"token": token}),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    cookie="sid=owner")
+
+    def test_deny_token_cannot_approve(self):
+        # finding 3: the token's `act` binds the endpoint. A deny token POSTed (or opened) on
+        # /_gate/approve is refused with 410: no state change, no ACL grant.
+        rid = self._pending_request("frank@example.com")
+        acl_before = OBJECTS["team/secret/.acl.json"]
+        token = self.gate.make_action_token(rid, "deny", self.gate._KEY, 1_800_000_000)
+        st, body, _ = self._post_action("approve", token)
+        self.assertEqual(st, 410)
+        self.assertIn("Link invalid", body)
+        st, _, _ = http(self.base + "/_gate/approve?token=" + urllib.parse.quote(token, safe=""),
+                        cookie="sid=owner")
+        self.assertEqual(st, 410)
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+            self.assertEqual(OBJECTS["team/secret/.acl.json"], acl_before)
+        # the right endpoint still works with the same token
+        st, _, _ = self._post_action("deny", token)
+        self.assertEqual(st, 200)
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "deny")
+            self.assertEqual(OBJECTS["team/secret/.acl.json"], acl_before)
+
+    def test_approve_token_cannot_deny(self):
+        # finding 3, other direction: an approve token on /_gate/deny is refused (410)
+        rid = self._pending_request("grace@example.com")
+        token = self.gate.make_action_token(rid, "approve", self.gate._KEY, 1_800_000_000)
+        st, _, _ = self._post_action("deny", token)
+        self.assertEqual(st, 410)
+        st, _, _ = http(self.base + "/_gate/deny?token=" + urllib.parse.quote(token, safe=""),
+                        cookie="sid=owner")
+        self.assertEqual(st, 410)
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+        st, _, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200)
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "approve")
+            self.assertIn("grace@example.com",
+                          json.loads(OBJECTS["team/secret/.acl.json"])["users"])
 
     def test_request_access_missing_artifact_uniform_response_no_state(self):
         USERS["frank"] = ("frank@example.com", "aaaa")

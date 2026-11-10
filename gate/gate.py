@@ -94,8 +94,18 @@ def _env(name, default=None, required=False):
 BUCKET = _env("GATE_BUCKET", "artifacts")
 BUCKET_PATH = "/" + BUCKET.strip("/") + "/"  # bucket public path prefix (path-style links)
 MINIO_ENDPOINT = _env("MINIO_ENDPOINT", "http://minio-s3.minio.svc.cluster.local:9000")
-MINIO_ACCESS_KEY = _env("MINIO_ACCESS_KEY", required=True)
+MINIO_ACCESS_KEY = _env("MINIO_ACCESS_KEY", required=True)   # gate user: ACL/state work
 MINIO_SECRET_KEY = _env("MINIO_SECRET_KEY", required=True)
+# Read-signing user: signs ONLY the forwarded artifact reads (upstream_auth_headers). Its S3
+# policy is s3:GetObject on the bucket with an explicit Deny on _gate/*, _plugins/* and every
+# .acl.json, nothing else, so a signature that leaks or is replayed can only read what a reader
+# of the artifact could read anyway. It must be a different user from MINIO_ACCESS_KEY (the gate
+# user can write ACLs and state); the gate refuses to start otherwise.
+READ_ACCESS_KEY = _env("GATE_READ_ACCESS_KEY", required=True)
+READ_SECRET_KEY = _env("GATE_READ_SECRET_KEY", required=True)
+if READ_ACCESS_KEY == MINIO_ACCESS_KEY:
+    raise RuntimeError("GATE_READ_ACCESS_KEY must be a dedicated read-signing user, "
+                       "not the gate user MINIO_ACCESS_KEY")
 OAUTH2_AUTH_URL = _env("OAUTH2_AUTH_URL", required=True)  # oauth2-proxy /auth of the artifacts proxy
 HMAC_KEY = (_env("HMAC_KEY_B64") or "").strip()
 HMAC_KEY_FILE = _env("HMAC_KEY_FILE", "/secrets/hmac-key")
@@ -436,16 +446,33 @@ def _bad_key(key):
     return False
 
 
-# S3 query parameters a gate-signed upstream read must never carry: sub-resources (they are not
-# plain object reads) and response-* overrides (a signed request may override Content-Type /
-# Content-Disposition, which an anonymous one cannot). Anything else (?v=2, ?tab=x) is signed
-# and passed through, MinIO ignores it on GetObject.
-_S3_RESERVED_QUERY = frozenset({
-    "acl", "attributes", "cors", "delete", "delimiter", "encoding-type", "legal-hold",
-    "lifecycle", "list-type", "location", "logging", "max-keys", "marker", "notification",
-    "object-lock", "partnumber", "policy", "prefix", "replication", "restore", "retention",
-    "select", "select-type", "start-after", "tagging", "torrent", "uploadid", "uploads",
-    "versionid", "versioning", "versions", "website"})
+# Query strings on a gate-signed upstream read: ALLOW-LIST. Any query key MinIO understands can
+# turn a plain GetObject into another handler (sub-resources like ?acl/?tagging, ?lambdaArn= ->
+# GetObjectLambdaHandler, response-* overrides, X-Amz-* presign params, ...), and a deny-list can
+# never keep up with MinIO's router. No documented flow needs a query on an artifact read:
+# delivered links (CLI, MCP) are bare paths and plugins (docs/plugins.md §5) receive the path, not
+# a query. So the allowed set is EMPTY: any "?" in the forwarded URI, even an empty one, is
+# refused with the same 404 as a never-served key. To allow a key later, add its exact raw form
+# here; the parser below still refuses percent-escapes, duplicates and ';' in every key.
+_ALLOWED_QUERY_KEYS = frozenset()
+
+
+def _allowed_query_pairs(raw_query):
+    """[(k, v), ...] when every key of `raw_query` is in _ALLOWED_QUERY_KEYS, else None.
+
+    Fail-closed parsing: keys are compared byte-for-byte as sent (no case folding, no
+    percent-decoding: `%61cl`, `acl%00`, `%20acl`, `ACL` are all simply "not allowed"), a key may
+    appear once, and ';' (a separator for some parsers) is refused outright."""
+    if raw_query == "" or ";" in raw_query:
+        return None
+    pairs, seen = [], set()
+    for part in raw_query.split("&"):
+        k, sep, v = part.partition("=")
+        if not k or "%" in k or "+" in k or k in seen or k not in _ALLOWED_QUERY_KEYS:
+            return None
+        seen.add(k)
+        pairs.append((k, urllib.parse.unquote(v)))
+    return pairs
 
 
 def upstream_auth_headers(method, host, uri, access_key, secret_key, amzdate=None):
@@ -454,20 +481,34 @@ def upstream_auth_headers(method, host, uri, access_key, secret_key, amzdate=Non
     The artifact bucket has no anonymous read policy outside pub/ (and none at all on a host
     with anonymous pub/ disabled), so after the gate allows a read the reverse proxy forwards it
     to MinIO carrying these headers (Traefik forwardAuth `authResponseHeaders`, Caddy
-    `forward_auth copy_headers`). They are signed with the gate's own read-only S3 user and bind
-    the method, the Host MinIO will see (the proxy passes the visitor's Host through), the exact
-    path and the query; they never reach the visitor. Returns None when the query carries an S3
-    sub-resource or response override (the read is then refused)."""
-    parts = urllib.parse.urlsplit(uri)
-    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
-    for k, _v in pairs:
-        lk = k.lower()
-        if lk in _S3_RESERVED_QUERY or lk.startswith(("response-", "x-amz-", "x-minio-")):
+    `forward_auth copy_headers`). They are signed with the dedicated read-signing S3 user
+    (GATE_READ_ACCESS_KEY) and bind the method, the Host MinIO will see (the proxy passes the
+    visitor's Host through), the exact path and the exact query sent; they never reach the
+    visitor. Returns None (the read is refused) when the URI carries any query that is not on
+    the allow-list (_ALLOWED_QUERY_KEYS, empty today: any "?" is refused)."""
+    path, qmark, raw_query = uri.partition("?")
+    raw_query = raw_query.split("#", 1)[0]
+    pairs = []
+    if qmark:
+        pairs = _allowed_query_pairs(raw_query)
+        if pairs is None:
             return None
-    h = sigv4_headers(method, host, urllib.parse.unquote(parts.path), pairs, None, b"",
+    h = sigv4_headers(method, host, urllib.parse.unquote(path), pairs, None, b"",
                       access_key, secret_key, amzdate=amzdate)
     return {"Authorization": h["Authorization"], "X-Amz-Date": h["x-amz-date"],
             "X-Amz-Content-Sha256": h["x-amz-content-sha256"]}
+
+
+# Request headers the visitor must never send on a forwarded read: MinIO acts on x-amz-* and
+# x-minio-* request headers (SSE-C, checksum mode, snowball extract, ...) even when they are not
+# part of the gate's SignedHeaders, so a client header would ride next to the gate's signature.
+_REFUSED_HEADER_PREFIXES = ("x-amz-", "x-minio-")
+
+
+def refused_client_headers(headers):
+    """Names of the visitor's headers that a forwarded read must not carry (lowercased)."""
+    return sorted({k.lower() for k in headers.keys()
+                   if k.lower().startswith(_REFUSED_HEADER_PREFIXES)})
 
 
 def plugin_authz_decision(email, groups, key, acl, now, head_status, tags=None, last_modified=None):
@@ -815,15 +856,22 @@ class GateHandler(BaseHTTPRequestHandler):
         # path is not routed publicly, so only Traefik can call it).
         if method not in ("GET", "HEAD"):
             return self._send(405, self._page("Method not allowed", "<p>Only GET and HEAD are served.</p>"))
+        # forwardAuth passes the visitor's headers along: refuse x-amz-*/x-minio-* before any
+        # identity call or signing (fail closed), they would reach MinIO next to our signature.
+        bad = refused_client_headers(self.headers)
+        if bad:
+            LOG.warning("forwardAuth: refused client S3 headers %s on %s", ",".join(bad), uri)
+            return self._send(400, self._page("Bad request",
+                                              "<p>S3 request headers are not accepted here.</p>"))
         verdict, key, _acl = self._authz_for(uri)
         if verdict == "allow":
             # the proxy's upstream read is signed by the gate (see upstream_auth_headers); the
             # Host is the one the proxy will pass through to MinIO
             host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
                     or PUBLIC_HOST).split(",")[0].strip()
-            sig = upstream_auth_headers(method, host, uri, MINIO_ACCESS_KEY, MINIO_SECRET_KEY)
+            sig = upstream_auth_headers(method, host, uri, READ_ACCESS_KEY, READ_SECRET_KEY)
             if sig is None:
-                LOG.warning("forwardAuth: S3 sub-resource/override query refused: %s", uri)
+                LOG.warning("forwardAuth: query not on the allow-list refused: %s", uri)
                 return self._send(404, self._page("Not found", "<p>Nothing here.</p>"))
             return self._send(200, b"ok", "text/plain", extra=sig)
         if verdict == "unauth_401":
@@ -966,6 +1014,10 @@ class GateHandler(BaseHTTPRequestHandler):
         else:
             token = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("token", [""])[0]
         p = check_action_token(token, _KEY, int(time.time()))
+        if p and p.get("act") != action:
+            # a deny token must never approve (and vice versa): the token's verb binds the endpoint
+            LOG.warning("action token for %s presented to /_gate/%s: refused", p.get("act"), action)
+            p = None
         if not p:
             return self._send(410, self._page("Link invalid or expired",
                                               "<p>This link is broken, already used, or older than "

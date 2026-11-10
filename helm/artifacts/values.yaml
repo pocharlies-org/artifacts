@@ -52,7 +52,12 @@ gate:
   # forwardAuth decision listener: the gate serves /_gate/auth and /_gate/plugin/authz
   # ONLY on this port, which no public route points at. The public surface stays on 8080.
   authPort: 8081
-  s3SecretName: artifact-gate-s3        # keys access-key, secret-key (least-privilege gate user)
+  s3SecretName: artifact-gate-s3        # keys access-key, secret-key (least-privilege gate user:
+                                        # ACL + _gate/ state work)
+  # Dedicated read-signing user, keys access-key/secret-key. Signs ONLY the forwarded artifact
+  # reads; its policy (bootstrap Job) is s3:GetObject on the bucket with an explicit Deny on
+  # _gate/*, _plugins/* and every .acl.json. Must be a different user from s3SecretName's.
+  readS3SecretName: artifact-gate-read-s3
   keysSecretName: artifact-gate-keys    # key hmac-key (signs CSRF + approve/deny tokens)
   slackSecretName: artifact-gate-slack  # key bot-token (optional; gate logs instead if absent)
 
@@ -62,7 +67,7 @@ gate:
 # from the Secret plugin-<name>-s3, keys access-key/secret-key).
 # Example:
 #   plugins:
-#     - name: canvas
+#     - name: canvas              # ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ (DNS-1123 label)
 #       pathPrefix: /_canvas/     # must start with /_
 #       service: artifact-canvas
 #       port: 8080

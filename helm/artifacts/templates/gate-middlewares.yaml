@@ -30,7 +30,7 @@ spec:
   forwardAuth:
     address: http://artifact-gate.{{ $sso }}.svc.cluster.local:{{ .Values.gate.authPort }}/_gate/auth
     trustForwardHeader: true
-    # On allow the gate signs the upstream MinIO read (SigV4, its own read-only user): the
+    # On allow the gate signs the upstream MinIO read (SigV4, the dedicated read-signing user): the
     # bucket has no anonymous read policy outside pub/. Traefik copies these onto the request,
     # replacing anything the visitor sent.
     authResponseHeaders: ["Authorization", "X-Amz-Date", "X-Amz-Content-Sha256"]

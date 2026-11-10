@@ -21,7 +21,9 @@
 
 	@pub path /artifacts/pub/*
 	handle @pub {
-		@pubbad path_regexp bad '\.acl\.json$|/$'
+		# backticks: in a Caddyfile single quotes are literal characters, so a '...' regex
+		# never matched and pub/<run>/.acl.json was served anonymously.
+		@pubbad path_regexp bad `\.acl\.json$|/$`
 		respond @pubbad 404
 		header Content-Security-Policy "sandbox allow-scripts"
 		reverse_proxy minio:9000 {

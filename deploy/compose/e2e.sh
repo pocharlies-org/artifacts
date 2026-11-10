@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # e2e.sh — end-to-end test of the local stack: publish with the CLI, read anonymously
 # (pub/), read gated (302 without login, 200 with a Dex id_token as Bearer), and the
-# negative checks (no .acl.json, no _plugins/, no listing, no writes).
+# negative checks (no .acl.json, no _plugins/, no listing, no writes, no query strings, no
+# client S3 headers, the gate never signs with MinIO root).
 # Requires: docker compose, curl, python3. The publisher renders .md inputs with the
 # python 'markdown' package (.html inputs need nothing); if it is not importable this
 # script creates a local .venv (gitignored) and installs it there.
@@ -55,6 +56,18 @@ check "anonymous pub read" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$PUB_U
 check "pub CSP sandbox" "sandbox allow-scripts" \
   "$(curl -sI "$PUB_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-security-policy"{print $2}' | tr -d '\r')"
 
+# ---- pub/ never serves an ACL or a listing anonymously -----------------------------------
+# Seed a pub/ .acl.json through the admin path (the publisher refuses to write one): the
+# anonymous pub/ rule must 404 it, not hand it out, and must 404 the directory itself.
+mc_admin() { docker compose exec -T minio sh -ec "export PATH=/opt/bitnami/minio-client/bin:\$PATH; $1"; }
+echo '{"owner":"seeded@example.com","users":["leak@example.com"]}' \
+  | mc_admin "mc pipe local/artifacts/pub/$RUN/.acl.json >/dev/null" \
+  || { echo "FAIL: could not seed pub/ .acl.json"; fail=1; }
+check "anonymous pub .acl.json not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/artifacts/pub/$RUN/.acl.json")"
+check "anonymous pub .acl.json body leaks nothing" 0 "$(curl -s "$BASE/artifacts/pub/$RUN/.acl.json" | grep -c 'seeded@example.com')"
+check "anonymous pub dir not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/artifacts/pub/$RUN/")"
+check "anonymous pub dir is no MinIO XML" 0 "$(curl -s "$BASE/artifacts/pub/$RUN/" | grep -c '<Error>')"
+
 # ---- gated read: 302 without login -------------------------------------------------------
 RUN2="e2e-priv-$(date +%s)"
 ARTIFACTS_ACCESS_KEY=minioadmin ARTIFACTS_SECRET_KEY=minioadmin \
@@ -75,6 +88,45 @@ check "gated CSP sandbox" "sandbox allow-scripts" \
 # the gate signs the upstream read; MinIO itself serves nothing anonymously off pub/
 check "direct anonymous MinIO read of u/ refused" 403 "$(curl -s -o /dev/null -w '%{http_code}' "$S3/artifacts/u/$RUN2/index.html")"
 check "S3 response override query refused" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL?response-content-type=text/plain")"
+
+# ---- query strings: allow-list (empty) -> every query 404s, unsigned, never reaches MinIO --
+for q in 'lambdaArn=arn:minio:s3-object-lambda::x:webhook' acl ACL '%61cl' 'acl%00' '%20acl' \
+         'acl&acl' 'acl;x=1' '' 'v=2'; do
+  check "query ?$q refused" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL?$q")"
+done
+check "?lambdaArn= answer is the gate's page, not MinIO XML" 0 \
+  "$(curl -s -H "Authorization: Bearer $TOKEN" "$GATED_URL?lambdaArn=arn:minio:s3-object-lambda::x:webhook" | grep -c '<Error>')"
+
+# ---- client x-amz-*/x-minio-* headers are refused before the gate signs -----------------
+check "x-amz SSE-C header refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'X-Amz-Server-Side-Encryption-Customer-Algorithm: AES256' "$GATED_URL")"
+check "x-amz-checksum-mode header refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'X-Amz-Checksum-Mode: ENABLED' "$GATED_URL")"
+check "x-minio-* header refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'X-Minio-Extract: true' "$GATED_URL")"
+
+# ---- the forwarded-read signature is NOT MinIO root ------------------------------------
+# Ask the decision listener directly from inside the gate container (it is never routed) and
+# read the Credential of the Authorization header it hands to the proxy.
+cred=$(docker compose exec -T -e TOKEN="$TOKEN" -e URI="/artifacts/u/$RUN2/index.html" gate python3 -c '
+import os, re, urllib.request
+r = urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8081/_gate/auth", headers={
+    "X-Forwarded-Method": "GET", "X-Forwarded-Uri": os.environ["URI"],
+    "X-Forwarded-Host": "127.0.0.1:8080", "Authorization": "Bearer " + os.environ["TOKEN"]}))
+print(re.search(r"Credential=([^/]+)/", r.headers["Authorization"]).group(1))')
+check "forwarded read signed by the read-signing user" artifact-reader "$cred"
+[[ "$cred" != minioadmin ]] && echo "PASS: forwarded read not signed with MinIO root ($cred)" \
+  || { echo "FAIL: forwarded read signed with MinIO root"; fail=1; }
+gate_env=$(docker compose exec -T gate sh -c 'echo "$MINIO_ACCESS_KEY $MINIO_SECRET_KEY $GATE_READ_ACCESS_KEY $GATE_READ_SECRET_KEY"')
+check "gate holds no MinIO root credential" 0 "$(echo "$gate_env" | tr ' ' '\n' | grep -cx minioadmin)"
+# the read-signing user: reads artifacts, nothing else (ACLs, state, listing, writes denied)
+if mc_admin "mc alias set e2e-read http://localhost:9000 artifact-reader artifact-reader-dev-password >/dev/null
+  mc cat e2e-read/artifacts/u/$RUN2/index.html >/dev/null"; then
+  echo "PASS: read user reads an artifact"; else echo "FAIL: read user cannot read an artifact"; fail=1; fi
+for probe in "mc cat e2e-read/artifacts/u/$RUN2/.acl.json" "mc cat e2e-read/artifacts/pub/$RUN/.acl.json" \
+             "echo x | mc pipe e2e-read/artifacts/_gate/e2e-probe.json" "mc ls e2e-read/artifacts/" \
+             "echo x | mc pipe e2e-read/artifacts/u/$RUN2/index.html"; do
+  if mc_admin "$probe >/dev/null 2>&1"; then echo "FAIL: read user allowed: $probe"; fail=1
+  else echo "PASS: read user denied: ${probe%% e2e-read*} ${probe##* }"; fi
+done
+mc_admin "mc alias rm e2e-read >/dev/null" || true
 
 # ---- bootstrap-job regression: two-arg `mc admin user add` against real MinIO -----------
 # (helm/artifacts/templates/bootstrap-job.yaml uses the same command shape; the one-arg

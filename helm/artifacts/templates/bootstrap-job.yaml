@@ -10,6 +10,10 @@
        Users (credentials come from Secrets, never from git):
          artifact-gate    from <sso ns sibling> gate.s3SecretName: GetObject + GetObjectTagging
                           on the bucket, PutObject only on the per-directory .acl.json files and _gate/*.
+                          The gate's ACL/state work only.
+         artifact-gate-read from <sso ns sibling> gate.readS3SecretName: GetObject on the bucket
+                          with an explicit Deny on _gate/*, _plugins/* and every .acl.json, nothing
+                          else. Signs ONLY the forwarded artifact reads.
          artifact-publisher (optional, bootstrap.publisherSecretName): Put/Get/Tagging on the
                           bucket + ListBucket. The publisher CLI/MCP use this user.
          plugin-<name>    (per enabled plugin) from plugin-<name>-s3: Get/Put/Delete/Tagging on
@@ -20,8 +24,8 @@
 {{- $pluginNames := list }}
 {{- range $p := .Values.plugins }}
 {{- $n := required "each plugin needs a name" $p.name | toString }}
-{{- if not (regexMatch "^[a-z0-9-]+$" $n) }}
-  {{- fail (printf "plugin name %q must match ^[a-z0-9-]+$ (split unquoted in a shell loop)" $n) }}
+{{- if not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $n) }}
+  {{- fail (printf "plugin name %q must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ (DNS-1123 label; split unquoted in a shell loop)" $n) }}
 {{- end }}
 {{- $pluginNames = append $pluginNames $n }}
 {{- end }}
@@ -88,23 +92,26 @@ spec:
               JSON
                 mc anonymous set-json /tmp/anonymous-pub.json "local/$BUCKET" >/dev/null
               else
-                mc anonymous none "local/$BUCKET" >/dev/null
+                # `anonymous none` is a usage error (rc=1) in the bundled mc: `set private`
+                mc anonymous set private "local/$BUCKET" >/dev/null
               fi
 
               # ---- policies (recreate + re-attach: idempotent) -------------------------
+              # mc admin <cmd> ALIAS NAME ...: the alias is its own argument. The former
+              # `local/<name>` form is a usage error (rc=1) for policy create/attach.
+              # `policy create` overwrites an existing policy (rm fails while it is attached),
+              # `user add` updates the secret, `policy attach` is idempotent.
               put_policy() { # $1=name $2=file
-                mc admin policy rm "local/$1" --force >/dev/null 2>&1 || true
-                mc admin policy create "local/$1" "$2" >/dev/null
+                mc admin policy create local "$1" "$2" >/dev/null
               }
-              ensure_user() { # $1=user $2=secret-dir $3=policy
+              ensure_user() { # $1=label $2=secret-dir $3=policy
                 id_file="$2/access-key"; secret_file="$2/secret-key"
                 [ -f "$id_file" ] || id_file=""
                 user_id="${3#plugin-}"; [ -n "$id_file" ] && user_id=$(cat "$id_file")
                 [ -f "$secret_file" ] || { echo "skip user $1: $secret_file missing"; return 0; }
-                mc admin user rm "local/$1" >/dev/null 2>&1 || true
                 # two-arg form: mc admin user add TARGET ACCESS-KEY SECRET-KEY
-                mc admin user add "local/$1" "$user_id" "$(cat "$secret_file")" >/dev/null
-                mc admin policy attach "local/$3" --user "$1" >/dev/null
+                mc admin user add local "$user_id" "$(cat "$secret_file")" >/dev/null
+                mc admin policy attach local "$3" --user "$user_id" >/dev/null
               }
 
               cat > /tmp/policy-gate.json <<JSON
@@ -114,6 +121,22 @@ spec:
               JSON
               put_policy artifact-gate /tmp/policy-gate.json
               ensure_user artifact-gate /secrets/gate artifact-gate
+
+              # read-signing user: forwarded reads only (gate/gate.py upstream_auth_headers)
+              cat > /tmp/policy-gate-read.json <<JSON
+              {"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
+                {"Effect":"Deny","Action":["s3:*"],"Resource":["arn:aws:s3:::${BUCKET}/_gate/*","arn:aws:s3:::${BUCKET}/_plugins/*","arn:aws:s3:::${BUCKET}/*/.acl.json","arn:aws:s3:::${BUCKET}/.acl.json"]}]}
+              JSON
+              # refuse BEFORE touching users: the same access key in both secrets would reset the
+              # gate user's secret and attach the read policy to it (the gate refuses it too)
+              if [ -f /secrets/gate-read/access-key ] && [ -f /secrets/gate/access-key ] && \
+                 [ "$(cat /secrets/gate-read/access-key)" = "$(cat /secrets/gate/access-key)" ]; then
+                echo "gate.readS3SecretName must hold a different user than gate.s3SecretName" >&2
+                exit 1
+              fi
+              put_policy artifact-gate-read /tmp/policy-gate-read.json
+              ensure_user artifact-gate-read /secrets/gate-read artifact-gate-read
 
               cat > /tmp/policy-publisher.json <<JSON
               {"Version":"2012-10-17","Statement":[
@@ -126,7 +149,8 @@ spec:
               fi
 
               # ---- per-plugin least-privilege users (docs/plugins.md §3) ---------------
-              # comma-separated; the template validates each name against ^[a-z0-9-]+$,
+              # comma-separated; the template validates each name against
+              # ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$,
               # so the unquoted split below cannot glob or word-split further.
               for name in $(printf '%s' "$PLUGIN_NAMES" | tr ',' ' '); do
                 cat > "/tmp/policy-plugin-$name.json" <<JSON
@@ -150,6 +174,7 @@ spec:
           volumeMounts:
             - {name: admin, mountPath: /secrets/admin, readOnly: true}
             - {name: gate, mountPath: /secrets/gate, readOnly: true}
+            - {name: gate-read, mountPath: /secrets/gate-read, readOnly: true}
             {{- if .Values.bootstrap.publisherSecretName }}
             - {name: publisher, mountPath: /secrets/publisher, readOnly: true}
             {{- end }}
@@ -162,6 +187,8 @@ spec:
           secret: {secretName: {{ .Values.bootstrap.adminSecretName }}, defaultMode: 0400}
         - name: gate
           secret: {secretName: {{ .Values.gate.s3SecretName }}, defaultMode: 0400}
+        - name: gate-read
+          secret: {secretName: {{ required "gate.readS3SecretName is required (read-signing S3 user)" .Values.gate.readS3SecretName }}, defaultMode: 0400}
         {{- if .Values.bootstrap.publisherSecretName }}
         - name: publisher
           secret: {secretName: {{ .Values.bootstrap.publisherSecretName }}, defaultMode: 0400, optional: true}

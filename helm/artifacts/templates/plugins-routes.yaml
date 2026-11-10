@@ -10,8 +10,10 @@
 {{- $hostMatch := printf "(%s)" (join " || " $hm) }}
 {{- range $p := .Values.plugins }}
 {{- $name := required "each plugin needs a name" $p.name | toString }}
-{{- if not (regexMatch "^[a-z0-9-]+$" $name) }}
-  {{- fail (printf "plugin name %q must match ^[a-z0-9-]+$" $name) }}
+{{- /* DNS-1123 label: the name becomes part of the IngressRoute name, so no leading or
+       trailing '-' (`canvas-` used to render an invalid object name). */ -}}
+{{- if not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $name) }}
+  {{- fail (printf "plugin name %q must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ (DNS-1123 label)" $name) }}
 {{- end }}
 {{- $prefix := required (printf "plugin %s needs a pathPrefix (e.g. /_%s/)" $name $name) $p.pathPrefix }}
 {{- if not (hasPrefix "/_" $prefix) }}

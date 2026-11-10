@@ -11,6 +11,10 @@
        Secrets (all created outside git, see README):
          <sso>/artifact-gate-s3     access-key/secret-key: least-privilege S3 user (GetObject on
                                     the bucket; PutObject only on the per-directory .acl.json files and _gate/ state).
+                                    ACL/state work only.
+         <sso>/artifact-gate-read-s3 access-key/secret-key: read-signing S3 user (GetObject on the
+                                    bucket, explicit Deny on _gate/*, _plugins/*, every .acl.json).
+                                    Signs ONLY the forwarded artifact reads.
          <sso>/artifact-gate-keys   hmac-key: signs CSRF + approve/deny tokens.
          <sso>/artifact-gate-slack  bot-token: optional; without it the gate logs notifications
                                     instead of sending DMs. */ -}}
@@ -72,6 +76,12 @@ spec:
             - name: MINIO_SECRET_KEY
               valueFrom:
                 secretKeyRef: {name: {{ .Values.gate.s3SecretName }}, key: secret-key}
+            - name: GATE_READ_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ required "gate.readS3SecretName is required (read-signing S3 user)" .Values.gate.readS3SecretName }}, key: access-key}
+            - name: GATE_READ_SECRET_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ .Values.gate.readS3SecretName }}, key: secret-key}
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ .Values.gate.slackSecretName }}, key: bot-token, optional: true}

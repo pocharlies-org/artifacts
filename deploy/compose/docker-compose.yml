@@ -3,7 +3,7 @@
 # fixed dev placeholders, never for a real deployment.
 #
 #   docker compose up -d
-#   docker compose up bootstrap          # one-shot: bucket, ILM, anonymous pub/
+#   docker compose up bootstrap          # one-shot: bucket, ILM, anonymous pub/, S3 users
 #   ./e2e.sh                             # full end-to-end (publish, reads, negatives)
 name: artifacts
 services:
@@ -99,8 +99,12 @@ services:
     command: ["python3", "/app/gate.py"]
     environment:
       MINIO_ENDPOINT: http://minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      # never MinIO root: the two non-root users bootstrap.sh creates (dev placeholders).
+      # gate user = ACL/state work; read user = signs the forwarded artifact reads only.
+      MINIO_ACCESS_KEY: artifact-gate
+      MINIO_SECRET_KEY: artifact-gate-dev-password
+      GATE_READ_ACCESS_KEY: artifact-reader
+      GATE_READ_SECRET_KEY: artifact-reader-dev-password
       GATE_BUCKET: artifacts
       OAUTH2_AUTH_URL: http://oauth2-proxy:4180/oauth2/auth
       PUBLIC_HOST: 127.0.0.1:8080
