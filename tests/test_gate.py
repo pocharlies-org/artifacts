@@ -382,6 +382,42 @@ class SigV4Test(unittest.TestCase):
                          "aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, "
                          "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
 
+    def test_bare_subresource_query_is_signed(self):
+        # GetObjectTagging is `GET <key>?tagging`: the bare subresource must be in the signed
+        # canonical query (`tagging=`). It used to be dropped (parse_qsl without
+        # keep_blank_values), so real MinIO answered 403 and plugin authz never had the ttl.
+        from unittest import mock
+        seen = {}
+        real = gate.sigv4_headers
+
+        def spy(method, host, path, qp, *a, **k):
+            seen["qp"] = list(qp)
+            return real(method, host, path, qp, *a, **k)
+
+        class Resp:
+            status = 200
+
+            def read(self):
+                return (b"<Tagging><TagSet><Tag><Key>ttl</Key><Value>7</Value></Tag>"
+                        b"</TagSet></Tagging>")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=10):
+            seen["url"] = req.full_url
+            return Resp()
+
+        with mock.patch.object(gate, "sigv4_headers", spy), \
+                mock.patch.object(gate.urllib.request, "urlopen", fake_urlopen):
+            tags = gate.MinioClient("http://minio:9000", "AK", "SK", "artifacts").get_tags("u/r/a.html")
+        self.assertEqual(seen["qp"], [("tagging", "")])
+        self.assertTrue(seen["url"].endswith("/artifacts/u/r/a.html?tagging"), seen["url"])
+        self.assertEqual(tags, {"ttl": "7"})
+
     def test_upstream_auth_headers_refuse_s3_queries(self):
         self.assertIsNone(gate.upstream_auth_headers("GET", "h", "/artifacts/u/r/a.html?acl",
                                                      "AK", "SK"))

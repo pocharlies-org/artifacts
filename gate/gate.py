@@ -214,7 +214,10 @@ class MinioClient:
 
     def _call(self, method, key, body=None, ctype=None, query=""):
         path = f"/{self.bucket}/{key}" if key else f"/{self.bucket}"
-        qp = urllib.parse.parse_qsl(query)
+        # keep_blank_values: a bare subresource (`?tagging`) must be signed as `tagging=`;
+        # dropping it made every GetObjectTagging a 403 (SignatureDoesNotMatch) on real MinIO,
+        # so the plugin authz never reported the ttl/expiry.
+        qp = urllib.parse.parse_qsl(query, keep_blank_values=True)
         headers = sigv4_headers(method, self.host, path, qp,
                                 {"content-type": ctype} if ctype else None,
                                 body or b"", self.ak, self.sk)
