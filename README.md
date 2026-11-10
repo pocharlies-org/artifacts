@@ -42,7 +42,8 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
 
 ```bash
 cd deploy/compose
-python3 -m pip install markdown   # publisher renders .md inputs (not needed for .html)
+python3 -m venv .venv && .venv/bin/pip install markdown   # publisher renders .md inputs
+export PATH="$PWD/.venv/bin:$PATH"   # (a plain `pip install` works too; e2e.sh does this itself)
 docker compose up -d          # MinIO + Dex (test user) + oauth2-proxy + gate + Caddy
 docker compose up bootstrap   # bucket, ILM rules, anonymous pub/ policy
 ./e2e.sh                      # publishes with the real CLI, checks reads and negatives

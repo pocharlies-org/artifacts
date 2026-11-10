@@ -2,11 +2,20 @@
 # e2e.sh — end-to-end test of the local stack: publish with the CLI, read anonymously
 # (pub/), read gated (302 without login, 200 with a Dex id_token as Bearer), and the
 # negative checks (no .acl.json, no _plugins/, no listing, no writes).
-# Requires: docker compose, curl, python3 + the python 'markdown' package
-# (pip3 install markdown — only needed to publish .md inputs; .html inputs need nothing).
+# Requires: docker compose, curl, python3. The publisher renders .md inputs with the
+# python 'markdown' package (.html inputs need nothing); if it is not importable this
+# script creates a local .venv (gitignored) and installs it there.
 # Run after: docker compose up -d && docker compose up bootstrap
 set -uo pipefail
 cd "$(dirname "$0")"
+
+# markdown package for the publisher's .md rendering (PEP 668-safe: local venv)
+if ! python3 -c "import markdown" >/dev/null 2>&1; then
+  [ -d .venv ] || python3 -m venv .venv
+  .venv/bin/pip install -q markdown
+  export PATH="$PWD/.venv/bin:$PATH"
+fi
+
 BASE=http://127.0.0.1:8080
 S3=http://127.0.0.1:9000
 fail=0
