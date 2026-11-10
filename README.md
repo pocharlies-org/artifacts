@@ -42,6 +42,7 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
 
 ```bash
 cd deploy/compose
+python3 -m pip install markdown   # publisher renders .md inputs (not needed for .html)
 docker compose up -d          # MinIO + Dex (test user) + oauth2-proxy + gate + Caddy
 docker compose up bootstrap   # bucket, ILM rules, anonymous pub/ policy
 ./e2e.sh                      # publishes with the real CLI, checks reads and negatives
@@ -58,7 +59,10 @@ ARTIFACTS_WRITE_BASE=http://127.0.0.1:9000 ARTIFACTS_READ_BASE=http://127.0.0.1:
 ```
 
 > The compose stack is a **dev/demo** stack with fixed low-entropy dev secrets — never
-> expose it beyond localhost (all ports bind `127.0.0.1`).
+> expose it beyond localhost (all ports bind `127.0.0.1`). MinIO runs from
+> `bitnamilegacy/minio` (digest-pinned): a **frozen legacy mirror**, because the
+> original `minio/minio`/`minio/mc` RELEASE tags were removed from Docker Hub; it
+> bundles the `mc` client at `/opt/bitnami/minio-client/bin/mc`.
 
 ## Quick start (Kubernetes)
 

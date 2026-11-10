@@ -8,23 +8,29 @@
 name: artifacts
 services:
   minio:
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-    command: ["server", "/data", "--console-address", ":9001"]
+    # bitnamilegacy/minio is the frozen legacy mirror: the original minio/minio
+    # RELEASE tags were removed from Docker Hub (404). Pinned by digest; the image
+    # also bundles the mc client at /opt/bitnami/minio-client/bin/mc, which the
+    # bootstrap service and e2e.sh use.
+    image: bitnamilegacy/minio@sha256:d7cd0e172c4cc0870f4bdc3142018e2a37be9acf04d68f386600daad427e0cab  # = 2025.4.22-debian-12-r1
+    entrypoint: ["/opt/bitnami/minio/bin/minio"]
+    command: ["server", "/bitnami/minio/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
       - "127.0.0.1:9000:9000"    # S3 API (the publisher writes here)
       - "127.0.0.1:9001:9001"    # console
-    volumes: [minio-data:/data]
+    volumes: [minio-data:/bitnami/minio/data]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      # the bitnami image ships no mc alias: set `local` first, then probe readiness
+      test: ["CMD-SHELL", "/opt/bitnami/minio-client/bin/mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1 && /opt/bitnami/minio-client/bin/mc ready local"]
       interval: 3s
       timeout: 3s
-      retries: 20
+      retries: 30
 
   bootstrap:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: bitnamilegacy/minio@sha256:d7cd0e172c4cc0870f4bdc3142018e2a37be9acf04d68f386600daad427e0cab  # same frozen legacy image; mc bundled inside
     depends_on: {minio: {condition: service_healthy}}
     entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
     volumes:

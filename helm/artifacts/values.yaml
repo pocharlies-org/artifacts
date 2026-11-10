@@ -72,6 +72,9 @@ plugins: []
 # ---- bootstrap Job (bucket, ILM, policies, users) ---------------------------------------
 bootstrap:
   enabled: true
-  image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+  # Frozen legacy mirror: the original minio/mc RELEASE tags were removed from
+  # Docker Hub (404). This image bundles the mc client at
+  # /opt/bitnami/minio-client/bin/mc (the Job exports that PATH).
+  image: bitnamilegacy/minio@sha256:d7cd0e172c4cc0870f4bdc3142018e2a37be9acf04d68f386600daad427e0cab
   # MinIO admin credentials the Job uses (keys access-key/secret-key, in namespaces.minio).
   adminSecretName: minio-bootstrap-admin

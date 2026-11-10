@@ -1,6 +1,6 @@
 # Caddyfile — replicates the Traefik IngressRoute rules of the Helm chart for the local
 # stack (see helm/artifacts/templates/artifacts-routes.yaml). Host is 127.0.0.1.
-#   1. writes to the bucket        -> gate (405 before any login)
+#   1. writes (non-GET/HEAD)       -> gate (405 before any login)
 #   2. anonymous pub/ GET/HEAD     -> MinIO (no .acl.json, no trailing-slash listings)
 #   3. artifact GET/HEAD           -> forwardAuth to the gate's decision listener, then MinIO
 #   4. /_gate/* (not auth/healthz) -> gate
@@ -10,7 +10,10 @@
 }
 
 :80 {
-	@write path /artifacts/*
+	@write {
+		path /artifacts/*
+		not method GET HEAD
+	}
 	handle @write {
 		reverse_proxy gate:8080
 	}

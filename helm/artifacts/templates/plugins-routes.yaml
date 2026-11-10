@@ -10,11 +10,14 @@
 {{- $hostMatch := printf "(%s)" (join " || " $hm) }}
 {{- range $p := .Values.plugins }}
 {{- $name := required "each plugin needs a name" $p.name }}
+{{- if not (regexMatch "^[a-z0-9-]+$" $name) }}
+  {{- fail (printf "plugin name %q must match ^[a-z0-9-]+$" $name) }}
+{{- end }}
 {{- $prefix := required (printf "plugin %s needs a pathPrefix (e.g. /_%s/)" $name $name) $p.pathPrefix }}
 {{- if not (hasPrefix "/_" $prefix) }}
   {{- fail (printf "plugin %s: pathPrefix must start with /_ (got %s) so it cannot shadow artifact, gate or login paths" $name $prefix) }}
 {{- end }}
-{{- if or (eq $prefix "/_gate/") (eq $prefix "/_gate") (eq $prefix "/_plugins/") (eq $prefix "/_plugins") (eq $prefix "/oauth2-artifacts/") }}
+{{- if or (hasPrefix "/_gate/" $prefix) (hasPrefix "/_plugins/" $prefix) (hasPrefix "/oauth2-artifacts/" $prefix) }}
   {{- fail (printf "plugin %s: pathPrefix %s collides with a reserved core path" $name $prefix) }}
 {{- end }}
 ---

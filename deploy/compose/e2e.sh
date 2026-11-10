@@ -2,7 +2,9 @@
 # e2e.sh — end-to-end test of the local stack: publish with the CLI, read anonymously
 # (pub/), read gated (302 without login, 200 with a Dex id_token as Bearer), and the
 # negative checks (no .acl.json, no _plugins/, no listing, no writes).
-# Requires: docker compose, curl, python3. Run after: docker compose up -d && docker compose up bootstrap
+# Requires: docker compose, curl, python3 + the python 'markdown' package
+# (pip3 install markdown — only needed to publish .md inputs; .html inputs need nothing).
+# Run after: docker compose up -d && docker compose up bootstrap
 set -uo pipefail
 cd "$(dirname "$0")"
 BASE=http://127.0.0.1:8080
@@ -35,7 +37,7 @@ PUB_URL="$BASE/artifacts/pub/$RUN/index.html"
 # ---- anonymous pub/ read ---------------------------------------------------------------
 check "anonymous pub read" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$PUB_URL")"
 check "pub CSP sandbox" "sandbox allow-scripts" \
-  "$(curl -sI "$PUB_URL" | tr -d '\r' | awk -F': ' '/^content-security-policy/{print tolower($2)}' | tr -d '\r')"
+  "$(curl -sI "$PUB_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-security-policy"{print $2}' | tr -d '\r')"
 
 # ---- gated read: 302 without login -------------------------------------------------------
 RUN2="e2e-priv-$(date +%s)"
@@ -51,6 +53,18 @@ TOKEN=$(curl -sf -X POST http://127.0.0.1:5556/dex/token \
   -d 'grant_type=password&username=test@example.com&password=test-password&client_id=artifacts-dev&client_secret=artifacts-dev-secret-not-a-real-secret&scope=openid' \
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["id_token"])')
 check "gated read with Bearer id_token" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL")"
+
+# ---- bootstrap-job regression: two-arg `mc admin user add` against real MinIO -----------
+# (helm/artifacts/templates/bootstrap-job.yaml uses the same command shape; the one-arg
+# form silently created a user with a wrong secret)
+if docker compose exec -T minio sh -ec 'export PATH=/opt/bitnami/minio-client/bin:$PATH
+  mc admin user add local e2e-regression-key e2e-secret-key >/dev/null 2>&1
+  mc admin user list local | grep -q e2e-regression-key
+  mc admin user rm local e2e-regression-key >/dev/null 2>&1'; then
+  echo "PASS: mc admin user add two-arg form (bootstrap-job regression)"
+else
+  echo "FAIL: mc admin user add two-arg form (bootstrap-job regression)"; fail=1
+fi
 
 # ---- negatives ---------------------------------------------------------------------------
 check "acl.json not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/artifacts/u/$RUN2/.acl.json")"

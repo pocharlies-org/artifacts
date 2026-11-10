@@ -27,12 +27,15 @@ Cookie: <the visitor's Cookie header, forwarded verbatim>
    — or —
 Authorization: Bearer <id_token>        (validated by oauth2-proxy, skip-jwt-bearer-tokens)
 
-{"artifact": "/artifacts/<key>"}        (form field `artifact=` for the form encoding)
+{"artifact": "/<bucket>/<key>"}         (form field `artifact=` for the form encoding)
 ```
 
 Forward the visitor's `Cookie` **and** `Authorization` exactly as received; the gate
 passes them to oauth2-proxy `/auth` and trusts nothing the client sent as
-`X-Auth-Request-*`. The artifact path is the public path, starting with `/artifacts/`.
+`X-Auth-Request-*`. The artifact path is the public path **including the bucket name**
+(path-style, same shape as the delivered links of §5): `/<bucket>/<key>` — with the
+default bucket `artifacts` that is `/artifacts/<key>`; a gate configured with another
+`GATE_BUCKET` only accepts that bucket's prefix.
 
 ### Response
 

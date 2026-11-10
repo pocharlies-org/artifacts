@@ -2,6 +2,8 @@
 # bootstrap.sh — one-shot local stack setup: bucket, ILM expiry rules, anonymous pub/.
 # Mirrors the Helm bootstrap Job (helm/artifacts/templates/bootstrap-job.yaml).
 set -eu
+# mc ships inside the bitnamilegacy/minio image (see docker-compose.yml)
+export PATH="/opt/bitnami/minio-client/bin:$PATH"
 : "${BUCKET:=artifacts}"
 mc alias set local http://minio:9000 minioadmin minioadmin
 mc mb -p "local/$BUCKET" >/dev/null 2>&1 || true

@@ -31,8 +31,46 @@ _spec = importlib.util.spec_from_file_location("artifact_gate", os.path.join(_RO
 gate = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gate)  # noqa: E402
 
+def load_gate_with_bucket(bucket):
+    """Fresh gate module instance with GATE_BUCKET overridden (env is read at import)."""
+    old = os.environ.get("GATE_BUCKET")
+    os.environ["GATE_BUCKET"] = bucket
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "artifact_gate_" + bucket.replace("-", "_"), os.path.join(_ROOT, "gate", "gate.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        if old is None:
+            os.environ.pop("GATE_BUCKET", None)
+        else:
+            os.environ["GATE_BUCKET"] = old
+
+
 KEY = b"k" * 32
 NOW = 1_800_000_000  # fixed clock for the whole suite
+
+
+class TestBucketPath(unittest.TestCase):
+    """The gate must key off the CONFIGURED bucket, not a hardcoded /artifacts/
+    (verifier finding 8): CLI/MCP links embed the bucket name, so with bucket !=
+    'artifacts' the gate would otherwise 400 its own links."""
+
+    def test_default_bucket_accepts_artifacts_path(self):
+        self.assertEqual(gate.key_from_path("/artifacts/pub/x.html"), "pub/x.html")
+        self.assertIsNone(gate.key_from_path("/cb-artifacts/pub/x.html"))
+
+    def test_non_default_bucket_accepts_its_own_prefix(self):
+        m = load_gate_with_bucket("cb-artifacts")
+        self.assertEqual(m.BUCKET_PATH, "/cb-artifacts/")
+        self.assertEqual(m.key_from_path("/cb-artifacts/u/r/index.html"), "u/r/index.html")
+        self.assertIsNone(m.key_from_path("/artifacts/u/r/index.html"))
+
+    def test_non_default_bucket_bad_key_still_guarded(self):
+        m = load_gate_with_bucket("cb-artifacts")
+        self.assertTrue(m._bad_key(m.key_from_path("/cb-artifacts/_plugins/c/x")))
+        # bucket-root listing: key_from_path yields "", _bad_key rejects it
 
 
 class FakeStore:

@@ -90,6 +90,7 @@ def _env(name, default=None, required=False):
 
 
 BUCKET = _env("GATE_BUCKET", "artifacts")
+BUCKET_PATH = "/" + BUCKET.strip("/") + "/"  # bucket public path prefix (path-style links)
 MINIO_ENDPOINT = _env("MINIO_ENDPOINT", "http://minio-s3.minio.svc.cluster.local:9000")
 MINIO_ACCESS_KEY = _env("MINIO_ACCESS_KEY", required=True)
 MINIO_SECRET_KEY = _env("MINIO_SECRET_KEY", required=True)
@@ -404,6 +405,17 @@ def decide(user_email, user_groups, key, acl, now, pub_prefixes=PUB_PREFIXES):
         if ug & acl_groups:
             return True, "group"
     return False, "not-listed"
+
+
+def key_from_path(path):
+    """Object key if `path` is under the bucket's public path, else None.
+
+    Delivered links (CLI/MCP, docs/plugins.md §5) embed the configured bucket name
+    (path-style), so the gate must accept `/<bucket>/<key>` — never a hardcoded
+    /artifacts/. With the default bucket this is /artifacts/<key>."""
+    if not path.startswith(BUCKET_PATH):
+        return None
+    return urllib.parse.unquote(path[len(BUCKET_PATH):])
 
 
 def _bad_key(key):
@@ -736,9 +748,9 @@ class GateHandler(BaseHTTPRequestHandler):
         """Shared by /_gate/auth and the request flow. Returns (verdict, artifact_key, acl).
         verdict: allow | deny | not_found | bad_path | unauth_401 | unauth_500"""
         path = urllib.parse.urlsplit(uri).path
-        if not path.startswith("/artifacts/"):
+        key = key_from_path(path)
+        if key is None:
             return "bad_path", path, None
-        key = urllib.parse.unquote(path[len("/artifacts/"):])
         if _bad_key(key):
             # dir listings, ACLs, gate state, plugin storage, traversal: never served
             return "bad_path", path, None
@@ -782,7 +794,8 @@ class GateHandler(BaseHTTPRequestHandler):
     # -- plugin authorization API (docs/plugins.md) ------------------------------------
     def _handle_plugin_authz(self, method):
         """POST /_gate/plugin/authz — the plugin authorization API (docs/plugins.md §1). Body:
-        JSON {"artifact": "/artifacts/<key>"} or form-encoded `artifact=`. Answers
+        JSON {"artifact": "/<bucket>/<key>"} (default bucket: /artifacts/<key>) or form-encoded
+        `artifact=`. Answers
         {allowed, reason, user:{id,name,anonymous}, artifact:{key,expires,ttl}} through the one
         and only decide(). Anonymous visitors are allowed only for pub/ keys and only while
         GATE_ANONYMOUS_PUB_ENABLED is true."""
@@ -803,10 +816,11 @@ class GateHandler(BaseHTTPRequestHandler):
         else:
             artifact = self._form().get("artifact", "")
         path = urllib.parse.urlsplit(artifact).path
-        if not path.startswith("/artifacts/"):
-            return self._send(400, json.dumps({"error": "artifact must be an /artifacts/ path"}),
-                              "application/json")
-        key = urllib.parse.unquote(path[len("/artifacts/"):])
+        key = key_from_path(path)
+        if key is None:
+            return self._send(400, json.dumps(
+                {"error": f"artifact must be a {BUCKET_PATH.rstrip('/')}/ path"}),
+                "application/json")
         if _bad_key(key):
             return self._send(400, json.dumps({"error": "artifact path not allowed"}),
                               "application/json")
@@ -850,7 +864,7 @@ class GateHandler(BaseHTTPRequestHandler):
         form = self._form()
         artifact = form.get("artifact") or ""
         path = urllib.parse.urlsplit(artifact).path
-        if not path.startswith("/artifacts/"):
+        if key_from_path(path) is None:
             return self._send(400, self._page("Bad request", "<p>Missing artifact.</p>"))
         email, groups, status = self._authenticate()
         if status == 401:
@@ -863,7 +877,7 @@ class GateHandler(BaseHTTPRequestHandler):
             LOG.warning("csrf rejected user=%s artifact=%s", email, path)
             return self._send(403, self._page("Bad request",
                                               "<p>Stale form. Go back, reload the page and try again.</p>"))
-        key = urllib.parse.unquote(path[len("/artifacts/"):])
+        key = key_from_path(path)
         if not RATE_LIMITER.allow(email, path, int(time.time())):
             LOG.warning("rate limit user=%s artifact=%s (no notification sent)", email, path)
             return self._send(429, self._page("Too many requests",
@@ -1009,7 +1023,7 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._handle_action("approve", method == "POST")
         if path == "/_gate/deny":
             return self._handle_action("deny", method == "POST")
-        if path.startswith("/artifacts/"):
+        if path.startswith(BUCKET_PATH):
             # Traefik only routes non-GET/HEAD here; GET/HEAD never reach the gate except via
             # /_gate/auth. Anything else is a write: refuse it.
             return self._send(405, self._page("Method not allowed",
@@ -1075,7 +1089,9 @@ def grant_access(minio, artifact_path, requester):
 
     Serialised per ACL directory (see _grant_lock): concurrent approvals of the same directory
     can no longer lose a grant."""
-    key = urllib.parse.unquote(artifact_path[len("/artifacts/"):])
+    key = key_from_path(artifact_path)
+    if key is None:
+        return False, "bad artifact path"
     acl_key = key.rsplit("/", 1)[0] + "/.acl.json" if "/" in key else ".acl.json"
     with _grant_lock(acl_key):
         acl, err = read_acl(minio, key, now=int(time.time()), bypass_cache=True)  # write path: no cache
