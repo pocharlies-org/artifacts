@@ -3,13 +3,15 @@
        gate-auth        forwardAuth to artifact-gate: the gate authenticates via oauth2-proxy-artifacts
                         and decides against the artifact's .acl.json. Its 4xx (401/403/404/405) and body
                         are passed through to the browser by traefik.
+                        On allow it returns SigV4 headers (Authorization, X-Amz-Date,
+                        X-Amz-Content-Sha256) for that exact read, which traefik forwards to MinIO.
                         Points at the DECISION listener values.gate.authPort (8081), a port no public
                         IngressRoute references: the decision endpoint is structurally separate from
                         the public request-access surface on 8080, and the gate itself 404s the
                         decision paths on 8080, so a misrouted route cannot drive it.
        artifacts-errors turns the gate's 401 into a 302 to the proxy's sign_in.
        artifacts-csp    CSP `sandbox` on every artifact served by MinIO. It is ordered INSIDE gate-auth
-                        (route middleware list [errors, gate-auth, csp]) so it only touches upstream
+                        (route middleware list [errors, gate-auth, strip, csp]) so it only touches upstream
                         responses: the gate's deny/confirmation pages keep their own stricter CSP, and
                         `sandbox` (which blocks form submission without allow-forms) cannot break the
                         "Request access" button.
@@ -28,6 +30,10 @@ spec:
   forwardAuth:
     address: http://artifact-gate.{{ $sso }}.svc.cluster.local:{{ .Values.gate.authPort }}/_gate/auth
     trustForwardHeader: true
+    # On allow the gate signs the upstream MinIO read (SigV4, its own read-only user): the
+    # bucket has no anonymous read policy outside pub/. Traefik copies these onto the request,
+    # replacing anything the visitor sent.
+    authResponseHeaders: ["Authorization", "X-Amz-Date", "X-Amz-Content-Sha256"]
 ---
 apiVersion: traefik.io/v1alpha1
 kind: Middleware

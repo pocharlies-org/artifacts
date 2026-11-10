@@ -16,7 +16,7 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
 ```
  visitor ──HTTPS── reverse proxy (Traefik / Caddy)
                      ├── /artifacts/**  reads ──forwardAuth──> gate :8081 /_gate/auth ──> oauth2-proxy /auth
-                     │        │ allowed ──> MinIO (path-style)   denied ──> 302 /oauth2/sign_in
+                     │        │ allowed ──> MinIO, signed by the gate   denied ──> 302 /oauth2/sign_in
                      │        └ every response: CSP `sandbox allow-scripts` (opaque origin)
                      ├── POST /artifacts/** ──> gate :8080  (request-access, approve, deny)
                      ├── /_gate/** (except auth/healthz) ──> gate :8080
@@ -30,6 +30,12 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
 - **Authorization**: one `decide()` in `gate/gate.py` — ACL file `<dir>/.acl.json`
   (`owner`, `users`, `groups`, `expires`); no ACL → any signed-in user for `pub/`,
   deny elsewhere. The same function answers forwardAuth and the plugin authz API.
+- **Signed upstream reads**: the bucket has no anonymous read policy outside `pub/`. On
+  allow, the gate answers forwardAuth with SigV4 headers (`Authorization`, `X-Amz-Date`,
+  `X-Amz-Content-Sha256`) for that exact method, host, path and query, signed with its own
+  read-only S3 user; the proxy copies them onto the MinIO request (Traefik
+  `authResponseHeaders`, Caddy `copy_headers`). Queries that would change what S3 does
+  (`?acl`, `?tagging`, `?versionId`, `response-*` overrides, …) are refused with 404.
 - **Two listeners, one process**: `:8080` public (request-access pages, approve/deny
   links, health) and `:8081` internal (decision endpoints only: `/_gate/auth`,
   `/_gate/plugin/authz`). The public routes never reach the decision listener.

@@ -204,6 +204,49 @@ class E2ETest(unittest.TestCase):
             self.assertEqual(st, 403, uri)
             self.assertIn("Access required", body, uri)
 
+    def _auth_h(self, uri, sid, host="artifacts.test.invalid", method="GET"):
+        return http(self.auth_base + "/_gate/auth",
+                    headers={"X-Forwarded-Method": method, "X-Forwarded-Uri": uri,
+                             "X-Forwarded-Host": host},
+                    cookie=f"sid={sid}" if sid else None)
+
+    def test_allow_signs_the_upstream_read(self):
+        # MinIO has no anonymous read outside pub/: on ALLOW the gate returns SigV4 headers the
+        # proxy copies onto the upstream request. They must bind method, Host and path.
+        uri = "/artifacts/team/secret/report.html"
+        for method in ("GET", "HEAD"):
+            st, _, h = self._auth_h(uri, "alice", host="reports.example.org", method=method)
+            self.assertEqual(st, 200)
+            auth = h.get("Authorization", "")
+            self.assertTrue(auth.startswith("AWS4-HMAC-SHA256 Credential=gate/"), auth)
+            self.assertIn("SignedHeaders=host;x-amz-content-sha256;x-amz-date", auth)
+            want = self.gate.sigv4_headers(method, "reports.example.org", uri, [], None, b"",
+                                           "gate", "gate-secret", amzdate=h["X-Amz-Date"])
+            self.assertEqual(auth, want["Authorization"])
+            self.assertEqual(h["X-Amz-Content-Sha256"], want["x-amz-content-sha256"])
+
+    def test_deny_and_401_carry_no_signature(self):
+        USERS["carol3"] = ("carol3@example.com", "aaaa")
+        for sid, code in (("carol3", 403), (None, 401)):
+            st, _, h = self._auth_h("/artifacts/team/secret/report.html", sid)
+            self.assertEqual(st, code)
+            self.assertNotIn("Authorization", h)
+            self.assertNotIn("X-Amz-Date", h)
+
+    def test_s3_subresource_or_override_query_refused(self):
+        for q in ("response-content-type=text/html", "Response-Content-Disposition=x",
+                  "tagging", "versionId=abc", "X-Amz-Expires=60"):
+            st, _, h = self._auth_h("/artifacts/team/secret/report.html?" + q, "alice")
+            self.assertEqual(st, 404, q)
+            self.assertNotIn("Authorization", h, q)
+        st, _, h = self._auth_h("/artifacts/team/secret/report.html?v=2&tab=", "alice")
+        self.assertEqual(st, 200)
+        want = self.gate.sigv4_headers("GET", "artifacts.test.invalid",
+                                       "/artifacts/team/secret/report.html",
+                                       [("v", "2"), ("tab", "")], None, b"",
+                                       "gate", "gate-secret", amzdate=h["X-Amz-Date"])
+        self.assertEqual(h["Authorization"], want["Authorization"])
+
     def test_anonymous_gets_401(self):
         st, _, _ = self.auth("/artifacts/pub/free/index.html", None)
         self.assertEqual(st, 401)

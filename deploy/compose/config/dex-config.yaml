@@ -1,13 +1,17 @@
 # Dex for the local dev stack: one static user, password grant enabled so the e2e can
 # obtain an id_token without a browser. The password is a fixed dev placeholder.
-issuer: ${DEX_ISSUER}
+# One issuer URL for everyone: the host (browser, e2e.sh) reaches Dex on the published
+# 127.0.0.1:5556, and oauth2-proxy shares the Dex container's network namespace
+# (docker-compose.yml), so 127.0.0.1:5556 is Dex for it too. Literal on purpose: Dex
+# does not expand environment variables in `issuer`.
+issuer: http://127.0.0.1:5556/dex
 storage:
   type: memory
 web:
   http: 0.0.0.0:5556
 oauth2:
-  clientID: artifacts-dev
-  clientSecret: artifacts-dev-secret-not-a-real-secret
+  # the resource-owner password grant (e2e.sh, no browser) logs in via the local DB
+  passwordConnector: local
 enablePasswordDB: true
 staticPasswords:
   - email: "test@example.com"

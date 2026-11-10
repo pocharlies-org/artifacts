@@ -6,7 +6,7 @@
        served anonymously: they fall through to the gated rule, where the gate 404s them.
        Writes are refused before login on the whole host.
 
-       Middleware order on the artifact rule is [errors, gate-auth, csp] — see
+       Middleware order on the artifact rule is [errors, gate-auth, strip, csp] — see
        gate-middlewares.yaml: errors must be outermost to turn the gate's 401 into a 302
        sign-in, and csp innermost so it only stamps MinIO responses (a sandbox CSP on the
        deny page would block its Request-access form).
@@ -83,7 +83,9 @@ spec:
       services:
         - {name: {{ $m.service }}, port: {{ $m.port }}}
     {{- end }}
-    # 3. Artifact read: forwardAuth to the gate (login + per-artifact ACL), then MinIO GET/HEAD.
+    # 3. Artifact read: forwardAuth to the gate (login + per-artifact ACL), then MinIO GET/HEAD
+    #    carrying the gate's SigV4 headers (gate-auth authResponseHeaders). strip runs after
+    #    gate-auth: the gate still sees the session cookie, MinIO does not (8 KB header cap).
     #    Bucket-level paths (`/<bucket>`, `/<bucket>/?list-type=2`) and `.acl.json` never match
     #    a serving rule here: the gate answers 404 for them (no listing, ACLs are never served).
     #    pub/ .acl.json and pub/ trailing-slash paths land here from rule 2's exclusions and 404.
@@ -95,6 +97,7 @@ spec:
       middlewares:
         - {name: artifacts-errors, namespace: {{ $sso }}}
         - {name: gate-auth, namespace: {{ $sso }}}
+        - {name: artifacts-strip-to-minio, namespace: {{ $sso }}}
         - {name: artifacts-csp, namespace: {{ $sso }}}
       services:
         - {name: {{ $m.service }}, port: {{ $m.port }}}

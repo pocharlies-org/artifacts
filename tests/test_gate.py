@@ -368,6 +368,29 @@ class SigV4Test(unittest.TestCase):
         self.assertIn("SignedHeaders=host;x-amz-content-sha256;x-amz-date", h1["Authorization"])
         self.assertEqual(h1["x-amz-content-sha256"], gate.hashlib.sha256(b"").hexdigest())
 
+    def test_aws_published_get_object_vector(self):
+        # AWS SigV4 docs, "Example: GET Object" (header-based auth, Range signed):
+        # independent check of the signing math the upstream read headers rely on.
+        h = gate.sigv4_headers("GET", "examplebucket.s3.amazonaws.com", "/test.txt", [],
+                               {"range": "bytes=0-9"}, b"", "AKIAIOSFODNN7EXAMPLE",
+                               "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                               amzdate="20130524T000000Z")
+        self.assertEqual(h["Authorization"],
+                         "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/"
+                         "aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, "
+                         "Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41")
+
+    def test_upstream_auth_headers_refuse_s3_queries(self):
+        self.assertIsNone(gate.upstream_auth_headers("GET", "h", "/artifacts/u/r/a.html?acl",
+                                                     "AK", "SK"))
+        self.assertIsNone(gate.upstream_auth_headers(
+            "GET", "h", "/artifacts/u/r/a.html?response-content-type=text/html", "AK", "SK"))
+        h = gate.upstream_auth_headers("HEAD", "h", "/artifacts/u/r/a%20b.html", "AK", "SK",
+                                       amzdate="20260101T000000Z")
+        want = gate.sigv4_headers("HEAD", "h", "/artifacts/u/r/a b.html", [], None, b"",
+                                  "AK", "SK", amzdate="20260101T000000Z")
+        self.assertEqual(h["Authorization"], want["Authorization"])
+
     def test_url_has_leading_slash_and_quoting(self):
         c = gate.MinioClient("http://minio:9000", "AK", "SK", "artifacts")
         self.assertEqual(c._url("pub/a b.txt"), "http://minio:9000/artifacts/pub/a%20b.txt")

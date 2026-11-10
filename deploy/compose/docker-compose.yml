@@ -40,22 +40,36 @@ services:
   dex:
     image: dexidp/dex:v2.41.1
     command: ["dex", "serve", "/dex/config.yaml"]
-    environment:
-      # Dex issuer must match what oauth2-proxy validates against. host.docker.internal
-      # is reachable from the containers (Docker Desktop) and from the host via :5556.
-      DEX_ISSUER: http://host.docker.internal:5556/dex
+    # issuer http://127.0.0.1:5556/dex is set in config/dex-config.yaml. No
+    # host.docker.internal: that name does not resolve on a Linux host, and the
+    # loopback-only published port is not reachable through the Docker gateway.
     ports:
       - "127.0.0.1:5556:5556"
     volumes:
       - ./config/dex-config.yaml:/dex/config.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5556/dex/.well-known/openid-configuration >/dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      default:
+        # oauth2-proxy lives in this network namespace: give it its service name on the
+        # compose network so the gate and Caddy keep calling oauth2-proxy:4180.
+        aliases: [oauth2-proxy]
 
   oauth2-proxy:
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+    # share Dex's network namespace: the issuer 127.0.0.1:5556 is Dex from here as well
+    network_mode: "service:dex"
     command:
       - --provider=oidc
-      - --oidc-issuer-url=http://host.docker.internal:5556/dex
+      - --oidc-issuer-url=http://127.0.0.1:5556/dex
       - --email-domain=*
-      - --oidc-email-claim=preferred_username
+      # Dex's preferred_username is the bare username ("test"); the e-mail the ACLs are
+      # keyed on is the `email` claim. (The Helm chart uses preferred_username: on Entra
+      # that is the UPN.)
+      - --oidc-email-claim=email
       - --oidc-groups-claim=groups
       - --scope=openid email profile groups
       - --code-challenge-method=S256
@@ -76,9 +90,9 @@ services:
       - --skip-jwt-bearer-tokens=true
       - --http-address=0.0.0.0:4180
       - --upstream=static://202
-    # the OIDC issuer is host.docker.internal; make it resolve on Linux Docker Engine
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    depends_on: [dex]
+    # OIDC discovery runs once at startup: wait until Dex answers it
+    depends_on: {dex: {condition: service_healthy}}
+    restart: on-failure
 
   gate:
     image: python:3.12-slim

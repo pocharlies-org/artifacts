@@ -6,7 +6,9 @@ Role in the chain (Traefik IngressRoute `artifacts-routes`, ns minio):
 
     browser ──(Entra cookie)──► Traefik ──forwardAuth──► THIS GATE ──/auth──► oauth2-proxy-artifacts
                                         │                                        (Entra session check)
-                                        └──(allowed)──► MinIO GET/HEAD (anonymous bucket policy)
+                                        └──(allowed)──► MinIO GET/HEAD, SigV4-signed by the gate
+                                                         (Authorization/X-Amz-* from the forwardAuth
+                                                         answer; see upstream_auth_headers)
 
 The gate answers Traefik's forwardAuth (`GET /_gate/auth`): it authenticates the visitor by calling
 oauth2-proxy's own `/auth` endpoint with the visitor's cookie (so it NEVER trusts client-supplied
@@ -434,6 +436,40 @@ def _bad_key(key):
     return False
 
 
+# S3 query parameters a gate-signed upstream read must never carry: sub-resources (they are not
+# plain object reads) and response-* overrides (a signed request may override Content-Type /
+# Content-Disposition, which an anonymous one cannot). Anything else (?v=2, ?tab=x) is signed
+# and passed through, MinIO ignores it on GetObject.
+_S3_RESERVED_QUERY = frozenset({
+    "acl", "attributes", "cors", "delete", "delimiter", "encoding-type", "legal-hold",
+    "lifecycle", "list-type", "location", "logging", "max-keys", "marker", "notification",
+    "object-lock", "partnumber", "policy", "prefix", "replication", "restore", "retention",
+    "select", "select-type", "start-after", "tagging", "torrent", "uploadid", "uploads",
+    "versionid", "versioning", "versions", "website"})
+
+
+def upstream_auth_headers(method, host, uri, access_key, secret_key, amzdate=None):
+    """SigV4 headers for the proxy's upstream request to MinIO, returned on a forwardAuth ALLOW.
+
+    The artifact bucket has no anonymous read policy outside pub/ (and none at all on a host
+    with anonymous pub/ disabled), so after the gate allows a read the reverse proxy forwards it
+    to MinIO carrying these headers (Traefik forwardAuth `authResponseHeaders`, Caddy
+    `forward_auth copy_headers`). They are signed with the gate's own read-only S3 user and bind
+    the method, the Host MinIO will see (the proxy passes the visitor's Host through), the exact
+    path and the query; they never reach the visitor. Returns None when the query carries an S3
+    sub-resource or response override (the read is then refused)."""
+    parts = urllib.parse.urlsplit(uri)
+    pairs = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    for k, _v in pairs:
+        lk = k.lower()
+        if lk in _S3_RESERVED_QUERY or lk.startswith(("response-", "x-amz-", "x-minio-")):
+            return None
+    h = sigv4_headers(method, host, urllib.parse.unquote(parts.path), pairs, None, b"",
+                      access_key, secret_key, amzdate=amzdate)
+    return {"Authorization": h["Authorization"], "X-Amz-Date": h["x-amz-date"],
+            "X-Amz-Content-Sha256": h["x-amz-content-sha256"]}
+
+
 def plugin_authz_decision(email, groups, key, acl, now, head_status, tags=None, last_modified=None):
     """Build the /_gate/plugin/authz answer (docs/plugins.md §1) from the SAME decide() the
     forwardAuth path uses — plugins must never re-implement the decision. `email` empty means
@@ -781,7 +817,15 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._send(405, self._page("Method not allowed", "<p>Only GET and HEAD are served.</p>"))
         verdict, key, _acl = self._authz_for(uri)
         if verdict == "allow":
-            return self._send(200, b"ok", "text/plain")
+            # the proxy's upstream read is signed by the gate (see upstream_auth_headers); the
+            # Host is the one the proxy will pass through to MinIO
+            host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
+                    or PUBLIC_HOST).split(",")[0].strip()
+            sig = upstream_auth_headers(method, host, uri, MINIO_ACCESS_KEY, MINIO_SECRET_KEY)
+            if sig is None:
+                LOG.warning("forwardAuth: S3 sub-resource/override query refused: %s", uri)
+                return self._send(404, self._page("Not found", "<p>Nothing here.</p>"))
+            return self._send(200, b"ok", "text/plain", extra=sig)
         if verdict == "unauth_401":
             return self._send(401, b"login required", "text/plain")   # errors middleware -> 302 sign_in
         if verdict == "unauth_500":

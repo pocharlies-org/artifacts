@@ -3,6 +3,7 @@
 #   1. writes (non-GET/HEAD)       -> gate (405 before any login)
 #   2. anonymous pub/ GET/HEAD     -> MinIO (no .acl.json, no trailing-slash listings)
 #   3. artifact GET/HEAD           -> forwardAuth to the gate's decision listener, then MinIO
+#                                     with the gate's SigV4 headers (no anonymous read off pub/)
 #   4. /_gate/* (not auth/healthz) -> gate
 #   5. /oauth2/*                   -> oauth2-proxy
 {
@@ -24,6 +25,7 @@
 		respond @pubbad 404
 		header Content-Security-Policy "sandbox allow-scripts"
 		reverse_proxy minio:9000 {
+			header_up -Authorization
 			header_up -Cookie
 			header_up -X-Auth-Request-User
 			header_up -X-Auth-Request-Email
@@ -34,9 +36,12 @@
 
 	@gated path /artifacts/*
 	handle @gated {
+		# On allow the gate answers with SigV4 headers for this exact read (the bucket has
+		# no anonymous policy outside pub/): copy them onto the upstream request, replacing
+		# whatever the visitor sent (e.g. a Bearer id_token).
 		forward_auth gate:8081 {
 			uri /_gate/auth
-			copy_headers Cookie Authorization
+			copy_headers Authorization X-Amz-Date X-Amz-Content-Sha256
 			@needsauth status 401
 			handle_response @needsauth {
 				redir "http://127.0.0.1:8080/oauth2/sign_in?rd={uri}" 302

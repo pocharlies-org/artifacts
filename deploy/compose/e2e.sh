@@ -29,6 +29,13 @@ for i in $(seq 1 60); do
   sleep 2
 done
 curl -sf "$BASE/_gate/healthz" >/dev/null || { echo "stack not ready"; exit 1; }
+# oauth2-proxy (the gate's identity backend) must answer too, or gated reads 500
+for i in $(seq 1 60); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/oauth2/sign_in")
+  [[ "$code" != 000 && "$code" != 502 ]] && break
+  sleep 2
+done
+[[ "$code" != 000 && "$code" != 502 ]] || { echo "oauth2-proxy not ready ($code)"; exit 1; }
 
 # ---- publish a pub/ artifact with the CLI (prints plugin links) ------------------------
 RUN="e2e-$(date +%s)"
@@ -59,9 +66,15 @@ check "gated read redirects to login" 302 "$(curl -s -o /dev/null -w '%{http_cod
 
 # ---- gated read: 200 with a Dex id_token as Bearer --------------------------------------
 TOKEN=$(curl -sf -X POST http://127.0.0.1:5556/dex/token \
-  -d 'grant_type=password&username=test@example.com&password=test-password&client_id=artifacts-dev&client_secret=artifacts-dev-secret-not-a-real-secret&scope=openid' \
+  -d 'grant_type=password&username=test@example.com&password=test-password&client_id=artifacts-dev&client_secret=artifacts-dev-secret-not-a-real-secret&scope=openid email profile' \
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["id_token"])')
 check "gated read with Bearer id_token" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL")"
+check "gated HEAD with Bearer id_token" 200 "$(curl -s -o /dev/null -I -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL")"
+check "gated CSP sandbox" "sandbox allow-scripts" \
+  "$(curl -sI -H "Authorization: Bearer $TOKEN" "$GATED_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-security-policy"{print $2}')"
+# the gate signs the upstream read; MinIO itself serves nothing anonymously off pub/
+check "direct anonymous MinIO read of u/ refused" 403 "$(curl -s -o /dev/null -w '%{http_code}' "$S3/artifacts/u/$RUN2/index.html")"
+check "S3 response override query refused" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL?response-content-type=text/plain")"
 
 # ---- bootstrap-job regression: two-arg `mc admin user add` against real MinIO -----------
 # (helm/artifacts/templates/bootstrap-job.yaml uses the same command shape; the one-arg
@@ -81,7 +94,8 @@ check "listing not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Aut
 check "_plugins not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/artifacts/_plugins/canvas/x.bin")"
 check "_gate state not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/artifacts/_gate/req/x.json")"
 check "writes refused (PUT)" 405 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -d x "$BASE/artifacts/whatever")"
-check "traversal refused" 400 "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is "$BASE/artifacts/u/$RUN2/../..%2f.acl.json" -H "Authorization: Bearer $TOKEN")"
+# forwardAuth answers 404 for every never-served key (ACLs, state, listings, traversal)
+check "traversal refused" 404 "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is "$BASE/artifacts/u/$RUN2/../..%2f.acl.json" -H "Authorization: Bearer $TOKEN")"
 
 # ---- MCP publish (stdlib lib path; the SDK wiring is unit-tested) ------------------------
 mcp_out=$(cd ../../mcp && ARTIFACTS_ENDPOINT="$S3" ARTIFACTS_ACCESS_KEY=minioadmin \
