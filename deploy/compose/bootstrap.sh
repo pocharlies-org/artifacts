@@ -49,4 +49,25 @@ mc admin user add local "$GATE_USER" "$GATE_PASSWORD" >/dev/null
 mc admin policy attach local artifact-gate --user "$GATE_USER" >/dev/null
 mc admin user add local "$READ_USER" "$READ_PASSWORD" >/dev/null
 mc admin policy attach local artifact-gate-read --user "$READ_USER" >/dev/null
-echo "bootstrap done: bucket=$BUCKET users=$GATE_USER,$READ_USER"
+
+# Plugin users (docs/plugins.md §3, same policy as the Helm bootstrap Job): PLUGIN_USERS is
+# `<name>:<secret>[,<name>:<secret>...]` (dev placeholders from the plugin's compose file).
+# User plugin-<name>: Get/Put/Delete/Tagging on _plugins/<name>/* and ListBucket restricted
+# to that prefix, nothing else.
+PLUGINS_DONE=""
+for entry in $(printf '%s' "${PLUGIN_USERS:-}" | tr ',' ' '); do
+  name="${entry%%:*}"; secret="${entry#*:}"
+  if ! printf '%s' "$name" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$' || [ "$secret" = "$entry" ] || [ -z "$secret" ]; then
+    echo "PLUGIN_USERS entry '$name' must be <dns-1123-name>:<secret>" >&2; exit 1
+  fi
+  cat > "/tmp/policy-plugin-$name.json" <<JSON
+{"Version":"2012-10-17","Statement":[
+  {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:GetObjectTagging","s3:PutObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/_plugins/${name}/*"]},
+  {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::${BUCKET}"],"Condition":{"StringLike":{"s3:prefix":["_plugins/${name}/*"]}}}]}
+JSON
+  mc admin policy create local "plugin-$name" "/tmp/policy-plugin-$name.json" >/dev/null
+  mc admin user add local "plugin-$name" "$secret" >/dev/null
+  mc admin policy attach local "plugin-$name" --user "plugin-$name" >/dev/null
+  PLUGINS_DONE="$PLUGINS_DONE plugin-$name"
+done
+echo "bootstrap done: bucket=$BUCKET users=$GATE_USER,$READ_USER plugins=[${PLUGINS_DONE# }]"

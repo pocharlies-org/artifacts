@@ -5,6 +5,13 @@
 #   docker compose up -d
 #   docker compose up bootstrap          # one-shot: bucket, ILM, anonymous pub/, S3 users
 #   ./e2e.sh                             # full end-to-end (publish, reads, negatives)
+#
+# Plugins (docs/plugins.md) join this stack without editing it: a plugin's own compose file
+# `include:`s this one and sets these variables (all empty/defaults here):
+#   ARTIFACTS_CADDY_PLUGINS  Caddy lines `import plugin /_<name>/ <service>:<port>` (route)
+#   ARTIFACTS_PLUGIN_USERS   `<name>:<secret>[,<name>:<secret>...]` -> S3 user plugin-<name>
+#                            scoped to _plugins/<name>/ (bootstrap.sh)
+#   GATE_ACL_CACHE_SECONDS   gate ACL cache (default 15; plugins testing revocation lower it)
 name: artifacts
 services:
   minio:
@@ -33,6 +40,8 @@ services:
     image: bitnamilegacy/minio@sha256:d7cd0e172c4cc0870f4bdc3142018e2a37be9acf04d68f386600daad427e0cab  # same frozen legacy image; mc bundled inside
     depends_on: {minio: {condition: service_healthy}}
     entrypoint: ["/bin/sh", "/bootstrap/bootstrap.sh"]
+    environment:
+      PLUGIN_USERS: ${ARTIFACTS_PLUGIN_USERS:-}
     volumes:
       - ./bootstrap.sh:/bootstrap/bootstrap.sh:ro
     restart: "no"
@@ -110,6 +119,7 @@ services:
       PUBLIC_HOST: 127.0.0.1:8080
       GATE_ANONYMOUS_PUB_ENABLED: "true"
       GATE_AUTH_PORT: "8081"
+      GATE_ACL_CACHE_SECONDS: ${GATE_ACL_CACHE_SECONDS:-15}
       HMAC_KEY_FILE: /secrets/hmac-key
     volumes:
       - ../../gate/gate.py:/app/gate.py:ro
@@ -120,6 +130,8 @@ services:
     image: caddy:2
     ports:
       - "127.0.0.1:8080:80"
+    environment:
+      ARTIFACTS_CADDY_PLUGINS: ${ARTIFACTS_CADDY_PLUGINS:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on: [gate, oauth2-proxy]

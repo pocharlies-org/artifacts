@@ -6,11 +6,32 @@
 #                                     with the gate's SigV4 headers (no anonymous read off pub/)
 #   4. /_gate/* (not auth/healthz) -> gate
 #   5. /oauth2/*                   -> oauth2-proxy
+#   6. plugin routes               -> plugin services (env ARTIFACTS_CADDY_PLUGINS, see below)
 {
 	admin off
 }
 
+# Plugin route (docs/plugins.md §2), the compose equivalent of the chart's plugins-routes:
+# `import plugin <pathPrefix> <service:port>` passes the whole prefix through (WebSockets
+# included) and drops any client-supplied identity headers; the plugin asks the gate.
+(plugin) {
+	handle {args[0]}* {
+		reverse_proxy {args[1]} {
+			header_up -X-Auth-Request-User
+			header_up -X-Auth-Request-Email
+			header_up -X-Auth-Request-Preferred-Username
+			header_up -X-Auth-Request-Groups
+		}
+	}
+}
+
 :80 {
+	# Plugins: one `import plugin /_<name>/ <service>:<port>` line per plugin, newline
+	# separated, from the caddy service's ARTIFACTS_CADDY_PLUGINS (empty = no plugins).
+	# Caddy substitutes {$VAR} before parsing, so the lines become directives here. A plugin
+	# prefix must start with /_, end with /, and never be /_gate/, /_plugins/ or /oauth2/.
+	{$ARTIFACTS_CADDY_PLUGINS}
+
 	@write {
 		path /artifacts/*
 		not method GET HEAD

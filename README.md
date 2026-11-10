@@ -62,8 +62,10 @@ docker compose up bootstrap   # bucket, ILM rules, anonymous pub/ policy, gate S
 ```
 
 Then open <http://127.0.0.1:8080/artifacts/pub/<run>/index.html> — anonymous `pub/`
-reads work; gated reads (`/artifacts/u/...`) redirect to Dex login
-(`test@example.com` / `test-password`). Publish your own:
+reads work; gated reads (`/artifacts/u/...`) redirect to Dex login. Dex has three static
+dev users: `test@example.com` / `test-password`, `test2@example.com` / `test2-password` and
+`test3@example.com` / `test3-password` (the extra two let plugins test sharing and refusals).
+Publish your own:
 
 ```bash
 ARTIFACTS_ACCESS_KEY=minioadmin ARTIFACTS_SECRET_KEY=minioadmin \
@@ -78,6 +80,32 @@ ARTIFACTS_WRITE_BASE=http://127.0.0.1:9000 ARTIFACTS_READ_BASE=http://127.0.0.1:
 > `bitnamilegacy/minio` (digest-pinned): a **frozen legacy mirror**, because the
 > original `minio/minio`/`minio/mc` RELEASE tags were removed from Docker Hub; it
 > bundles the `mc` client at `/opt/bitnami/minio-client/bin/mc`.
+
+### Plugins in the compose stack
+
+A plugin joins this stack **without editing it**: its own compose file `include:`s
+`deploy/compose/docker-compose.yml`, adds its service, and sets the stack's plugin
+variables (empty by default):
+
+| Variable | Effect |
+|---|---|
+| `ARTIFACTS_CADDY_PLUGINS` | Caddy lines, one per plugin: `import plugin /_<name>/ <service>:<port>` — routes the whole prefix (WebSockets included) to the plugin, like the chart's plugin routes |
+| `ARTIFACTS_PLUGIN_USERS` | `<name>:<secret>[,…]` — `bootstrap.sh` creates S3 user `plugin-<name>` with the policy of docs/plugins.md §3 (`_plugins/<name>/*` only) |
+| `GATE_ACL_CACHE_SECONDS` | the gate's ACL cache (default 15 s); lower it to see revocations quickly |
+
+The plugin asks the real gate (`http://gate:8081/_gate/plugin/authz`) and uses the real
+MinIO (`http://minio:9000`). `e2e.sh` keeps passing with plugins enabled (run it from this
+directory; it finds the running project by name). The canvas plugin ships such a file:
+[`pocharlies-org/artifacts-canvas`](https://github.com/pocharlies-org/artifacts-canvas),
+`deploy/compose/compose.yml` — with both repos cloned side by side:
+
+```bash
+git clone -b feat/initial-import https://github.com/pocharlies-org/artifacts.git
+git clone -b feat/integrate https://github.com/pocharlies-org/artifacts-canvas.git
+cd artifacts-canvas/deploy/compose
+docker compose up -d --build --wait     # core + canvas (bootstrap included)
+# open http://127.0.0.1:8080/_canvas/artifacts/<key> (the CLI prints the link)
+```
 
 ## Quick start (Kubernetes)
 

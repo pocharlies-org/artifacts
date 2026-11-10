@@ -81,6 +81,15 @@ check "gated read redirects to login" 302 "$(curl -s -o /dev/null -w '%{http_cod
 TOKEN=$(curl -sf -X POST http://127.0.0.1:5556/dex/token \
   -d 'grant_type=password&username=test@example.com&password=test-password&client_id=artifacts-dev&client_secret=artifacts-dev-secret-not-a-real-secret&scope=openid email profile' \
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["id_token"])')
+# the second and third static Dex users exist (plugins test sharing and refusals with them)
+for n in 2 3; do
+  tok=$(curl -sf -X POST http://127.0.0.1:5556/dex/token \
+    -d "grant_type=password&username=test$n@example.com&password=test$n-password&client_id=artifacts-dev&client_secret=artifacts-dev-secret-not-a-real-secret&scope=openid email profile" \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin)["id_token"])' 2>/dev/null)
+  check "Dex user test$n logs in" yes "$([[ -n "$tok" ]] && echo yes || echo no)"
+  # signed in, but not on the ACL of a test@example.com artifact: the deny page, never the object
+  check "test$n is denied test@example.com's artifact" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $tok" "$GATED_URL")"
+done
 check "gated read with Bearer id_token" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL")"
 check "gated HEAD with Bearer id_token" 200 "$(curl -s -o /dev/null -I -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL")"
 check "gated CSP sandbox" "sandbox allow-scripts" \
@@ -114,6 +123,23 @@ print(re.search(r"Credential=([^/]+)/", r.headers["Authorization"]).group(1))')
 check "forwarded read signed by the read-signing user" artifact-reader "$cred"
 [[ "$cred" != minioadmin ]] && echo "PASS: forwarded read not signed with MinIO root ($cred)" \
   || { echo "FAIL: forwarded read signed with MinIO root"; fail=1; }
+# plugin authz (docs/plugins.md §1) against the real MinIO: the ttl tag and the expiry come
+# back (GetObjectTagging is signed correctly); the anonymous pub/ case runs after the MCP
+# publish below (pub/$RUN carries the seeded .acl.json from above)
+authz() { # <artifact path> [bearer]
+  docker compose exec -T -e A="$1" -e TOKEN="${2:-}" gate python3 -c '
+import json, os, urllib.request
+h = {"Content-Type": "application/json"}
+if os.environ["TOKEN"]: h["Authorization"] = "Bearer " + os.environ["TOKEN"]
+r = urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8081/_gate/plugin/authz",
+    data=json.dumps({"artifact": os.environ["A"]}).encode(), headers=h))
+a = json.load(r)
+print(a["allowed"], a["reason"], a["user"]["id"], a["artifact"]["ttl"], bool(a["artifact"]["expires"]))'
+}
+check "plugin authz: ACL user on u/ carries ttl + expiry" "True user test@example.com 1 True" \
+  "$(authz "/artifacts/u/$RUN2/index.html" "$TOKEN")"
+check "plugin authz: anonymous on u/ is unauthenticated" "False unauthenticated None None False" \
+  "$(authz "/artifacts/u/$RUN2/index.html")"
 gate_env=$(docker compose exec -T gate sh -c 'echo "$MINIO_ACCESS_KEY $MINIO_SECRET_KEY $GATE_READ_ACCESS_KEY $GATE_READ_SECRET_KEY"')
 check "gate holds no MinIO root credential" 0 "$(echo "$gate_env" | tr ' ' '\n' | grep -cx minioadmin)"
 # the read-signing user: reads artifacts, nothing else (ACLs, state, listing, writes denied)
@@ -164,6 +190,8 @@ echo "$mcp_out" | sed 's/^/  mcp| /'
 MCP_KEY=$(echo "$mcp_out" | head -1)
 MCP_URL=$(echo "$mcp_out" | tail -1)
 check "MCP artifact readable" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/artifacts/$MCP_KEY")"
+check "plugin authz: anonymous pub/ carries ttl + expiry" "True pub: anonymous (anonymous-pub enabled) None 1 True" \
+  "$(authz "/artifacts/$MCP_KEY")"
 [[ "$MCP_URL" == "$BASE/_canvas/artifacts/$MCP_KEY" ]] \
   && echo "PASS: MCP printed the plugin link" || { echo "FAIL: MCP plugin link wrong: $MCP_URL"; fail=1; }
 

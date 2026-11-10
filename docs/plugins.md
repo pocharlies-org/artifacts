@@ -116,6 +116,11 @@ plugins:
   served with `Content-Security-Policy: sandbox allow-scripts` (opaque origin). Plugin
   pages hold the user's session; artifact iframes must not gain access to them.
 
+**Local compose stack.** `deploy/compose/` renders the same route with Caddy: a plugin's
+compose file sets `ARTIFACTS_CADDY_PLUGINS="import plugin /_<name>/ <service>:<port>"` (and
+`ARTIFACTS_PLUGIN_USERS="<name>:<secret>"` for its S3 user, §3) — see the README, "Plugins in
+the compose stack".
+
 ## 3. Storage
 
 - Each plugin owns the bucket prefix **`_plugins/<name>/`** and nothing else.
