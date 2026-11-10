@@ -114,13 +114,24 @@ spec:
         {{ $hostMatch }} && PathPrefix(`/_gate/`) && !Path(`/_gate/auth`) && !Path(`/_gate/healthz`)
       services:
         - {name: artifact-gate, namespace: {{ $sso }}, port: 8080}
-    # 5. oauth2-proxy endpoints for this host (sign_in, callback, sign_out). /auth is NOT routed:
-    #    only the gate calls it, in-cluster, and it answers with the session's id_token. Excluded
-    #    as a PREFIX (any case): oauth2-proxy also serves it as /auth/, /auth;x and /auth%2f, and
-    #    it decodes the path again (/%2561uth answers as /auth), so a path that still holds a '%'
-    #    after Traefik's decoding is excluded too (no browser endpoint has one).
+    # 5. oauth2-proxy browser endpoints for this host: an ALLOW-LIST, nothing else under the
+    #    prefix is routed. oauth2-proxy runs with --upstream=static://202 and
+    #    --set-authorization-header, so EVERY path its own router does not claim (/auth, which
+    #    only the gate calls in-cluster, but also /zzz, /, /ping, /userinfo, /sign_inX,
+    #    /SIGN_IN...) is authenticated and answered 202 + `Authorization: Bearer <id_token>`.
+    #    Routed: sign_in, start, callback, sign_out (exact, case-sensitive like oauth2-proxy's
+    #    router) and static/<file> (its CSS and fonts; file names only, no dot segment, no '%',
+    #    no listing). Query strings are not part of the path, so ?rd= / ?code=&state= pass.
+    #    Relies on Traefik >= v3.5 routing semantics (pkg/muxer/http withRoutingPath and the
+    #    entryPoint normalizePath/sanitizePath handlers): the rules match the normalized path
+    #    (unreserved %XX decoded, dot segments and '//' removed, reserved %XX such as %2F %3B
+    #    %25 kept encoded) and that same normalized path is what oauth2-proxy receives, so an
+    #    exact match here is an exact match there. tests/check_oauth2_routes.py models this.
     - kind: Rule
       priority: 300
-      match: {{ $hostMatch }} && PathPrefix(`/oauth2-artifacts/`) && !PathRegexp(`(?i)^/+oauth2-artifacts/+(auth|.*%)`)
+      match: >-
+        {{ $hostMatch }} && (Path(`/oauth2-artifacts/sign_in`) || Path(`/oauth2-artifacts/start`)
+        || Path(`/oauth2-artifacts/callback`) || Path(`/oauth2-artifacts/sign_out`)
+        || PathRegexp(`^/oauth2-artifacts/static/([A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+$`))
       services:
         - {name: oauth2-proxy-artifacts, namespace: {{ $sso }}, port: 4180}

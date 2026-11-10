@@ -5,7 +5,8 @@
 #   3. artifact GET/HEAD           -> forwardAuth to the gate's decision listener, then MinIO
 #                                     with the gate's SigV4 headers (no anonymous read off pub/)
 #   4. /_gate/* (not auth/healthz) -> gate
-#   5. /oauth2/*                   -> oauth2-proxy
+#   5. /oauth2/ browser endpoints  -> oauth2-proxy, ALLOW-LIST only: sign_in, start, callback,
+#                                     sign_out, static/<file>; any other /oauth2 path -> 404
 #   6. plugin routes               -> plugin services (env ARTIFACTS_CADDY_PLUGINS, see below)
 {
 	admin off
@@ -85,20 +86,31 @@
 		reverse_proxy gate:8080
 	}
 
-	# /oauth2/auth is the gate's in-network identity check (it answers with the session's
-	# id_token, --set-authorization-header): never reachable from the browser side. Blocked
-	# as a PREFIX, not an exact path: oauth2-proxy also serves it as /oauth2/auth/,
-	# /oauth2/auth;x and /oauth2/auth%2f. path_regexp matches the decoded, cleaned path
-	# (%2f, %61, //, /./ and /x/../ all fold onto it); (?i) covers any case. oauth2-proxy
-	# decodes the path AGAIN (/oauth2/%2561uth answers as /auth), so a path that still holds
-	# a '%' after Caddy's decoding is refused too (no browser endpoint has one).
-	@oauth2auth path_regexp (?i)^/+oauth2/+(auth|.*%)
-	handle @oauth2auth {
-		respond 404
+	# oauth2-proxy: ALLOW-LIST of its browser endpoints. It runs with --upstream=static://202
+	# and --set-authorization-header, so EVERY path its own router does not claim (/auth, but
+	# also /zzz, /, /ping, /userinfo, /sign_inX, /SIGN_IN...) is authenticated and answered
+	# 202 + `Authorization: Bearer <id_token>`. Its router (gorilla/mux, UseEncodedPath) is
+	# case-sensitive and matches the RAW, still-encoded path, so a spelling Caddy decodes or
+	# cleans onto an allowed endpoint (/oauth2/%73ign_in, /oauth2/x/../sign_in) would still
+	# miss it there and fall to that 202. Two conditions, both case-sensitive:
+	#   path_regexp  the decoded, cleaned path Caddy sees is exactly an allowed endpoint;
+	#   vars_regexp  the request target AS SENT (orig_uri: no '%', no '//', no dot segment,
+	#                same case) is that same endpoint plus an optional query string.
+	# So oauth2-proxy only ever receives /oauth2/<endpoint>[?query] verbatim.
+	# static/<file>: the proxy's own CSS and fonts (error pages); file names only, no listing.
+	@oauth2browser {
+		path_regexp `^/oauth2/(sign_in|start|callback|sign_out|static/([A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+)$`
+		vars_regexp {http.request.orig_uri} `^/oauth2/(sign_in|start|callback|sign_out|static/([A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+)([?].*)?$`
+	}
+	handle @oauth2browser {
+		reverse_proxy oauth2-proxy:4180
 	}
 
-	handle /oauth2/* {
-		reverse_proxy oauth2-proxy:4180
+	# Everything else under /oauth2 (any case, any encoding, /auth included: the gate's
+	# in-network identity check) is never routed to oauth2-proxy.
+	@oauth2other path_regexp (?i)^/+oauth2
+	handle @oauth2other {
+		respond 404
 	}
 
 	respond 404

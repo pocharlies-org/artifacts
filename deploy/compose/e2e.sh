@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # e2e.sh — end-to-end test of the local stack: publish with the CLI, read anonymously
-# (pub/), read gated (302 without login, 200 with a Dex id_token as Bearer), and the
+# (pub/), read gated (302 without login, 200 with a Dex id_token as Bearer, 200 after a
+# browser login through sign_in/Dex/callback), and the
 # negative checks (no .acl.json, no _plugins/, no listing, no writes, no query strings, no
 # client S3 headers, the gate never signs with MinIO root).
 # Requires: docker compose, curl, python3. The publisher renders .md inputs with the
@@ -152,23 +153,22 @@ print(u["id"], "|", u["name"])'
 }
 check "plugin authz: display name from the name claim" "test@example.com | Test One" \
   "$(authz_user "/artifacts/u/$RUN2/index.html" "$TOKEN")"
-# oauth2-proxy's /auth (answers 202 + the session's id_token) is never reachable from the
-# browser side, in any spelling oauth2-proxy (or a path cleaner in front of it) would route
-# to it — oauth2-proxy decodes the path again, so double/triple encodings count too.
-# --path-as-is sends each spelling verbatim.
-for p in /oauth2/auth /oauth2/auth/ '/oauth2/auth;x' /oauth2/auth%2f /oauth2/auth%2F /oauth2/auth/x \
-         '/oauth2/auth?x=1' //oauth2/auth /oauth2//auth /oauth2/./auth /oauth2/x/../auth \
-         /oauth2/%61uth /oauth2/%2561uth /oauth2/%252561uth /oauth2/%2561UTH /oauth2/x%252f..%252fauth \
-         /oauth2/AUTH /OAUTH2/auth /oauth2/Auth/; do
-  hdrs=$(curl -s --path-as-is -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE$p")
-  code=$(printf '%s' "$hdrs" | awk 'NR==1{print $2}')
-  leak=$(printf '%s' "$hdrs" | grep -ciE '^(authorization|x-auth-request-email):')
-  check "oauth2-proxy /auth not reachable from the browser side: $p" "404 0" "$code $leak"
-done
-# the browser endpoints oauth2-proxy must keep serving
-code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/oauth2/sign_in")
-[[ "$code" == 200 || "$code" == 302 ]] && echo "PASS: oauth2-proxy sign_in still routed ($code)" \
-  || { echo "FAIL: oauth2-proxy sign_in not routed ($code)"; fail=1; }
+# oauth2-proxy (--upstream=static://202, --set-authorization-header) answers 202 + the
+# session's id_token for EVERY path its router does not claim: /auth, but also /zzz, /,
+# /ping, /sign_inX, /SIGN_IN... Caddy routes an allow-list only (sign_in, start, callback,
+# sign_out, static/<file>). tests/oauth2_probe.py sends each spelling verbatim over a raw
+# socket with the valid Bearer id_token: no 202, no Authorization / X-Auth-Request-* answer,
+# 400/404 for the blocked ones; the browser endpoints still reach oauth2-proxy.
+probe_out=$(OAUTH2_PROBE_TOKEN="$TOKEN" python3 -I ../../tests/oauth2_probe.py probe 127.0.0.1:8080)
+probe_rc=$?
+echo "$probe_out"
+[[ $probe_rc -eq 0 ]] || { echo "FAIL: oauth2 raw probe (exit $probe_rc)"; fail=1; }
+# browser login end to end (no Bearer): gated read -> sign_in -> Dex login -> approval ->
+# callback (session cookie) -> the same gated read answers 200 with the artifact
+login_out=$(python3 -I ../../tests/oauth2_probe.py login test@example.com test-password "$GATED_URL" "Run $RUN2")
+login_rc=$?
+echo "$login_out"
+[[ $login_rc -eq 0 ]] || { echo "FAIL: browser login flow (exit $login_rc)"; fail=1; }
 gate_env=$(docker compose exec -T gate sh -c 'echo "$MINIO_ACCESS_KEY $MINIO_SECRET_KEY $GATE_READ_ACCESS_KEY $GATE_READ_SECRET_KEY"')
 check "gate holds no MinIO root credential" 0 "$(echo "$gate_env" | tr ' ' '\n' | grep -cx minioadmin)"
 # the read-signing user: reads artifacts, nothing else (ACLs, state, listing, writes denied)

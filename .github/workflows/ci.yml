@@ -61,11 +61,23 @@ jobs:
               --set-string 'plugins[0].name=can-vas' --set 'plugins[0].pathPrefix=/_can-vas/' \
               --set plugins[0].service=s --set plugins[0].port=8080 \
             | grep -q 'name: artifacts-plugin-can-vas'
-      - name: helm template never routes oauth2-proxy /auth (excluded as a prefix, any case, no '%')
+      - name: helm template routes only oauth2-proxy's browser endpoints (allow-list)
         run: |
           helm template t helm/artifacts -f helm/artifacts/values.yaml | python3 -I tests/check_oauth2_routes.py
-      - name: compose Caddyfile blocks oauth2-proxy /auth as a prefix
-        run: grep -qF 'path_regexp (?i)^/+oauth2/+(auth|.*%)' deploy/compose/Caddyfile
+          helm template t helm/artifacts -f helm/artifacts/values.yaml \
+              --set artifactsGate.anonymousPubEnabled=true --set 'artifactsExtraHosts[0]=b.example.com' \
+              --set 'plugins[0].name=canvas' --set 'plugins[0].pathPrefix=/_canvas/' \
+              --set 'plugins[0].service=artifact-canvas' --set 'plugins[0].port=8080' \
+            | python3 -I tests/check_oauth2_routes.py
+      - name: compose Caddyfile routes only oauth2-proxy's browser endpoints (allow-list)
+        run: |
+          grep -qF 'vars_regexp {http.request.orig_uri} `^/oauth2/(sign_in|start|callback|sign_out|static/' deploy/compose/Caddyfile
+          grep -qF '@oauth2other path_regexp (?i)^/+oauth2' deploy/compose/Caddyfile
+          if grep -qE '^[[:space:]]*handle /oauth2' deploy/compose/Caddyfile; then
+            echo "Caddyfile routes an /oauth2 prefix wholesale"; exit 1
+          fi
+      - name: oauth2 probe script parses
+        run: python3 -I -m py_compile tests/oauth2_probe.py tests/check_oauth2_routes.py
       - name: helm template wires the read-signing user (gate env + bootstrap Job)
         run: |
           out=$(helm template t helm/artifacts -f helm/artifacts/values.yaml)

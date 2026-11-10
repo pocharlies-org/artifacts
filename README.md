@@ -20,7 +20,7 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
                      │        └ every response: CSP `sandbox allow-scripts` (opaque origin)
                      ├── POST /artifacts/** ──> gate :8080  (request-access, approve, deny)
                      ├── /_gate/** (except auth/healthz) ──> gate :8080
-                     ├── /oauth2/** ──> oauth2-proxy
+                     ├── /oauth2/{sign_in,start,callback,sign_out,static/*} ──> oauth2-proxy (allow-list; rest 404)
                      └── /_<plugin>/** ──> plugin service        (plugin → gate :8081 /_gate/plugin/authz)
 ```
 
@@ -241,6 +241,7 @@ public API other plugins build against: **[docs/plugins.md](docs/plugins.md)**.
 python3 -I -m unittest discover -s tests              # unit (gate + mcp lib)
 python3 -I -m unittest discover -s tests -p 'e2e_*.py' # e2e vs fake MinIO + fake proxy
 helm lint helm/artifacts && helm template t helm/artifacts -f helm/artifacts/values.yaml
+helm template t helm/artifacts -f helm/artifacts/values.yaml | python3 -I tests/check_oauth2_routes.py
 cd deploy/compose && docker compose up -d && docker compose up bootstrap && ./e2e.sh  # full stack (Docker required)
 ```
 
