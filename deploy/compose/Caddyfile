@@ -86,8 +86,12 @@
 	}
 
 	# /oauth2/auth is the gate's in-network identity check (it answers with the session's
-	# id_token, --set-authorization-header): never reachable from the browser side.
-	handle /oauth2/auth {
+	# id_token, --set-authorization-header): never reachable from the browser side. Blocked
+	# as a PREFIX, not an exact path: oauth2-proxy also serves it as /oauth2/auth/,
+	# /oauth2/auth;x and /oauth2/auth%2f. path_regexp matches the decoded, cleaned path
+	# (%2f, %61, //, /./ and /x/../ all fold onto it); (?i) covers any case.
+	@oauth2auth path_regexp (?i)^/+oauth2/+auth
+	handle @oauth2auth {
 		respond 404
 	}
 

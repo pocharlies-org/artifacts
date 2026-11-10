@@ -152,8 +152,21 @@ print(u["id"], "|", u["name"])'
 }
 check "plugin authz: display name from the name claim" "test@example.com | Test One" \
   "$(authz_user "/artifacts/u/$RUN2/index.html" "$TOKEN")"
-check "oauth2-proxy /auth not reachable from the browser side" 404 \
-  "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/oauth2/auth")"
+# oauth2-proxy's /auth (answers 202 + the session's id_token) is never reachable from the
+# browser side, in any spelling oauth2-proxy (or a path cleaner in front of it) would route
+# to it. --path-as-is sends each spelling verbatim.
+for p in /oauth2/auth /oauth2/auth/ '/oauth2/auth;x' /oauth2/auth%2f /oauth2/auth%2F /oauth2/auth/x \
+         '/oauth2/auth?x=1' //oauth2/auth /oauth2//auth /oauth2/./auth /oauth2/x/../auth \
+         /oauth2/%61uth /oauth2/%2561uth /oauth2/AUTH /OAUTH2/auth /oauth2/Auth/; do
+  hdrs=$(curl -s --path-as-is -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE$p")
+  code=$(printf '%s' "$hdrs" | awk 'NR==1{print $2}')
+  leak=$(printf '%s' "$hdrs" | grep -ciE '^(authorization|x-auth-request-email):')
+  check "oauth2-proxy /auth not reachable from the browser side: $p" "404 0" "$code $leak"
+done
+# the browser endpoints oauth2-proxy must keep serving
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/oauth2/sign_in")
+[[ "$code" == 200 || "$code" == 302 ]] && echo "PASS: oauth2-proxy sign_in still routed ($code)" \
+  || { echo "FAIL: oauth2-proxy sign_in not routed ($code)"; fail=1; }
 gate_env=$(docker compose exec -T gate sh -c 'echo "$MINIO_ACCESS_KEY $MINIO_SECRET_KEY $GATE_READ_ACCESS_KEY $GATE_READ_SECRET_KEY"')
 check "gate holds no MinIO root credential" 0 "$(echo "$gate_env" | tr ' ' '\n' | grep -cx minioadmin)"
 # the read-signing user: reads artifacts, nothing else (ACLs, state, listing, writes denied)
