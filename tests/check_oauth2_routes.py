@@ -2,7 +2,8 @@
 
 Reads `helm template` output on stdin. Every Traefik route rule that mentions the
 oauth2-proxy prefix must exclude /auth as a PREFIX with a regex (oauth2-proxy also serves it
-as /auth/, /auth;x and /auth%2f, which Traefik decodes to /auth/), in any case, and must keep
+as /auth/, /auth;x and /auth%2f, which Traefik decodes to /auth/), in any case, refuse a
+path that still holds a '%' after one decoding (oauth2-proxy decodes again), and must keep
 the browser endpoints (sign_in, start, callback, sign_out) routed.
 Stdlib only: python3 -I tests/check_oauth2_routes.py < rendered.yaml
 """
@@ -11,7 +12,8 @@ import sys
 
 PREFIX = "/oauth2-artifacts"
 # what Traefik sees as req.URL.Path for the spellings the e2e probes (decoded, not cleaned)
-BLOCKED = ["/auth", "/auth/", "/auth;x", "/auth/x", "/AUTH", "/Auth/", "//auth"]
+# (oauth2-proxy decodes again: whatever still holds a '%' could be /auth once more)
+BLOCKED = ["/auth", "/auth/", "/auth;x", "/auth/x", "/AUTH", "/Auth/", "//auth", "/%61uth", "/%2561uth", "/x%2f..%2fauth"]
 ROUTED = ["/sign_in", "/start", "/callback", "/sign_out", "/static/css/x.css"]
 
 

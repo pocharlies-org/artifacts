@@ -154,10 +154,12 @@ check "plugin authz: display name from the name claim" "test@example.com | Test 
   "$(authz_user "/artifacts/u/$RUN2/index.html" "$TOKEN")"
 # oauth2-proxy's /auth (answers 202 + the session's id_token) is never reachable from the
 # browser side, in any spelling oauth2-proxy (or a path cleaner in front of it) would route
-# to it. --path-as-is sends each spelling verbatim.
+# to it — oauth2-proxy decodes the path again, so double/triple encodings count too.
+# --path-as-is sends each spelling verbatim.
 for p in /oauth2/auth /oauth2/auth/ '/oauth2/auth;x' /oauth2/auth%2f /oauth2/auth%2F /oauth2/auth/x \
          '/oauth2/auth?x=1' //oauth2/auth /oauth2//auth /oauth2/./auth /oauth2/x/../auth \
-         /oauth2/%61uth /oauth2/%2561uth /oauth2/AUTH /OAUTH2/auth /oauth2/Auth/; do
+         /oauth2/%61uth /oauth2/%2561uth /oauth2/%252561uth /oauth2/%2561UTH /oauth2/x%252f..%252fauth \
+         /oauth2/AUTH /OAUTH2/auth /oauth2/Auth/; do
   hdrs=$(curl -s --path-as-is -D - -o /dev/null -H "Authorization: Bearer $TOKEN" "$BASE$p")
   code=$(printf '%s' "$hdrs" | awk 'NR==1{print $2}')
   leak=$(printf '%s' "$hdrs" | grep -ciE '^(authorization|x-auth-request-email):')

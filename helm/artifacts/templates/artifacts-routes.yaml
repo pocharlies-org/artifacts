@@ -116,9 +116,11 @@ spec:
         - {name: artifact-gate, namespace: {{ $sso }}, port: 8080}
     # 5. oauth2-proxy endpoints for this host (sign_in, callback, sign_out). /auth is NOT routed:
     #    only the gate calls it, in-cluster, and it answers with the session's id_token. Excluded
-    #    as a PREFIX (any case): oauth2-proxy also serves it as /auth/, /auth;x and /auth%2f.
+    #    as a PREFIX (any case): oauth2-proxy also serves it as /auth/, /auth;x and /auth%2f, and
+    #    it decodes the path again (/%2561uth answers as /auth), so a path that still holds a '%'
+    #    after Traefik's decoding is excluded too (no browser endpoint has one).
     - kind: Rule
       priority: 300
-      match: {{ $hostMatch }} && PathPrefix(`/oauth2-artifacts/`) && !PathRegexp(`(?i)^/+oauth2-artifacts/+auth`)
+      match: {{ $hostMatch }} && PathPrefix(`/oauth2-artifacts/`) && !PathRegexp(`(?i)^/+oauth2-artifacts/+(auth|.*%)`)
       services:
         - {name: oauth2-proxy-artifacts, namespace: {{ $sso }}, port: 4180}
