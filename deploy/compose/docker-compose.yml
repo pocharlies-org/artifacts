@@ -61,7 +61,7 @@ services:
       - --code-challenge-method=S256
       - --client-id=artifacts-dev
       - --client-secret=artifacts-dev-secret-not-a-real-secret
-      - --cookie-secret=dev-cookie-secret-0123456789abcdef
+      - --cookie-secret=dev-cookie-secret-0123456789abcd  # exactly 32 bytes (AES)
       - --cookie-secure=false
       - --cookie-name=_oauth2_proxy_artifacts
       - --cookie-samesite=lax
@@ -76,6 +76,8 @@ services:
       - --skip-jwt-bearer-tokens=true
       - --http-address=0.0.0.0:4180
       - --upstream=static://202
+    # the OIDC issuer is host.docker.internal; make it resolve on Linux Docker Engine
+    extra_hosts: ["host.docker.internal:host-gateway"]
     depends_on: [dex]
 
   gate:
