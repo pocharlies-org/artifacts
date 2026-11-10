@@ -708,6 +708,50 @@ class PluginAuthzDecisionTest(unittest.TestCase):
         self.assertFalse(ans["allowed"])
         self.assertEqual(ans["reason"], "expired")
 
+    def test_expired_told_only_to_who_would_be_allowed(self):
+        acl = dict(self.ACL, expires="2020-01-01")
+        for who in ("owner@example.com", "alice@example.com"):
+            ans = self.d(who, "team/x/r.html", acl)
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "expired"), who)
+            self.assertTrue(ans["artifact"]["expires"].startswith("2020-01-01"))
+        # a stranger (and anonymous) gets the same deny as for a live artifact, no expiry/ttl
+        users_only = {k: v for k, v in self.ACL.items() if k != "groups"}
+        live = self.d("mallory@example.com", "team/x/r.html", users_only, tags={"ttl": "7"}, lm=NOW)
+        dead = self.d("mallory@example.com", "team/x/r.html", dict(users_only, expires="2020-01-01"),
+                      tags={"ttl": "7"}, lm=NOW)
+        self.assertEqual((dead["allowed"], dead["reason"]), (False, "not-listed"))
+        self.assertEqual(dead, live)
+        self.assertEqual(dead["artifact"], {"key": "team/x/r.html", "expires": None, "ttl": None})
+        anon = self.d("", "team/x/r.html", dict(users_only, expires="2020-01-01"))
+        self.assertEqual((anon["allowed"], anon["reason"]), (False, "not-listed"))
+        self.assertIsNone(anon["artifact"]["expires"])
+        # group ACL: a member is told `expired`, a visitor in no listed group gets the live deny
+        member = gate.plugin_authz_decision("carol@example.com", ["11111111-2222-4333-8444-555555555555"],
+                                            "team/x/r.html", acl, NOW, 200)
+        self.assertEqual(member["reason"], "expired")
+        other = gate.plugin_authz_decision("carol@example.com", ["99999999-2222-4333-8444-555555555555"],
+                                           "team/x/r.html", acl, NOW, 200)
+        self.assertEqual((other["reason"], other["artifact"]["expires"]), ("not-listed", None))
+        empty = gate.plugin_authz_decision("carol@example.com", [], "team/x/r.html", acl, NOW, 200)
+        self.assertIn("groups-claim-empty", empty["reason"])
+
+    def test_object_missing_told_only_to_who_would_be_allowed(self):
+        users_only = {k: v for k, v in self.ACL.items() if k != "groups"}
+        stranger = self.d("mallory@example.com", "team/x/r.html", users_only, head=404)
+        self.assertEqual((stranger["allowed"], stranger["reason"]), (False, "not-listed"))
+        listed = self.d("alice@example.com", "team/x/r.html", self.ACL, head=404)
+        self.assertEqual(listed["reason"], "object-missing")
+
+    def test_display_name_passed_through_email_fallback(self):
+        ans = gate.plugin_authz_decision("alice@example.com", [], "team/x/r.html", self.ACL, NOW, 200,
+                                         name="Alice Example")
+        self.assertEqual(ans["user"], {"id": "alice@example.com", "name": "Alice Example",
+                                       "anonymous": False})
+        self.assertEqual(self.d("alice@example.com", "team/x/r.html", self.ACL)["user"]["name"],
+                         "alice@example.com")
+        anon = gate.plugin_authz_decision("", [], "pub/free/x.html", None, NOW, 200, name="Nope")
+        self.assertEqual(anon["user"]["name"], "anonymous")
+
     def test_anonymous_pub_allowed(self):
         # caller-side gating (pub/ + ANONYMOUS_PUB_ENABLED) is e2e; here: empty email = anonymous
         ans = self.d("", "pub/free/x.html", None)
@@ -741,3 +785,39 @@ class PluginAuthzDecisionTest(unittest.TestCase):
         ans = self.d("alice@example.com", "team/x/r.html", self.ACL, tags={"ttl": "banana"}, lm=NOW)
         self.assertIsNone(ans["artifact"]["ttl"])
         self.assertIsNone(ans["artifact"]["expires"])
+
+
+class DisplayNameTest(unittest.TestCase):
+    """user.name for plugins comes from the id_token `name` claim of the proxy's /auth answer
+    (--set-authorization-header), only when the token is the same identity; email otherwise."""
+
+    @staticmethod
+    def tok(claims):
+        b = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
+        return f"{b({'alg': 'RS256'})}.{b(claims)}.c2ln"
+
+    def name(self, hdrs, email="test@example.com"):
+        return gate.display_name_from_auth_headers(hdrs, email)
+
+    def test_name_claim_of_same_identity(self):
+        t = self.tok({"email": "Test@Example.com", "name": "Test One"})
+        self.assertEqual(self.name({"Authorization": f"Bearer {t}"}), "Test One")
+        t = self.tok({"preferred_username": "test@example.com", "name": "  Ana\u0000  López\n "})
+        self.assertEqual(self.name({"Authorization": f"Bearer {t}"}), "Ana López")
+        t = self.tok({"upn": "test@example.com", "name": "x" * 300})
+        self.assertEqual(self.name({"Authorization": f"bearer {t}"}), "x" * 128)
+
+    def test_fallbacks_to_email(self):
+        cases = [
+            {},
+            {"Authorization": "Basic Zm9vOmJhcg=="},
+            {"Authorization": "Bearer not-a-jwt"},
+            {"Authorization": "Bearer a.%%%.c"},
+            {"Authorization": f"Bearer {self.tok({'email': 'other@example.com', 'name': 'Mallory'})}"},
+            {"Authorization": f"Bearer {self.tok({'email': 'test@example.com'})}"},
+            {"Authorization": f"Bearer {self.tok({'email': 'test@example.com', 'name': 42})}"},
+            {"Authorization": f"Bearer {self.tok({'email': 'test@example.com', 'name': '  '})}"},
+            {"Authorization": f"Bearer {self.tok(['not', 'a', 'dict'])}"},
+        ]
+        for h in cases:
+            self.assertEqual(self.name(h), "test@example.com", h)

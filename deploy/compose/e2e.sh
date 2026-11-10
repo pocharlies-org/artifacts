@@ -140,6 +140,20 @@ check "plugin authz: ACL user on u/ carries ttl + expiry" "True user test@exampl
   "$(authz "/artifacts/u/$RUN2/index.html" "$TOKEN")"
 check "plugin authz: anonymous on u/ is unauthenticated" "False unauthenticated None None False" \
   "$(authz "/artifacts/u/$RUN2/index.html")"
+# display name: the id_token `name` claim (Dex username), never the e-mail; identity stays the e-mail
+authz_user() { # <artifact path> <bearer>
+  docker compose exec -T -e A="$1" -e TOKEN="$2" gate python3 -c '
+import json, os, urllib.request
+r = urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8081/_gate/plugin/authz",
+    data=json.dumps({"artifact": os.environ["A"]}).encode(),
+    headers={"Content-Type": "application/json", "Authorization": "Bearer " + os.environ["TOKEN"]}))
+u = json.load(r)["user"]
+print(u["id"], "|", u["name"])'
+}
+check "plugin authz: display name from the name claim" "test@example.com | Test One" \
+  "$(authz_user "/artifacts/u/$RUN2/index.html" "$TOKEN")"
+check "oauth2-proxy /auth not reachable from the browser side" 404 \
+  "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/oauth2/auth")"
 gate_env=$(docker compose exec -T gate sh -c 'echo "$MINIO_ACCESS_KEY $MINIO_SECRET_KEY $GATE_READ_ACCESS_KEY $GATE_READ_SECRET_KEY"')
 check "gate holds no MinIO root credential" 0 "$(echo "$gate_env" | tr ' ' '\n' | grep -cx minioadmin)"
 # the read-signing user: reads artifacts, nothing else (ACLs, state, listing, writes denied)

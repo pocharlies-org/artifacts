@@ -114,9 +114,10 @@ spec:
         {{ $hostMatch }} && PathPrefix(`/_gate/`) && !Path(`/_gate/auth`) && !Path(`/_gate/healthz`)
       services:
         - {name: artifact-gate, namespace: {{ $sso }}, port: 8080}
-    # 5. oauth2-proxy endpoints for this host (sign_in, callback, sign_out).
+    # 5. oauth2-proxy endpoints for this host (sign_in, callback, sign_out). /auth is NOT routed:
+    #    only the gate calls it, in-cluster, and it answers with the session's id_token.
     - kind: Rule
       priority: 300
-      match: {{ $hostMatch }} && PathPrefix(`/oauth2-artifacts/`)
+      match: {{ $hostMatch }} && PathPrefix(`/oauth2-artifacts/`) && !Path(`/oauth2-artifacts/auth`)
       services:
         - {name: oauth2-proxy-artifacts, namespace: {{ $sso }}, port: 4180}

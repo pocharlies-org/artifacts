@@ -10,6 +10,7 @@ Run:  python3 -I -m unittest discover -s tests -p 'e2e_*.py' -v
 """
 
 import importlib.util
+import base64
 import json
 import os
 import re
@@ -86,6 +87,16 @@ class MinioHandler(BaseHTTPRequestHandler):
 # (email, groups[, send_email_header]) — send_email defaults True; False makes the fake proxy
 # answer 202 with ONLY X-Auth-Request-Preferred-Username, the misconfiguration the gate must fail
 # closed on (identity comes from X-Auth-Request-Email ONLY).
+# Display names: the real proxy (--set-authorization-header) returns the session's id_token in
+# the Authorization header of its 202; the gate reads only its `name` claim, for display.
+NAMES = {"alice": "Alice Example", "bob": "Bob Example"}
+
+
+def _fake_id_token(email, name):
+    b = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
+    return f"{b({'alg': 'none'})}.{b({'email': email, 'name': name})}.sig"
+
+
 USERS = {"alice": ("alice@example.com", ""),            # no groups claim (overage-ish)
          "bob": ("bob@example.com", "11111111-2222-4333-8444-555555555555"),
          "owner": ("owner@example.com", ""),
@@ -118,6 +129,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("X-Auth-Request-Email", u[0])
         if u[1]:
             self.send_header("X-Auth-Request-Groups", u[1])
+        if name in NAMES:
+            self.send_header("Authorization", f"Bearer {_fake_id_token(u[0], NAMES[name])}")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -619,8 +632,24 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertTrue(ans["allowed"], ans)
         self.assertEqual(ans["user"]["id"], "alice@example.com")
+        self.assertEqual(ans["user"]["name"], "Alice Example")   # id_token `name` claim
         self.assertFalse(ans["user"]["anonymous"])
         self.assertEqual(ans["artifact"]["key"], "team/secret/report.html")
+
+    def test_plugin_authz_name_falls_back_to_email(self):
+        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="owner")
+        self.assertEqual((st, ans["allowed"]), (200, True))
+        self.assertEqual(ans["user"]["name"], "owner@example.com")   # no id_token from the proxy
+
+    def test_plugin_authz_expired_not_leaked_to_strangers(self):
+        OBJECTS["team/secret/.acl.json"] = json.dumps(
+            {"owner": "owner@example.com", "users": ["alice@example.com"],
+             "expires": "2020-01-01"}).encode()
+        self.gate._acl_cache.clear()
+        # bob is in no listed group: same answer as for a live artifact he is not on
+        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="bob")
+        self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "not-listed"))
+        self.assertEqual((ans["artifact"]["expires"], ans["artifact"]["ttl"]), (None, None))
 
     def test_plugin_authz_allow_group_member(self):
         st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="bob")

@@ -1,5 +1,6 @@
 # Dex for the local dev stack: three static users (the second and third exist so plugins
-# can test sharing between people and a refusal for someone outside the ACL), password
+# can test sharing between people and a refusal for someone outside the ACL), each with a
+# distinct display name (Dex puts `username` in the id_token `name` claim), password
 # grant enabled so the e2e can obtain an id_token without a browser. The passwords are
 # fixed dev placeholders.
 # One issuer URL for everyone: the host (browser, e2e.sh) reaches Dex on the published
@@ -19,17 +20,17 @@ staticPasswords:
   - email: "test@example.com"
     # bcrypt of "test-password" (dev only)
     hash: "$2a$10$jBIY5t1en/2umGuVZX/EZOFaR17ROfctS1iFlRQM0osvj7Et/vrNS"
-    username: "test"
+    username: "Test One"
     userID: "11111111-2222-4333-8444-555555555555"
   - email: "test2@example.com"
     # bcrypt of "test2-password" (dev only)
     hash: "$2a$10$QBxGuMEVwvFSrdEZYDu/YO/3gqRihjmnTepaiCb5ReH6gcJ7aMLTy"
-    username: "test2"
+    username: "Test Two"
     userID: "22222222-3333-4444-8555-666666666666"
   - email: "test3@example.com"
     # bcrypt of "test3-password" (dev only)
     hash: "$2a$10$eOKMrF/MQViLptht4wQ0zOqENduSBbGFb0E9uLFklpb6A/bN9Un26"
-    username: "test3"
+    username: "Test Three"
     userID: "33333333-4444-4555-8666-777777777777"
 staticClients:
   - id: artifacts-dev

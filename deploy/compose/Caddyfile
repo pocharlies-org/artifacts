@@ -85,6 +85,12 @@
 		reverse_proxy gate:8080
 	}
 
+	# /oauth2/auth is the gate's in-network identity check (it answers with the session's
+	# id_token, --set-authorization-header): never reachable from the browser side.
+	handle /oauth2/auth {
+		respond 404
+	}
+
 	handle /oauth2/* {
 		reverse_proxy oauth2-proxy:4180
 	}

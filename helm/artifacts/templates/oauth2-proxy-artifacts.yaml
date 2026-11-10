@@ -61,6 +61,10 @@ spec:
             - --cookie-csrf-expire={{ .Values.cookieCsrfExpire }}
             - --reverse-proxy=true
             - --set-xauthrequest=true
+            # the /auth 202 also carries `Authorization: Bearer <id_token>`; the gate reads its
+            # `name` claim as the DISPLAY name for plugins (identity stays X-Auth-Request-Email).
+            # /oauth2-artifacts/auth is therefore not routed publicly (artifacts-routes rule 5).
+            - --set-authorization-header=true
             - --pass-access-token=false
             - --skip-provider-button=true
             - --prompt={{ .Values.oidcPrompt }}

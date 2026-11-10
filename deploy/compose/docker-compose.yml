@@ -75,7 +75,7 @@ services:
       - --provider=oidc
       - --oidc-issuer-url=http://127.0.0.1:5556/dex
       - --email-domain=*
-      # Dex's preferred_username is the bare username ("test"); the e-mail the ACLs are
+      # Dex's preferred_username is the username ("Test One"); the e-mail the ACLs are
       # keyed on is the `email` claim. (The Helm chart uses preferred_username: on Entra
       # that is the UPN.)
       - --oidc-email-claim=email
@@ -93,6 +93,9 @@ services:
       - --whitelist-domain=127.0.0.1:8080
       - --reverse-proxy=true
       - --set-xauthrequest=true
+      # the /auth 202 also carries `Authorization: Bearer <id_token>`: the gate reads its `name`
+      # claim as the DISPLAY name plugins show (identity stays X-Auth-Request-Email)
+      - --set-authorization-header=true
       - --skip-provider-button=true
       # the e2e authenticates with an id_token as Authorization: Bearer instead of a
       # browser cookie; the proxy validates it against the same issuer.

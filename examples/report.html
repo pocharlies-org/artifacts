@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sample report</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 52rem; padding: 0 1rem; color: #1f2937; }
+  h1 { font-size: 1.6rem; margin-bottom: .25rem; }
+  .muted { color: #6b7280; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { border-bottom: 1px solid #e5e7eb; padding: .4rem .6rem; text-align: left; }
+  th { background: #f9fafb; }
+  .bar { height: .8rem; background: #6366f1; border-radius: 2px; }
+</style>
+</head>
+<body>
+<h1>Sample report</h1>
+<p class="muted">A self-contained example artifact for the quick starts: publish it with
+<code>cli/publish.sh</code> and open the link it prints.</p>
+
+<h2>Results</h2>
+<table>
+  <thead><tr><th>Check</th><th>Status</th><th>Duration</th><th></th></tr></thead>
+  <tbody>
+    <tr><td>build</td><td>passed</td><td>42 s</td><td><div class="bar" style="width:42%"></div></td></tr>
+    <tr><td>unit tests</td><td>passed</td><td>18 s</td><td><div class="bar" style="width:18%"></div></td></tr>
+    <tr><td>integration</td><td>passed</td><td>67 s</td><td><div class="bar" style="width:67%"></div></td></tr>
+    <tr><td>lint</td><td>passed</td><td>6 s</td><td><div class="bar" style="width:6%"></div></td></tr>
+  </tbody>
+</table>
+
+<h2>Notes</h2>
+<p>Everything in this file is placeholder content. Artifacts are served with
+<code>Content-Security-Policy: sandbox allow-scripts</code>, so scripts run in an opaque
+origin: no cookies, no storage, no same-origin requests.</p>
+</body>
+</html>

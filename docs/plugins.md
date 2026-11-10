@@ -45,14 +45,20 @@ Always JSON. `200` with a decision, or an error status (§ table below).
 {
   "allowed": true,
   "reason": "acl: users",
-  "user":     { "id": "alice@example.com", "name": "alice@example.com", "anonymous": false },
+  "user":     { "id": "alice@example.com", "name": "Alice Example", "anonymous": false },
   "artifact": { "key": "u/run-1/index.html", "expires": "2026-11-16", "ttl": 7 }
 }
 ```
 
 - `user.id` — the UPN (`preferred_username` via the proxy's email claim); `null` for
-  anonymous. `user.name` — same string (display name is the plugin's problem, the gate
-  only vouches for `id`). `user.anonymous` — true when there was no session.
+  anonymous. The identity: ACLs and attribution use it. `user.name` — the visitor's
+  **display name**: the OIDC `name` claim of the session's id_token, which oauth2-proxy
+  returns in the `Authorization` header of its `/auth` answer (`--set-authorization-header`;
+  that endpoint is never routed publicly). Used only when the token is the same identity
+  (its `email`/`preferred_username`/`upn` equals `user.id`), trimmed to 128 printable
+  characters; otherwise, or without a `name` claim, it is `user.id`. Display only — never
+  decide anything on it. `"anonymous"` for anonymous. `user.anonymous` — true when there
+  was no session.
 - `artifact.key` — the object key (no leading `/artifacts/`).
 - `artifact.expires` — ISO date when the artifact dies: the ACL `expires` when present,
   otherwise the `ttl` object tag applied to `Last-Modified`. `null` when neither exists
@@ -63,6 +69,12 @@ Always JSON. `200` with a decision, or an error status (§ table below).
   `no-acl`, `expired`, `groups-claim-empty`, `unauthenticated`, `acl-error`,
   `object-missing`). Plugins must treat `reason` as informational; only `allowed` is
   the decision.
+- **No existence leak**: `expired` and `object-missing` — and `artifact.expires`/`ttl` — are
+  told only to a visitor who would otherwise be allowed (listed, owner, group member, or
+  anonymous on a `pub/` key without ACL). Anyone else gets exactly the answer they would get
+  for a live artifact they are not on (e.g. `not-listed`, `expires`/`ttl` null), so a plugin
+  answering `410` for `expired` and `403` for a deny reveals nothing to a stranger. The
+  forwardAuth path already answers both with the same 403 deny page.
 
 ### Status codes
 

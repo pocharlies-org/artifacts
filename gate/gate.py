@@ -514,15 +514,27 @@ def refused_client_headers(headers):
                    if k.lower().startswith(_REFUSED_HEADER_PREFIXES)})
 
 
-def plugin_authz_decision(email, groups, key, acl, now, head_status, tags=None, last_modified=None):
+def plugin_authz_decision(email, groups, key, acl, now, head_status, tags=None, last_modified=None,
+                          name=None):
     """Build the /_gate/plugin/authz answer (docs/plugins.md §1) from the SAME decide() the
     forwardAuth path uses — plugins must never re-implement the decision. `email` empty means
     anonymous (the caller has already checked pub/ + GATE_ANONYMOUS_PUB_ENABLED). `tags` is the
     object's tag set (ttl) and `last_modified` a unix timestamp: together they give the ILM
     expiry when the ACL has no `expires`, so plugins can delete their data when the artifact dies.
+    `name` is the visitor's display name (display only; falls back to the email).
+
+    No existence leak: `expired` and `object-missing` (and the artifact's expiry/ttl) are told
+    ONLY to a visitor who would otherwise be allowed. Anyone else gets exactly the deny they
+    would get for a live artifact (e.g. `not-listed`) — a plugin answering 410 vs 403 on that
+    reason must not reveal to a stranger that an artifact exists or has expired.
     """
     anonymous = not email
     allowed, reason = decide(email, groups, key, acl, now)
+    if not allowed and reason == "expired":
+        live_acl = {k: v for k, v in acl.items() if k != "expires"}
+        would, live_reason = decide(email, groups, key, live_acl, now)
+        if not would:
+            reason = live_reason
     if allowed and head_status != 200:
         # same no-existence-leak rule as forwardAuth: "allowed but not there" answers as denied
         allowed, reason = False, "object-missing"
@@ -541,9 +553,43 @@ def plugin_authz_decision(email, groups, key, acl, now, head_status, tags=None, 
             ttl = None
     if expires is None and ttl is not None and last_modified is not None:
         expires = datetime.fromtimestamp(last_modified + ttl * 86400, timezone.utc).isoformat()
+    if not allowed and reason not in ("expired", "object-missing"):
+        # a denied stranger learns nothing about the artifact's life either
+        expires, ttl = None, None
     return {"allowed": allowed, "reason": reason,
-            "user": {"id": email or None, "name": email or "anonymous", "anonymous": anonymous},
+            "user": {"id": email or None, "name": (name or email) if email else "anonymous",
+                     "anonymous": anonymous},
             "artifact": {"key": key, "expires": expires, "ttl": ttl}}
+
+
+_NAME_MAX = 128
+
+
+def display_name_from_auth_headers(hdrs, email):
+    """Display name for plugins (docs/plugins.md §1 `user.name`), from the `name` claim of the
+    id_token that oauth2-proxy returns in the Authorization header of its /auth answer
+    (--set-authorization-header=true). DISPLAY ONLY: identity and every ACL decision stay on
+    X-Auth-Request-Email. The token comes from the same trusted proxy response as the email, and
+    it is used only when it belongs to that same identity (its email / preferred_username / upn
+    equals the email); otherwise, or when there is no usable name, the email is the name."""
+    auth = hdrs.get("Authorization") or ""
+    parts = auth.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer" or parts[1].count(".") != 2:
+        return email
+    try:
+        claims = json.loads(_unb64u(parts[1].split(".")[1]))
+    except (ValueError, TypeError):
+        return email
+    if not isinstance(claims, dict):
+        return email
+    owners = {str(claims.get(c) or "").lower() for c in ("email", "preferred_username", "upn")}
+    if (email or "").lower() not in owners:
+        return email
+    raw = claims.get("name")
+    if not isinstance(raw, str):
+        return email
+    clean = " ".join("".join(ch for ch in raw if ch.isprintable()).split())[:_NAME_MAX].strip()
+    return clean or email
 
 
 class RateLimiter:
@@ -762,11 +808,16 @@ class GateHandler(BaseHTTPRequestHandler):
     # the email/UPN, and a second accepted header would widen the identity surface and silently
     # change identity semantics if --oidc-email-claim is ever reconfigured. A 202 without
     # X-Auth-Request-Email fails closed (500, logged), never a login.
+    # The proxy also runs with --set-authorization-header=true, so the 202 carries
+    # `Authorization: Bearer <id_token>`: its `name` claim becomes the DISPLAY name plugins show
+    # (display_name_from_auth_headers). It never feeds identity or an ACL decision, and the
+    # public route to the proxy's /auth endpoint is blocked (the gate reaches it in-cluster).
     def _authenticate(self):
         """Ask oauth2-proxy about the visitor's cookie. Returns (email, groups, status).
         status: None = authenticated, 401 = no session, 500 = proxy unreachable or unexpected
         answer (fail closed). Only headers from THIS response are trusted; incoming
         X-Auth-Request-* are ignored. See the contract comment above."""
+        self._display_name = None
         # PUBLIC_HOST is used here on purpose: the gate talks to the proxy over the cluster
         # network and oauth2-proxy validates rd=/redirect against its own --whitelist-domain, so
         # the Host it sees must be the configured artifacts host, not whatever the visitor asked
@@ -803,6 +854,8 @@ class GateHandler(BaseHTTPRequestHandler):
             # fail closed: no X-Auth-Request-Email means no identity (see contract comment)
             LOG.error("oauth2-proxy /auth 202 without X-Auth-Request-Email — failing closed")
             return None, [], 500
+        # display name for the plugin authz answer (never identity; see the helper)
+        self._display_name = display_name_from_auth_headers(hdrs, email.lower())
         return email.lower(), groups, None
 
     # -- pages ---------------------------------------------------------------------
@@ -936,7 +989,9 @@ class GateHandler(BaseHTTPRequestHandler):
         if err:
             LOG.error("plugin-authz acl read failed for %s: %s — denying (fail closed)", key, err)
             ans = {"allowed": False, "reason": "acl-error",
-                   "user": {"id": email or None, "name": email or "anonymous",
+                   "user": {"id": email or None,
+                            "name": (getattr(self, "_display_name", None) or email) if email
+                            else "anonymous",
                             "anonymous": not email},
                    "artifact": {"key": key, "expires": None, "ttl": None}}
             return self._send(200, json.dumps(ans), "application/json")
@@ -949,7 +1004,8 @@ class GateHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 last_modified = None
         ans = plugin_authz_decision(email, groups, key, acl, int(time.time()),
-                                    head_status, tags, last_modified)
+                                    head_status, tags, last_modified,
+                                    name=getattr(self, "_display_name", None) if email else None)
         LOG.info("plugin-authz user=%s key=%s allowed=%s reason=%s",
                  email or "-", key, ans["allowed"], ans["reason"])
         return self._send(200, json.dumps(ans), "application/json")

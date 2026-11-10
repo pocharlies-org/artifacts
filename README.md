@@ -64,13 +64,15 @@ docker compose up bootstrap   # bucket, ILM rules, anonymous pub/ policy, gate S
 Then open <http://127.0.0.1:8080/artifacts/pub/<run>/index.html> — anonymous `pub/`
 reads work; gated reads (`/artifacts/u/...`) redirect to Dex login. Dex has three static
 dev users: `test@example.com` / `test-password`, `test2@example.com` / `test2-password` and
-`test3@example.com` / `test3-password` (the extra two let plugins test sharing and refusals).
+`test3@example.com` / `test3-password` (the extra two let plugins test sharing and refusals),
+with the display names *Test One*, *Test Two* and *Test Three* (the id_token `name` claim that
+the plugin authz answer carries as `user.name`; the ACLs use the e-mails).
 Publish your own:
 
 ```bash
 ARTIFACTS_ACCESS_KEY=minioadmin ARTIFACTS_SECRET_KEY=minioadmin \
 ARTIFACTS_WRITE_BASE=http://127.0.0.1:9000 ARTIFACTS_READ_BASE=http://127.0.0.1:8080 \
-../../cli/publish.sh -g pub -t 7 -a me -s demo report.html
+../../cli/publish.sh -g pub -t 7 -a me -s demo ../../examples/report.html
 ```
 
 > The compose stack is a **dev/demo** stack with fixed low-entropy dev secrets — never
@@ -100,8 +102,8 @@ directory; it finds the running project by name). The canvas plugin ships such a
 `deploy/compose/compose.yml` — with both repos cloned side by side:
 
 ```bash
-git clone -b feat/initial-import https://github.com/pocharlies-org/artifacts.git
-git clone -b feat/integrate https://github.com/pocharlies-org/artifacts-canvas.git
+git clone https://github.com/pocharlies-org/artifacts.git
+git clone https://github.com/pocharlies-org/artifacts-canvas.git
 cd artifacts-canvas/deploy/compose
 docker compose up -d --build --wait     # core + canvas (bootstrap included)
 # open http://127.0.0.1:8080/_canvas/artifacts/<key> (the CLI prints the link)
@@ -143,9 +145,9 @@ runs, verifies the link anonymously, and prints the artifact link plus one link 
 enabled plugin.
 
 ```bash
-publish.sh -u alice@example.com -t 14 -a build -s 42 report.html   # gated (u/<run>/)
-publish.sh -g pub -t 7 report.html                                 # anonymous pub/
-publish.sh -g <group-slug> -t 7 report.html                        # group-gated
+publish.sh -u alice@example.com -t 14 -a build -s 42 examples/report.html   # gated (u/<run>/)
+publish.sh -g pub -t 7 examples/report.html                                 # anonymous pub/
+publish.sh -g <group-slug> -t 7 examples/report.html                        # group-gated
 ```
 
 **MCP** — `mcp/server.py` (Python, `mcp` SDK, stdio) for agent sessions:
