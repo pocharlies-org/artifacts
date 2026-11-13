@@ -1020,21 +1020,30 @@ class RequestStore:
             if len(kept) != len(pending):
                 self.store.put_json(self._owner_rel(owner), {"pending": kept})
 
-    def get(self, rid):
+    def get(self, rid, strict=False):
+        """The record, or None when the id is malformed, the record is missing or not JSON.
+        A store that cannot be read is None too, unless strict: then the ConnectionError is
+        raised, since an unreadable record is not a missing or decided one."""
         if not rid or not all(c in "0123456789abcdef" for c in rid) or len(rid) > 64:
             return None
         try:
             return self.store.get_json(f"req/{rid}.json")
-        except (ConnectionError, ValueError):
+        except ConnectionError:
+            if strict:
+                raise
+            return None
+        except ValueError:
             return None
 
     def mark(self, rid, status, now):
         """Transition pending -> approve|deny. Returns the record ONLY when this call performed
-        the transition; None when missing or already decided. An approval calls it only after
-        the grant succeeded (_handle_action). Single-use without a CAS primitive:
-        two concurrent POSTs that both read `pending` can both act (grant is idempotent; the
-        requester could get a duplicate DM) — acceptable for the PoC, see README residual risks."""
-        rec = self.get(rid)
+        the transition; None when missing or already decided. Raises ConnectionError when the
+        record cannot be read or written (never "already decided" for a store error). An
+        approval calls it only after the grant succeeded (_handle_action). Single-use without a
+        CAS primitive: two concurrent POSTs that both read `pending` can both act (grant is
+        idempotent; the requester could get a duplicate DM) — acceptable for the PoC, see
+        README residual risks."""
+        rec = self.get(rid, strict=True)
         if rec is None or rec.get("status") != "pending":
             return None
         rec["status"], rec["updated"] = status, now

@@ -995,6 +995,55 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 200, page)
         self.assertEqual(self._approval_state(rid, "elio@example.com"), ("approve", True))
 
+    def _owner_places(self):
+        with OBJECTS_LOCK:
+            return [p[0] for k in OBJECTS if k.startswith("_gate/owner/")
+                    for p in json.loads(OBJECTS[k])["pending"]]
+
+    def test_unreadable_record_at_the_mark_after_a_grant_is_not_already_decided(self):
+        # the record is read at the top of the handler, then again inside mark(); when that
+        # second read fails after the grant was written, the owner is not told "another
+        # decision won": the access is granted and said so, its place is freed, and the same
+        # link closes the record without a second ACL write
+        sent = self.record_notifications()
+        rid, token = self._approve("lou@example.com")
+        self.assertTrue(self.gate.REQUESTS.reserve_owner_slot("owner@example.com", rid,
+                                                              int(time.time())))
+        with OBJECTS_LOCK:
+            PLAN[("GET", f"_gate/req/{rid}.json")] = ["ok", "drop"]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertIn("<title>Request approved</title>", page)
+        self.assertNotIn("Another decision", page)
+        self.assertEqual(self._approval_state(rid, "lou@example.com"), ("pending", True))
+        self.assertEqual([to for to, _ in sent], ["lou@example.com"])
+        self.assertNotIn(rid, self._owner_places())
+        st, page, _ = self._post_action("approve", token)        # the same link closes it
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "lou@example.com"), ("approve", True))
+        with OBJECTS_LOCK:
+            self.assertEqual([s for k, _im, _t, s in PUTS if k == "u/secret/.acl.json"], [200])
+
+    def test_unreadable_record_at_the_mark_of_a_deny_is_not_already_decided(self):
+        sent = self.record_notifications()
+        rid = self._pending_request("max@example.com")
+        token = self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time()))
+        self.assertTrue(self.gate.REQUESTS.reserve_owner_slot("owner@example.com", rid,
+                                                              int(time.time())))
+        with OBJECTS_LOCK:
+            PLAN[("GET", f"_gate/req/{rid}.json")] = ["ok", "drop"]
+        st, page, _ = self._post_action("deny", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("<title>Decision not confirmed</title>", page)
+        self.assertNotIn("Another decision", page)
+        self.assertEqual(self._approval_state(rid, "max@example.com"), ("pending", False))
+        self.assertEqual(sent, [])
+        self.assertIn(rid, self._owner_places())                 # still open: place kept
+        st, page, _ = self._post_action("deny", token)           # the same link denies
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "max@example.com"), ("deny", False))
+        self.assertNotIn(rid, self._owner_places())
+
     def test_approve_and_deny_at_the_same_time_says_what_happened(self):
         # the owner's Deny is recorded while this approval is granting: the page says both
         sent = self.record_notifications()

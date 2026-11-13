@@ -445,6 +445,21 @@ class RequestStoreTest(unittest.TestCase):
         self.assertIsNone(rs.mark(rid, "approve", NOW + 7))
         self.assertEqual(rs.get(rid)["status"], "approve")
 
+    def test_mark_raises_when_the_record_cannot_be_read(self):
+        # a store that cannot be read is not "already decided": mark() raises, get() still
+        # answers None (a missing, unreadable or malformed record all read as no request)
+        class Down(FakeStore):
+            def get_json(self, rel):
+                raise ConnectionError("state get: HTTP 500")
+        rs = gate.RequestStore(Down())
+        with self.assertRaises(ConnectionError):
+            rs.mark("ab" * 16, "approve", NOW)
+        self.assertIsNone(rs.get("ab" * 16))
+        store = FakeStore()
+        rs = gate.RequestStore(store)
+        store.objs["req/" + "cd" * 16 + ".json"] = "not json"
+        self.assertIsNone(rs.mark("cd" * 16, "approve", NOW))   # malformed: no request
+
     def test_mark_missing(self):
         rs = gate.RequestStore(FakeStore())
         self.assertIsNone(rs.mark("deadbeef", "approve", NOW))
