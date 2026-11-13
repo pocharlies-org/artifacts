@@ -1372,7 +1372,8 @@ class GateHandler(BaseHTTPRequestHandler):
         JSON {"artifact": "/<bucket>/<key>"} (default bucket: /artifacts/<key>) or form-encoded
         `artifact=`. Answers
         {allowed, reason, user:{id,name,anonymous}, artifact:{key,expires,ttl}} through the one
-        and only decide(). Anonymous visitors are allowed only for pub/ keys and only while
+        and only decide(). Anonymous visitors are allowed only for pub/ keys that pass
+        pub_key_refused (the anonymous edge's character list) and only while
         GATE_ANONYMOUS_PUB_ENABLED is true."""
         if method != "POST":
             return self._send(405, json.dumps({"error": "POST required"}), "application/json")
@@ -1412,8 +1413,11 @@ class GateHandler(BaseHTTPRequestHandler):
                      key, DENIED_REASON)
             return self._send(200, json.dumps(ans), "application/json")
         if status == 401:
-            # anonymous: only pub/ keys, and only while anonymous pub access is enabled at all
-            if not (ANONYMOUS_PUB_ENABLED and key.startswith(PUB_PREFIXES)):
+            # anonymous: only pub/ keys, only while anonymous pub access is enabled at all, and
+            # never a key the anonymous edge refuses on its characters (pub_key_refused): the
+            # plugin answer must not say "allowed" for a spelling /_gate/pub-auth would refuse
+            if not (ANONYMOUS_PUB_ENABLED and key.startswith(PUB_PREFIXES)
+                    and not pub_key_refused(key)):
                 ans = {"allowed": False, "reason": "unauthenticated",
                        "user": {"id": None, "name": "anonymous", "anonymous": True},
                        "artifact": {"key": key, "expires": None, "ttl": None}}

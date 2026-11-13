@@ -72,7 +72,9 @@ Always JSON. `200` with a decision, or an error status (§ table below).
   quotes pass through (`<img src=x onerror=...>` comes back as is), so escape it wherever
   you render it, like any user input. `user.anonymous` — true when there
   was no session.
-- `artifact.key` — the object key (no leading `/artifacts/`).
+- `artifact.key` — the object key (no leading `/artifacts/`), the key the gate decided, already
+  decoded once. Act on it as given and never decode it again: a second decode can turn the key
+  that was decided into another one.
 - `artifact.expires` — ISO date when the artifact dies: the ACL `expires` when present,
   otherwise the `ttl` object tag applied to `Last-Modified`. `null` when neither exists
   (then the bucket ILM catch-all is the only expiry).
@@ -122,7 +124,9 @@ Always JSON. `200` with a decision, or an error status (§ table below).
 
 With no session the answer is `allowed: true` **only** for keys under the pub prefixes
 (default `pub/`) **and** only while `GATE_ANONYMOUS_PUB_ENABLED` (helm
-`artifactsGate.anonymousPubEnabled`) is true. Otherwise `200` with
+`artifactsGate.anonymousPubEnabled`) is true **and** only for a key the gate's anonymous read
+decision would also take: a key that, decoded once, contains `..`, `//`, `\`, `;`, `%`, `#`,
+`?` or a control character is never allowed anonymously. Otherwise `200` with
 `{"allowed": false, "reason": "unauthenticated"}`. The flag must be false before the
 host is reachable outside a trusted network, and the chart refuses to render with
 `anonymousPubEnabled: true` together with `publicExposure: true`. An anonymous visitor on a

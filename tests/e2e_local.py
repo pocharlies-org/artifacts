@@ -1261,6 +1261,26 @@ class E2ETest(unittest.TestCase):
         self.assertFalse(ans["allowed"])
         self.assertEqual(ans["reason"], "unauthenticated")
 
+    def test_plugin_authz_anonymous_never_allows_a_key_the_edge_refuses(self):
+        # existing objects whose literal keys carry a character the anonymous edge refuses: the
+        # plugin's anonymous answer is `unauthenticated`, like /_gate/pub-auth's refusal
+        with OBJECTS_LOCK:
+            OBJECTS["pub/a;b/x.html"] = b"x"
+            OBJECTS["pub/%2e%2e/x.html"] = b"x"
+            OBJECTS["pub/50%off.html"] = b"x"
+        st, ans = self.plugin_authz("/artifacts/pub/free/index.html", flag=True)    # control
+        self.assertEqual((st, ans["allowed"], ans["reason"]),
+                         (200, True, "pub: anonymous (anonymous-pub enabled)"))
+        for art in ("/artifacts/pub/a;b/x.html", "/artifacts/pub/a%3Bb/x.html",
+                    "/artifacts/pub/%252e%252e/x.html", "/artifacts/pub/50%25off.html"):
+            st, ans = self.plugin_authz(art, flag=True)
+            self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "unauthenticated"),
+                             art)
+            self.assertEqual(self.pub_auth(art)[0], 404, art)          # the edge agrees
+        # a signed-in caller is decided as before (decide(), literal key)
+        st, ans = self.plugin_authz("/artifacts/pub/a;b/x.html", sid="alice")
+        self.assertEqual((st, ans["allowed"]), (200, True))
+
     def test_plugin_authz_pub_signed_in_allowed(self):
         st, ans = self.plugin_authz("/artifacts/pub/free/index.html", sid="alice")
         self.assertEqual((st, ans["allowed"]), (200, True))
