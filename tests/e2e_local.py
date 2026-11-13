@@ -718,6 +718,31 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 403)
         self.assertIn("Request access", body)
 
+    def test_request_access_refuses_paths_the_gate_never_serves(self):
+        # even with a valid CSRF token for that exact path (the gate never issues one: no deny
+        # page is rendered for these), nothing is recorded, nobody is notified
+        sent = self.record_notifications()
+        acl = json.dumps({"owner": "owner@example.com", "users": []}).encode()
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/../other/x.html"] = b"x"     # the literal key, as a store could hold it
+            OBJECTS["u/other/.acl.json"] = acl
+            OBJECTS["u/.acl.json"] = acl
+            OBJECTS["u/loose.html"] = b"x"
+        USERS["quin"] = ("quin@example.com", "aaaa")
+        for path in ("/artifacts/u/secret/../other/x.html", "/artifacts/u/secret/%2e%2e/other/x.html",
+                     "/artifacts/u/secret/.acl.json", "/artifacts/u/secret/",
+                     "/artifacts/u/loose.html", "/artifacts/acl/run.json"):
+            csrf = self.gate.make_csrf("quin@example.com", path, self.gate._KEY, int(time.time()))
+            st, body, _ = http(self.base + "/_gate/request", method="POST",
+                               data=urllib.parse.urlencode({"csrf": csrf, "artifact": path}),
+                               headers={"Content-Type": "application/x-www-form-urlencoded"},
+                               cookie="sid=quin")
+            self.assertEqual(st, 400, path)
+            self.assertIn("not inside a published artifact", body)
+        with OBJECTS_LOCK:
+            self.assertEqual([k for k in OBJECTS if k.startswith("_gate/req/")], [])
+        self.assertEqual(sent, [])
+
     def test_request_access_missing_artifact_uniform_response_no_state(self):
         USERS["frank"] = ("frank@example.com", "aaaa")
         st, page, _ = self.auth("/artifacts/u/secret/ghost.html", "frank")
@@ -1203,16 +1228,21 @@ class E2ETest(unittest.TestCase):
         forged = "INFO action=approve id=deadbeef by=owner@example.com"
         self._auth_h("/artifacts/u/secret/x%0A" + urllib.parse.quote(forged), "alice")
         self._auth_h("/artifacts/u/secret/report.html?x=%0A" + urllib.parse.quote(forged), "alice")
-        # urlsplit drops \n from the form value; other line breaks of str.splitlines() remain
+        # urlsplit drops \n from the form value; other line breaks of str.splitlines() remain.
+        # Two log lines carry the form's path: the CSRF refusal (a path inside an artifact, u/x/)
+        # and the shape refusal before it (a path with no artifact root, u/x<sep>...)
         for sep in ("\x0b", "\x1e", "\x85", "\u2028"):
-            http(self.base + "/_gate/request", method="POST",
-                 data=urllib.parse.urlencode({"csrf": "bad", "artifact": "/artifacts/u/x" + sep + forged}),
-                 headers={"Content-Type": "application/x-www-form-urlencoded"}, cookie="sid=alice")
+            for prefix in ("/artifacts/u/x/", "/artifacts/u/x"):
+                http(self.base + "/_gate/request", method="POST",
+                     data=urllib.parse.urlencode({"csrf": "bad", "artifact": prefix + sep + forged}),
+                     headers={"Content-Type": "application/x-www-form-urlencoded"}, cookie="sid=alice")
         lines = log.getvalue().splitlines()
         self.assertFalse([ln for ln in lines if ln.startswith(forged)], lines)
         self.assertTrue([ln for ln in lines if "key=u/secret/x\\x0aINFO action" in ln], lines)
-        self.assertEqual(len([ln for ln in lines if "csrf rejected" in ln and "u/x\\" in ln]), 4,
+        self.assertEqual(len([ln for ln in lines if "csrf rejected" in ln and "u/x/\\" in ln]), 4,
                          lines)
+        self.assertEqual(len([ln for ln in lines
+                              if "request-access refused" in ln and "u/x\\" in ln]), 4, lines)
 
     def test_gate_pages_cannot_be_framed(self):
         USERS["fran"] = ("fran@example.com", "aaaa")

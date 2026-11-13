@@ -1298,6 +1298,17 @@ class AclRootTest(unittest.TestCase):
                            ("/elsewhere/u/r/x.html", None)):
             self.assertEqual(gate.artifact_root_path(path), want, path)
 
+    def test_grant_refuses_paths_the_gate_never_serves(self):
+        acl = json.dumps({"owner": "own@x.com", "users": []}).encode()
+        m = FakeMinio({"u/secret/.acl.json": acl, "u/other/.acl.json": acl})
+        for path in ("/artifacts/u/secret/../other/x.html", "/artifacts/u/secret/./x.html",
+                     "/artifacts/u/secret/%2e%2e/other/x.html", "/artifacts/u/secret/.acl.json",
+                     "/artifacts/u/secret/sub/.acl.json", "/artifacts/u/secret/",
+                     "/artifacts/_gate/req/x.json", "/artifacts/_mcp/x/y.json"):
+            self.assertEqual(gate.grant_access(m, path, "new@x.com"), (False, "bad artifact path"),
+                             path)
+        self.assertEqual((m.gets, m.puts), ([], []))
+
     def test_mcp_prefix_is_never_served(self):
         for key in ("_mcp", "_mcp/x.json", "_mcp/sessions/a/b.json", "_mcp/.acl.json"):
             self.assertTrue(gate._bad_key(key), key)

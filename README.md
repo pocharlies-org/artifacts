@@ -58,7 +58,9 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
 - **Request access**: a denied visitor can ask the artifact's owner, who gets a one-click
   approve/deny link (Slack DM). An approval covers the whole artifact, not only the file that
   was asked for (the owner's message, the confirm page and the requester's message name the
-  artifact root); a key with no artifact root offers no request (there is no owner to ask).
+  artifact root); a key with no artifact root offers no request (there is no owner to ask),
+  and neither a request nor an approval is ever taken for a path the gate would not serve
+  (dot segments, an `.acl.json`, `_gate/`, a listing) or one without an artifact root.
   The approval adds the requester to the root ACL with a conditional write: the gate reads
   the ACL with its ETag and writes it back with `If-Match`, so a change made by anyone else in
   between is never overwritten (the store answers `412`; the gate reads again and retries

@@ -1290,8 +1290,17 @@ class GateHandler(BaseHTTPRequestHandler):
         form = self._form()
         artifact = form.get("artifact") or ""
         path = urllib.parse.urlsplit(artifact).path
-        if key_from_path(path) is None:
+        key = key_from_path(path)
+        if key is None:
             return self._send(400, self._page("Bad request", "<p>Missing artifact.</p>"))
+        if _bad_key(key) or acl_key_for(key) is None:
+            # a path the gate never serves (dot segments, ACLs, state, listings) or one with no
+            # artifact root: nothing to request and no owner to ask. Refused on its shape alone,
+            # before any identity call or store read, like forwardAuth's bad_path.
+            LOG.warning("request-access refused path=%s (never served or no artifact root)", path)
+            return self._send(400, self._page("Bad request",
+                                              "<p>This address is not inside a published "
+                                              "artifact.</p>"))
         email, groups, status = self._authenticate()
         if status == 401:
             return self._send(401, self._page("Session expired",
@@ -1305,7 +1314,6 @@ class GateHandler(BaseHTTPRequestHandler):
             LOG.warning("csrf rejected user=%s artifact=%s", email, path)
             return self._send(403, self._page("Bad request",
                                               "<p>Stale form. Go back, reload the page and try again.</p>"))
-        key = key_from_path(path)
         if not RATE_LIMITER.allow(email, path, int(time.time())):
             LOG.warning("rate limit user=%s artifact=%s (no notification sent)", email, path)
             return self._send(429, self._page("Too many requests",
@@ -1630,7 +1638,9 @@ def grant_access(minio, artifact_path, requester):
         read, and the ACL keeps its tags (ttl, which drives its expiry): they are read before
         the write and sent with it; if they cannot be read, nothing is written."""
     key = key_from_path(artifact_path)
-    if key is None:
+    if key is None or _bad_key(key):
+        # a path the gate would never serve (dot segments, an ACL, gate state, a listing) never
+        # gets an ACL written for it, whatever root acl_key_for would derive
         return False, "bad artifact path"
     acl_key = acl_key_for(key)
     if acl_key is None:
