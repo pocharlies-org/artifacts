@@ -3,7 +3,7 @@
 
 # ---- login (oauth2-proxy) --------------------------------------------------------------
 # Digest-pinned image; any OIDC provider works (the example issuer below is Entra).
-image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1@sha256:f6a4aa83a27e316114bf79664302b1ffb2cc8ce697fb479273af4feb3fb16fe3
+image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6@sha256:c3415e8660af553f5e18f5d90db050614c02493c0ac6260ac59442f6d9b12048
 # OIDC issuer. Example: a single-tenant Entra app with a placeholder tenant id.
 oidcIssuer: https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0
 # Keys client-id, client-secret, cookie-secret. Create out of band; never in git.
@@ -22,10 +22,9 @@ oauth2Proxy:
   emailDomains: []
   # Reverse proxies allowed to set X-Forwarded-* and the client-IP header (one
   # --trusted-proxy-ip per IP or CIDR, e.g. your ingress controller's pod CIDR). The flag
-  # exists from oauth2-proxy v7.15.2 (v7.15.5 or newer recommended): set this only with such
-  # an image (the example image above, v7.7.1, refuses the flag and does not start). Empty
-  # (default): no flag, and oauth2-proxy keeps its own default (v7.15.2 and later trust
-  # every source).
+  # exists from oauth2-proxy v7.15.2 (v7.15.5 or newer recommended; the example image above
+  # is v7.15.6), so keep `image` at such a release. Empty (default): no flag, and
+  # oauth2-proxy keeps its own default (it trusts every source).
   trustedProxyIPs: []
   # Extra oauth2-proxy flags, appended after the chart's own. Only --allowed-group=<group id>
   # (non-empty id; one entry per group) is accepted: any other flag is refused, because a flag

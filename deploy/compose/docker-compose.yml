@@ -68,7 +68,7 @@ services:
         aliases: [oauth2-proxy]
 
   oauth2-proxy:
-    image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6@sha256:c3415e8660af553f5e18f5d90db050614c02493c0ac6260ac59442f6d9b12048  # same image as the chart
     # share Dex's network namespace: the issuer 127.0.0.1:5556 is Dex from here as well
     network_mode: "service:dex"
     command:
