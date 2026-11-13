@@ -12,7 +12,9 @@ in-cluster `<service>.<namespace>.svc.cluster.local` address must name that name
 two objects may share a kind and a name. Every optional template branch is switched on (anonymous
 pub/ route, a plugin without its own namespace, the gate image mode, the publisher user, the
 login proxy lists) so that no template is left out. The default render (two namespaces) is
-checked as a control, so the check cannot pass by finding nothing. Stdlib only.
+checked as a control, so the check cannot pass by finding nothing, and in it every object must
+sit in its own one of the two (namespaces.sso: gate, login proxy, middlewares; minio.namespace:
+routes, bootstrap Job), which the single-namespace render cannot tell apart. Stdlib only.
 """
 import json
 import os
@@ -45,6 +47,10 @@ EXPECTED = {
     ("IngressRoute", "artifacts-routes"), ("IngressRoute", "artifacts-plugin-canvas"),
     ("Job", "artifacts-bootstrap"),
 }
+# where each kind lands with the example values (namespaces.sso: sso, minio.namespace: minio)
+PLACEMENT = {"Deployment": "sso", "Service": "sso", "Middleware": "sso",
+             "IngressRoute": "minio", "Job": "minio"}
+VALUE_OF = {"sso": "namespaces.sso", "minio": "minio.namespace"}
 REF_RE = re.compile(r"\bnamespace:\s*([^\s,}]+)")
 SVC_RE = re.compile(r"\b([a-z0-9-]+)\.([a-z0-9-]+)\.svc\.cluster\.local\b")
 
@@ -106,6 +112,13 @@ def namespaces_seen(text):
 control = render(OPTIONS)
 check(set(namespaces_seen(control)) == {"sso", "minio"},
       "control: the default namespaces render two namespaces (sso, minio) and the check sees both")
+cobjs = objects(control)
+check({(k, n) for k, n, _ns, _d in cobjs} == EXPECTED and len(cobjs) == len(EXPECTED),
+      "control: all %d objects rendered once" % len(EXPECTED))
+for kind, name, ns, _d in cobjs:
+    want = PLACEMENT.get(kind)
+    check(ns == want, "control: %s/%s is in %s (%s)%s" % (
+        kind, name, want, VALUE_OF.get(want), "" if ns == want else ", rendered in %s" % ns))
 
 text = render(dict(OPTIONS, namespaces={"sso": NS}, minio={"namespace": NS}))
 objs = objects(text)

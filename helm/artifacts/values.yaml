@@ -22,14 +22,15 @@ oauth2Proxy:
   emailDomains: []
   # Reverse proxies allowed to set X-Forwarded-* and the client-IP header (one
   # --trusted-proxy-ip per IP or CIDR, e.g. your ingress controller's pod CIDR). The flag
-  # exists from oauth2-proxy v7.15.2: set this only with such an image (the example image
-  # above, v7.7.1, refuses the flag and does not start). Empty (default): no flag, and
-  # oauth2-proxy keeps its own default (v7.15.2 and later trust every source).
+  # exists from oauth2-proxy v7.15.2 (v7.15.5 or newer recommended): set this only with such
+  # an image (the example image above, v7.7.1, refuses the flag and does not start). Empty
+  # (default): no flag, and oauth2-proxy keeps its own default (v7.15.2 and later trust
+  # every source).
   trustedProxyIPs: []
-  # Extra oauth2-proxy flags, appended after the chart's own, one `--flag` or `--flag=value`
-  # per entry (e.g. --allowed-group=<group id>). Refused here: --email-domain and
-  # --trusted-proxy-ip (use the two lists above) and --trusted-ip (it lets matching client
-  # addresses skip authentication, and the gate takes the proxy's answer as identity).
+  # Extra oauth2-proxy flags, appended after the chart's own. Only --allowed-group=<group id>
+  # (non-empty id; one entry per group) is accepted: any other flag is refused, because a flag
+  # appended last can override the chart's own, so a different login-proxy flag is a chart
+  # change. --email-domain and --trusted-proxy-ip have the two lists above.
   extraArgs: []
   # Container resources. To bound local disk, add ephemeral-storage to both, e.g.
   #   requests: {ephemeral-storage: 16Mi}   limits: {ephemeral-storage: 64Mi}

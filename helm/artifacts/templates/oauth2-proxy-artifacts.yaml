@@ -6,9 +6,10 @@
 
        Values (oauth2Proxy.*):
          emailDomains     one --email-domain per entry instead of --email-domain=* (never `*`)
-         trustedProxyIPs  one --trusted-proxy-ip per entry (oauth2-proxy v7.15.2 or newer)
-         extraArgs        appended after the chart's flags; --email-domain, --trusted-proxy-ip
-                          and --trusted-ip are refused there
+         trustedProxyIPs  one --trusted-proxy-ip per entry (oauth2-proxy v7.15.5 or newer
+                          recommended)
+         extraArgs        appended after the chart's flags; only --allowed-group=<id> (non-empty)
+                          is accepted there, any other flag is refused
          resources        container resources (add ephemeral-storage to bound local disk) */ -}}
 {{- $sso := .Values.namespaces.sso }}
 {{- $slug := "artifacts" }}
@@ -44,6 +45,9 @@
 {{- end }}
 {{- if eq $flag "--trusted-ip" }}
 {{- fail "oauth2Proxy.extraArgs: --trusted-ip is refused: it lets matching client addresses skip authentication, and the gate takes this proxy's answer as the visitor's identity (for X-Forwarded-* trust use oauth2Proxy.trustedProxyIPs)" }}
+{{- end }}
+{{- if not (regexMatch "^--allowed-group=.+$" (toString $a)) }}
+{{- fail (printf "oauth2Proxy.extraArgs: only --allowed-group=<id> is accepted, got %q; any other login-proxy flag is a chart change" (toString $a)) }}
 {{- end }}
 {{- end }}
 ---

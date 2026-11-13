@@ -7,7 +7,8 @@ does (needs helm).
 Covered values: ingressRouteAnnotations (on every IngressRoute, plugin routes included),
 gate.trustForwardHeader (gate-auth forwardAuth, default false), oauth2Proxy.emailDomains,
 oauth2Proxy.trustedProxyIPs and oauth2Proxy.extraArgs (login proxy flags; no
---email-domain=* once a domain list is set), the artifacts-csp response headers, the
+--email-domain=* once a domain list is set; extraArgs accepts only a non-empty
+--allowed-group), the artifacts-csp response headers, the
 container resources of the gate, the login proxy and the bootstrap Job (ephemeral-storage
 from values), and the route that keeps /_gate/plugin/ off the public gate listener. Every
 refusal the chart makes for these values is exercised too. Stdlib only.
@@ -178,7 +179,7 @@ full = ok_render({
     "oauth2Proxy": {"emailDomains": ["example.com", "*.example.org"],
                     "trustedProxyIPs": ["10.42.0.0/16", "fd00::/8", "192.0.2.10"],
                     "extraArgs": ["--allowed-group=00000000-0000-0000-0000-000000000001",
-                                  "--skip-provider-button=false"],
+                                  "--allowed-group=00000000-0000-0000-0000-000000000002"],
                     "resources": EPH},
     "bootstrap": {"resources": EPH},
 })
@@ -203,8 +204,13 @@ check([a for a in args if a.startswith("--trusted-proxy-ip")]
 check(args.index("--trusted-proxy-ip=10.42.0.0/16") == args.index("--reverse-proxy=true") + 1,
       "set: --trusted-proxy-ip follows --reverse-proxy=true")
 check(args[-2:] == ["--allowed-group=00000000-0000-0000-0000-000000000001",
-                    "--skip-provider-button=false"],
-      "set: extra args appended last, in order")
+                    "--allowed-group=00000000-0000-0000-0000-000000000002"],
+      "set: extra args (one --allowed-group per group) appended last, in order")
+one_group = proxy_args(ok_render(
+    {"oauth2Proxy": {"extraArgs": ["--allowed-group=00000000-0000-0000-0000-000000000001"]}}))
+check(one_group[-1] == "--allowed-group=00000000-0000-0000-0000-000000000001"
+      and sum(a.startswith("--allowed-group") for a in one_group) == 1,
+      "set: extraArgs accepts --allowed-group=<id> (rendered once, last)")
 check(resources(docs[("Deployment", "artifact-gate")]) == with_eph(GATE_RES),
       "set: gate ephemeral-storage request and limit from values (cpu/memory defaults kept)")
 check(resources(docs[("Deployment", "oauth2-proxy-artifacts")]) == with_eph(GATE_RES),
@@ -241,8 +247,21 @@ refusals = [
     ({OP: {"extraArgs": ["--trusted-ip=0.0.0.0/0"]}}, "--trusted-ip is refused"),
     ({OP: {"extraArgs": ["--trusted-ip"]}}, "--trusted-ip is refused"),
     ({OP: {"extraArgs": ["allowed-group=x"]}}, "must be one flag"),
-    ({OP: {"extraArgs": ["--allowed-group", "x"]}}, "must be one flag"),
+    ({OP: {"extraArgs": ["--allowed-group", "x"]}}, "only --allowed-group=<id> is accepted"),
+    ({OP: {"extraArgs": ["--allowed-group=x", "x"]}}, "must be one flag"),
     ({OP: {"extraArgs": ["--allowed-group=x\n- --skip-auth-regex=.*"]}}, "must be one flag"),
+] + [
+    # allow-list: a flag appended last overrides the chart's own, so only --allowed-group=<id>
+    ({OP: {"extraArgs": [a]}}, "only --allowed-group=<id> is accepted")
+    for a in ("--skip-auth-regex=.*", "--skip-auth-route=/x", "--skip-jwt-bearer-tokens",
+              "--skip-jwt-bearer-tokens=true", "--ping-user-agent=x",
+              "--cookie-domain=.example.com", "--oidc-email-claim=email",
+              "--whitelist-domain=*", "--skip-provider-button=false",
+              "--allowed-group=", "--allowed-group")
+] + [
+    # an allowed entry does not let a later one through
+    ({OP: {"extraArgs": ["--allowed-group=00000000-0000-0000-0000-000000000001",
+                         "--skip-auth-regex=.*"]}}, "only --allowed-group=<id> is accepted"),
 ]
 for values, needle in refusals:
     rc, _, err = render(values)
