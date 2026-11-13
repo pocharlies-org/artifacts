@@ -441,6 +441,66 @@ class ConditionalGrantTest(unittest.TestCase):
         gate._acl_cache.clear()
         self.addCleanup(gate._acl_cache.clear)
 
+    class LostReplyMinio(FakeMinio):
+        """The ACL write raises ConnectionError like a lost reply: after applying it
+        (applied=True) or without applying it; reads after the write can fail too."""
+
+        def __init__(self, *a, applied=True, reads_after_fail=False, **kw):
+            super().__init__(*a, **kw)
+            self.applied, self.reads_after_fail, self.written = applied, reads_after_fail, False
+
+        def put(self, key, data, ctype=None, if_match=None, tagging=None):
+            if key.endswith(".acl.json"):
+                if self.applied:
+                    super().put(key, data, ctype, if_match=if_match, tagging=tagging)
+                self.written = True
+                raise ConnectionError(f"minio PUT {key}: IncompleteRead")
+            return super().put(key, data, ctype, if_match=if_match, tagging=tagging)
+
+        def get(self, key):
+            if self.written and self.reads_after_fail:
+                raise ConnectionError(f"minio GET {key}: timed out")
+            return super().get(key)
+
+    def test_lost_reply_on_an_applied_write_is_confirmed_by_one_re_read(self):
+        m = self.LostReplyMinio({self.KEY: json.dumps(self.ACL).encode()},
+                                tags={self.KEY: {"ttl": "7"}})
+        self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"),
+                         (True, "added (confirmed by a re-read after a lost reply)"))
+        self.assertEqual(m.gets, [self.KEY, self.KEY])               # the read, then one re-read
+        self.assertEqual(json.loads(m.objects[self.KEY])["users"], ["a@x.com", "new@x.com"])
+        self.assertEqual(m.tags[self.KEY], {"ttl": "7"})
+
+    def test_lost_reply_not_applied_is_an_unknown_outcome(self):
+        m = self.LostReplyMinio({self.KEY: json.dumps(self.ACL).encode()}, applied=False)
+        ok, note = gate.grant_access(m, self.PATH, "new@x.com")
+        self.assertEqual((ok, note), (False, "put failed: minio PUT u/r/.acl.json: IncompleteRead"
+                                             "; not listed on a re-read"))
+        self.assertTrue(gate.grant_outcome_unknown(note))
+        self.assertEqual(m.gets, [self.KEY, self.KEY])
+
+    def test_lost_reply_and_a_failed_re_read_is_an_unknown_outcome(self):
+        m = self.LostReplyMinio({self.KEY: json.dumps(self.ACL).encode()}, reads_after_fail=True)
+        ok, note = gate.grant_access(m, self.PATH, "new@x.com")
+        self.assertEqual((ok, note), (False, "put failed: minio PUT u/r/.acl.json: IncompleteRead"
+                                             "; the confirming read failed too: minio GET "
+                                             "u/r/.acl.json: timed out"))
+        self.assertTrue(gate.grant_outcome_unknown(note))
+        self.assertIn("new@x.com", json.loads(m.objects[self.KEY])["users"])   # it was applied
+
+    def test_which_failed_grants_may_have_changed_the_acl(self):
+        # unknown: a lost write reply (after the re-read), an exception raised inside the grant;
+        # known to have changed nothing: every refusal before the write and every status code
+        for note in ("put failed: minio PUT k: IncompleteRead; not listed on a re-read",
+                     "put failed: minio PUT k: timed out; the confirming read failed too: x",
+                     "unexpected RuntimeError"):
+            self.assertTrue(gate.grant_outcome_unknown(note), note)
+        for note in ("put HTTP 412", "put HTTP 403", "put HTTP 500", "acl unreadable: missing",
+                     "acl unreadable: minio GET k: IncompleteRead", "acl tags unreadable: HTTP 403",
+                     "acl unreadable: users is not a list", "no artifact root", "bad artifact path",
+                     "pub/ takes no access grants", "", None):
+            self.assertFalse(gate.grant_outcome_unknown(note), note)
+
     def test_read_returns_acl_and_etag(self):
         m = FakeMinio({self.KEY: json.dumps(self.ACL).encode()})
         acl, etag, err = gate.read_acl_for_write(m, self.KEY)

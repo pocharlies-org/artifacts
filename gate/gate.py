@@ -62,7 +62,9 @@ gate's own least-privilege S3 user):
     POST /_gate/approve   single-use signed token, acts only for the ACL owner: adds the requester
                           to the root ACL (a conditional write, see grant_access) and DMs them; a
                           failed write is never reported as approved and leaves the request
-                          pending. /_gate/deny mirrors it without touching the ACL.
+                          pending, and when the store may have applied it (a lost reply that
+                          one re-read did not settle) the owner is told so, never "nothing was
+                          changed". /_gate/deny mirrors it without touching the ACL.
 
 Two listeners, one process (— the forwardAuth decision endpoint and the
 public surface must not share a port):
@@ -1606,9 +1608,28 @@ class GateHandler(BaseHTTPRequestHandler):
                     reopened = REQUESTS.reopen(rec["id"], action, int(time.time()))
                 except ConnectionError:
                     reopened = False
+                unknown = grant_outcome_unknown(note)
                 LOG.error("approve %s: ACL write failed: %s (requester=%s artifact=%s "
-                          "request reopened=%s, requester not notified)",
-                          rec["id"], note, rec["requester"], rec["artifact"], reopened)
+                          "request reopened=%s, requester not notified, access list %s)",
+                          rec["id"], note, rec["requester"], rec["artifact"], reopened,
+                          "may or may not have been updated" if unknown else "unchanged")
+                if unknown:
+                    # The store may have applied the write (its reply was lost, and a re-read
+                    # did not settle it): never "nothing was changed" here. A retry of the same
+                    # link finishes the approval and never adds anyone twice; Deny writes no ACL,
+                    # so it would not take back an access that was already added.
+                    return self._send(503, self._page("Access not confirmed", (
+                        f"<p>It is not known whether <b>{requester}</b> was given access to the "
+                        f"artifact <code>{root_html}</code>: the store did not confirm the "
+                        f"update, so its access list may or may not have been updated. They "
+                        f"were not notified.</p>"
+                        + ("<p>Use the same link again to finish: it reads the access list "
+                           "again and never adds anyone twice.</p>" if reopened else
+                           "<p>The request could not be reopened, so this link will not work "
+                           "again: ask them to request access again (an approval never adds "
+                           "anyone twice).</p>")
+                        + "<p>Deny does not remove access that was already added: to take it "
+                          "back, publish the artifact's access list again without them.</p>")))
                 return self._send(503, self._page("Access not granted", (
                     f"<p><b>{requester}</b> was <b>not</b> given access to the artifact "
                     f"<code>{root_html}</code>: its access list could not be updated. "
@@ -1821,6 +1842,32 @@ def read_acl_for_write(minio, acl_key):
 # A write that loses the race (412) is redone once on a fresh read; a second loss gives up.
 GRANT_ATTEMPTS = 2
 
+# grant_access notes after which the access list may or may not have been updated: the reply to
+# the write was lost and one re-read did not show the requester listed ("put failed: ..."), or
+# something unexpected was raised inside the grant ("unexpected <Class>", see _handle_action).
+# Every other failed grant is known to have changed nothing: it stopped before the write, or
+# the store refused the write with a status code.
+_GRANT_OUTCOME_UNKNOWN = ("put failed:", "unexpected ")
+
+
+def grant_outcome_unknown(note):
+    """True when a failed grant may or may not have updated the access list."""
+    return isinstance(note, str) and note.startswith(_GRANT_OUTCOME_UNKNOWN)
+
+
+def _confirm_lost_write(minio, acl_key, requester, error):
+    """After an ACL write whose reply was lost (the store may or may not have applied it): one
+    fresh read. (True, note) when the requester is listed now, so the grant happened; else
+    (False, "put failed: ...") saying what the read found, and the outcome stays unknown."""
+    acl, _etag, err = read_acl_for_write(minio, acl_key)
+    if err is not None:
+        return False, f"put failed: {error}; the confirming read failed too: {err}"
+    users = acl.get("users")
+    if isinstance(users, list) and requester.lower() in [u.lower() for u in users
+                                                         if isinstance(u, str)]:
+        return True, "added (confirmed by a re-read after a lost reply)"
+    return False, f"put failed: {error}; not listed on a re-read"
+
 
 def grant_access(minio, artifact_path, requester):
     """Add `requester` to the ACL users of `artifact_path`. (ok, note).
@@ -1835,7 +1882,10 @@ def grant_access(minio, artifact_path, requester):
         with (False, "put HTTP 412") and leaves the other writer's ACL as it is;
       - everything else in the ACL (owner, groups, expires, unknown fields) is written back as
         read, and the ACL keeps its tags (ttl, which drives its expiry): they are read before
-        the write and sent with it; if they cannot be read, nothing is written."""
+        the write and sent with it; if they cannot be read, nothing is written;
+      - a write whose reply is lost (the store may have applied it) is checked with one fresh
+        read: the requester listed is a grant; anything else is "put failed: ..." and the
+        outcome stays unknown (grant_outcome_unknown)."""
     key = key_from_path(artifact_path)
     if key is None or _bad_key(key):
         # a path the gate would never serve (dot segments, an ACL, gate state, a listing) never
@@ -1848,6 +1898,7 @@ def grant_access(minio, artifact_path, requester):
     acl_key = acl_key_for(key)
     if acl_key is None:
         return False, "no artifact root"
+    added = "added"
     with _grant_lock(acl_key):
         for _attempt in range(GRANT_ATTEMPTS):
             acl, etag, err = read_acl_for_write(minio, acl_key)    # write path: never the cache
@@ -1867,14 +1918,18 @@ def grant_access(minio, artifact_path, requester):
                                    if_match=etag,
                                    tagging=urllib.parse.urlencode(sorted(tags.items())) or None)
             except ConnectionError as e:
-                return False, f"put failed: {e}"
+                ok, note = _confirm_lost_write(minio, acl_key, requester, e)
+                if not ok:
+                    return False, note
+                status, added = 200, note
+                break
             if status != 412:
                 break
         if status not in (200, 204):
             return False, f"put HTTP {status}"
     with _acl_lock:
         _acl_cache.pop(acl_key, None)
-    return True, "added"
+    return True, added
 
 
 # --------------------------------------------------------------------------------------------

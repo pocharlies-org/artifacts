@@ -72,8 +72,13 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   once, then gives up). Everything else in the ACL (`owner`,
   `groups`, `expires`, unknown fields) and the ACL's tags (its `ttl`) are kept. A write that
   fails is never reported as approved: the requester is told nothing, the owner sees that
-  access was not granted, and the request stays open. Your store must honour `If-Match` on
-  `PutObject` (MinIO does; a store that ignores it brings back the lost-update race).
+  access was not granted, and the request stays open. When the store may have applied the
+  write anyway (its reply was lost), the gate reads the ACL once more: the requester listed
+  means approved; otherwise the owner is told the access list may or may not have been
+  updated, to use the same link again (it never adds anyone twice), and that Deny does not
+  take back an access already added. "Nothing was changed" is said only when that is
+  known. Your store must honour `If-Match` on `PutObject` (MinIO does; a store that ignores
+  it brings back the lost-update race).
 - **Two listeners, one process**: `:8080` public (request-access pages, approve/deny
   links, health) and `:8081` internal (decision endpoints only: `/_gate/auth`,
   `/_gate/pub-auth`, `/_gate/plugin/authz`). The public routes never reach the decision
