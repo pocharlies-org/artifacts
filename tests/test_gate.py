@@ -350,7 +350,88 @@ class RateLimiterTest(unittest.TestCase):
         self.assertIsInstance(result, bool)
 
 
+    # every spelling of one object key is one artifact: index.html, %69ndex.html, ...
+    ENCODED_VARIANTS = ("/artifacts/u/r/index.html", "/artifacts/u/r/%69ndex.html",
+                        "/artifacts/u/r/%69%6E%64ex.html", "/artifacts/u/r/index%2ehtml",
+                        "/artifacts/%75/r/index.html", "/artifacts/u/%72/index.html")
+
+    def test_percent_encoded_variants_share_one_limit(self):
+        rl = gate.RateLimiter(FakeStore(), max_n=2, window=1000)
+        got = [rl.allow("u@x.com", v, NOW + i) for i, v in enumerate(self.ENCODED_VARIANTS)]
+        self.assertEqual(got, [True, True, False, False, False, False])
+        self.assertEqual(len({rl._key("u@x.com", v) for v in self.ENCODED_VARIANTS}), 1)
+        # another file of the same artifact, or another user, has its own limit
+        self.assertTrue(rl.allow("u@x.com", "/artifacts/u/r/other.html", NOW + 9))
+        self.assertTrue(rl.allow("v@x.com", "/artifacts/u/r/%69ndex.html", NOW + 9))
+
+    def test_per_requester_limit_across_artifacts(self):
+        store = FakeStore()
+        rl = gate.RateLimiter(store, max_n=3, window=1000, per_requester=True)
+        self.assertEqual([rl.allow("u@x.com", None, NOW + i) for i in range(4)],
+                         [True, True, True, False])
+        self.assertTrue(rl.allow("v@x.com", None, NOW + 4))             # per user
+        self.assertTrue(rl.allow("u@x.com", None, NOW + 1000))          # the window slides
+        self.assertTrue(all(k.startswith("rq/") for k in store.objs), store.objs)
+
+    def test_module_limits_and_their_defaults(self):
+        self.assertEqual((gate.RATE_LIMITER.max_n, gate.RATE_LIMITER.per_requester), (5, False))
+        self.assertEqual((gate.REQUESTER_LIMITER.max_n, gate.REQUESTER_LIMITER.window,
+                          gate.REQUESTER_LIMITER.per_requester), (20, 86400, True))
+        self.assertEqual(gate.REQUESTS.max_pending, 10)
+
+
+class RequestCapsConfigTest(unittest.TestCase):
+    """GATE_REQUESTER_RATE_LIMIT_MAX and GATE_OWNER_PENDING_MAX: whole numbers from 1 to
+    999999, or the gate refuses to start (a typo never turns a limit off)."""
+
+    def _load(self, **env):
+        return ReadSigningUserTest._load(self, **env)
+
+    def test_values_are_read(self):
+        mod = self._load(GATE_REQUESTER_RATE_LIMIT_MAX="7", GATE_OWNER_PENDING_MAX=" 3 ")
+        self.assertEqual((mod.REQUESTER_RATE_LIMIT_MAX, mod.OWNER_PENDING_MAX), (7, 3))
+        self.assertEqual((mod.REQUESTER_LIMITER.max_n, mod.REQUESTS.max_pending), (7, 3))
+
+    def test_invalid_values_refused_at_startup(self):
+        for name in ("GATE_REQUESTER_RATE_LIMIT_MAX", "GATE_OWNER_PENDING_MAX"):
+            for bad in ("0", "-1", "", "ten", "1.5", "1e3", "1000000", "07", "+5"):
+                with self.subTest(name=name, value=bad), self.assertRaises(RuntimeError):
+                    self._load(**{name: bad})
+
+
 class RequestStoreTest(unittest.TestCase):
+    def test_record_names_the_decoded_object_key(self):
+        rs = gate.RequestStore(FakeStore())
+        for v in RateLimiterTest.ENCODED_VARIANTS:
+            rec = rs.get(rs.create("req@x.com", v, "own@x.com", NOW))
+            self.assertEqual(rec["artifact"], "/artifacts/u/r/index.html", v)
+        # one decode only: an encoded "%" or "/" stays encoded, so the grant reads the same key
+        for raw, key in (("/artifacts/u/r/100%2541.html", "u/r/100%41.html"),
+                         ("/artifacts/u/a%252Fb/c.html", "u/a%2Fb/c.html"),
+                         ("/artifacts/u/r/%C3%A9%20x.html", "u/r/\u00e9 x.html")):
+            rec = rs.get(rs.create("req@x.com", raw, "own@x.com", NOW))
+            self.assertEqual(gate.key_from_path(rec["artifact"]), key, raw)
+            self.assertEqual(gate.canonical_artifact_path(rec["artifact"]), rec["artifact"])
+        self.assertIsNone(gate.canonical_artifact_path("/other/u/r/x.html"))
+
+    def test_owner_pending_cap(self):
+        store = FakeStore()
+        rs = gate.RequestStore(store, max_pending=2, link_ttl=100)
+        self.assertTrue(rs.reserve_owner_slot("Own@x.com", "a" * 32, NOW))
+        self.assertTrue(rs.reserve_owner_slot("own@x.com", "b" * 32, NOW + 1))
+        self.assertFalse(rs.reserve_owner_slot("own@x.com", "c" * 32, NOW + 2))      # at the cap
+        self.assertTrue(rs.reserve_owner_slot("other@x.com", "c" * 32, NOW + 2))     # per owner
+        rs.release_owner_slot("own@x.com", "a" * 32, NOW + 3)                       # decided
+        self.assertTrue(rs.reserve_owner_slot("own@x.com", "d" * 32, NOW + 4))
+        self.assertFalse(rs.reserve_owner_slot("own@x.com", "e" * 32, NOW + 5))
+        # an entry whose links expired holds no place any more
+        self.assertTrue(rs.reserve_owner_slot("own@x.com", "e" * 32, NOW + 101))
+        # unreadable or malformed state reads as no open requests (never a crash)
+        for junk in ("not json", json.dumps({"pending": "x"}), json.dumps([1]),
+                     json.dumps({"pending": [["a", "b"], [1, 2], "x"]})):
+            store.objs[rs._owner_rel("own@x.com")] = junk
+            self.assertTrue(rs.reserve_owner_slot("own@x.com", "f" * 32, NOW + 200), junk)
+
     def test_create_get_mark_single_use(self):
         rs = gate.RequestStore(FakeStore())
         rid = rs.create("req@x.com", "/artifacts/pub/x", "own@x.com", NOW)

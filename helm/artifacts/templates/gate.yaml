@@ -42,6 +42,19 @@
 {{- end }}
 {{- $gateImage = printf "%s@%s" $repo $digest }}
 {{- end }}
+{{- /* Request-access caps (values gate.requestCaps): whole numbers from 1 to 999999. A number
+       only: a string, a boolean, a fraction or a missing entry is refused, never read as
+       "no limit". The gate refuses to start on the same inputs. */ -}}
+{{- $caps := .Values.gate.requestCaps | default dict }}
+{{- if not (kindIs "map" $caps) }}
+{{- fail (printf "gate.requestCaps must be a map (perRequester, ownerPending), got %v" $caps) }}
+{{- end }}
+{{- range $name := list "perRequester" "ownerPending" }}
+{{- $v := index $caps $name }}
+{{- if not (and (or (kindIs "float64" $v) (kindIs "int64" $v) (kindIs "int" $v)) (regexMatch "^[1-9][0-9]{0,5}$" (toString $v))) }}
+{{- fail (printf "gate.requestCaps.%s must be a whole number from 1 to 999999, got %v" $name $v) }}
+{{- end }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -93,6 +106,10 @@ spec:
               value: /secrets/hmac-key
             - name: GATE_AUTH_PORT
               value: {{ .Values.gate.authPort | quote }}
+            - name: GATE_REQUESTER_RATE_LIMIT_MAX
+              value: {{ $caps.perRequester | toString | quote }}
+            - name: GATE_OWNER_PENDING_MAX
+              value: {{ $caps.ownerPending | toString | quote }}
             - name: MINIO_ACCESS_KEY
               valueFrom:
                 secretKeyRef: {name: {{ .Values.gate.s3SecretName }}, key: access-key}

@@ -1092,6 +1092,101 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 429)
         self.assertIn("Too many requests", page)
 
+    # -- request-access caps: the decoded key, per requester, per owner -------------------
+    def _request_access(self, sid, uri):
+        """Open `uri` as `sid` (the deny page carries the CSRF token bound to that spelling)
+        and send its request-access form: (status, page)."""
+        st, page, _ = self.auth(uri, sid)
+        self.assertEqual(st, 403, (sid, uri))
+        csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
+        st, page, _ = http(self.base + "/_gate/request", method="POST",
+                           data=urllib.parse.urlencode({"csrf": csrf, "artifact": uri}),
+                           headers={"Content-Type": "application/x-www-form-urlencoded"},
+                           cookie=f"sid={sid}")
+        return st, page
+
+    @staticmethod
+    def _records():
+        with OBJECTS_LOCK:
+            return [json.loads(OBJECTS[k]) for k in OBJECTS if k.startswith("_gate/req/")]
+
+    def test_request_access_encoded_variants_share_one_limit(self):
+        # six spellings of one file by one requester: GATE_RATE_LIMIT_MAX (2) of them are
+        # recorded and sent, under the decoded name; the rest are refused before any store read
+        sent = self.record_notifications()
+        USERS["rita"] = ("rita@example.com", "aaaa")
+        variants = ("/artifacts/u/secret/report.html", "/artifacts/u/secret/%72eport.html",
+                    "/artifacts/u/secret/r%65port%2ehtml", "/artifacts/%75/secret/report.html",
+                    "/artifacts/u/%73ecret/report.html",
+                    "/artifacts/u/secret/%72%65%70%6F%72%74.html")
+        codes = [self._request_access("rita", v)[0] for v in variants]
+        self.assertEqual(codes, [200, 200, 429, 429, 429, 429])
+        self.assertEqual([r["artifact"] for r in self._records()],
+                         ["/artifacts/u/secret/report.html"] * 2)
+        self.assertEqual([to for to, _ in sent], ["owner@example.com"] * 2)
+        for _to, text in sent:
+            self.assertIn("Requested file: `/artifacts/u/secret/report.html`", text)
+
+    def test_request_access_per_requester_limit_across_artifacts(self):
+        sent = self.record_notifications()
+        USERS["rob"] = ("rob@example.com", "aaaa")
+        acl = json.dumps({"owner": "owner@example.com", "users": []}).encode()
+        with OBJECTS_LOCK:
+            for i in range(3):
+                OBJECTS[f"u/r{i}/index.html"] = b"x"
+                OBJECTS[f"u/r{i}/.acl.json"] = acl
+        uris = [f"/artifacts/u/r{i}/index.html" for i in range(3)] + [
+            "/artifacts/u/r0/ghost.html",                      # missing: counted all the same
+            "/artifacts/u/secret/report.html"]
+        with mock.patch.object(self.gate.REQUESTER_LIMITER, "max_n", 4):
+            answers = [self._request_access("rob", u) for u in uris]
+        self.assertEqual([st for st, _ in answers], [200, 200, 200, 200, 429])
+        self.assertIn("many access requests", answers[4][1])
+        self.assertEqual(sorted(r["artifact"] for r in self._records()), uris[:3])
+        self.assertEqual(len(sent), 3)
+        # another requester has their own count
+        USERS["ros"] = ("ros@example.com", "aaaa")
+        self.assertEqual(self._request_access("ros", "/artifacts/u/secret/report.html")[0], 200)
+
+    def test_owner_pending_cap_records_but_does_not_send(self):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        uri = "/artifacts/u/secret/report.html"
+        names = ("ola", "pia", "quy", "ria")
+        for n in names:
+            USERS[n] = (f"{n}@example.com", "aaaa")
+        with mock.patch.object(self.gate.REQUESTS, "max_pending", 2):
+            self.assertEqual([self._request_access(n, uri)[0] for n in names[:3]], [200] * 3)
+            recs = self._records()
+            self.assertEqual(len(recs), 3)                      # every request is recorded
+            self.assertEqual(len(sent), 2)                      # the owner is sent two
+            held = [ln for ln in log.getvalue().splitlines() if " held: " in ln]
+            self.assertEqual(len(held), 1, held)
+            self.assertIn("requester=quy@example.com", held[0])
+            self.assertIn("the owner already has 2 open requests (recorded, no notification sent)",
+                          held[0])
+            # the owner decides one: its place frees up and the next request is sent
+            first = next(r for r in recs if r["requester"] == "ola@example.com")
+            token = self.gate.make_action_token(first["id"], "deny", self.gate._KEY, int(time.time()))
+            self.assertEqual(self._post_action("deny", token)[0], 200)
+            self.assertEqual(self._request_access(names[3], uri)[0], 200)
+        to_owner = [t for to, t in sent if to == "owner@example.com"]
+        self.assertEqual(len(to_owner), 3)
+        self.assertIn("Requester: `ria@example.com`", to_owner[-1])
+
+    def test_unsent_request_holds_no_owner_place(self):
+        # a message that could not be sent (no transport, Slack error) leaves no open request
+        # behind, so it never fills the owner's places
+        uri = "/artifacts/u/secret/report.html"
+        with mock.patch.object(self.gate.REQUESTS, "max_pending", 1):
+            for n in ("sia", "tom"):
+                USERS[n] = (f"{n}@example.com", "aaaa")
+                self.assertEqual(self._request_access(n, uri)[0], 200)
+        with OBJECTS_LOCK:
+            index = [json.loads(OBJECTS[k]) for k in OBJECTS if k.startswith("_gate/owner/")]
+        self.assertEqual(len(self._records()), 2)
+        self.assertEqual([i["pending"] for i in index], [[]])
+
     def test_csrf_rejected_on_foreign_or_stale_token(self):
         USERS["hank"] = ("hank@example.com", "aaaa")
         st, page, _ = self.auth("/artifacts/u/secret/report.html", "hank")

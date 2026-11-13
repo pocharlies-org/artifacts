@@ -418,6 +418,10 @@ mc_admin "mc rm --force local/artifacts/_gate/$PROBE.json >/dev/null 2>&1" || tr
 check "gate policy probes left no object" 0 "$(mc_admin "mc ls --recursive local/artifacts/u/$PROBE local/artifacts/g/$PROBE local/artifacts/pub/$PROBE local/artifacts/_gate/$PROBE.json 2>/dev/null | wc -l" | tr -d ' ')"
 
 # ---- an approval end to end on the real store --------------------------------------------
+# A long-lived stack keeps test2's daily count of access requests (all artifacts) between
+# runs of this script: start it from zero.
+rq_test2="_gate/rq/$(python3 -c 'import hashlib; print(hashlib.sha256(b"test2@example.com").hexdigest())').json"
+mc_admin "mc rm --force local/artifacts/$rq_test2 >/dev/null 2>&1" || true
 # test2 is denied an artifact owned by test@example.com, requests access, the owner approves
 # (the approve token is minted in the gate container with the dev HMAC key, as the DM would
 # carry it): the ACL write goes through MinIO with If-Match and the ACL's ttl tag, the owner
@@ -458,6 +462,29 @@ check "approval flow: test2 reads after approval" 200 "$(curl -s -o /dev/null -w
 check "approval flow: the ACL keeps its ttl tag" "$tags_before" "$(acl_tags)"
 check "approval flow: owner, users and expiry kept, test2 added" "test@example.com ['test2@example.com', 'test@example.com'] True" \
   "$(mc_admin "mc cat local/artifacts/u/$RUN3/.acl.json" | python3 -c 'import json,sys; a=json.load(sys.stdin); print(a["owner"], sorted(a["users"]), bool(a["expires"]))')"
+
+# ---- request-access caps: every spelling of one file is one artifact ---------------------
+# test2 asks for one file of a fresh artifact under six spellings: the gate counts them on
+# the decoded key, so GATE_RATE_LIMIT_MAX (5) are recorded, all under the decoded name, and
+# the sixth is refused before anything is recorded or sent.
+RUN4="e2e-caps-$(date +%s)"
+ARTIFACTS_OWNER=test@example.com ARTIFACTS_ACCESS_KEY=artifact-publisher \
+  ARTIFACTS_SECRET_KEY=artifact-publisher-dev-password ARTIFACTS_WRITE_BASE="$S3" ARTIFACTS_READ_BASE="$BASE" \
+  bash ../../cli/publish.sh -u test@example.com -r "$RUN4" -t 1 -a e2e -s compose /tmp/e2e-note.md >/dev/null \
+  || { echo "CLI publish for the request caps failed"; exit 1; }
+codes=""
+for name in index.html %69ndex.html i%6edex.html %69%6E%64ex.html index%2ehtml %69ndex%2Ehtml; do
+  variant="/artifacts/u/$RUN4/$name"
+  page=$(curl -s -H "Authorization: Bearer $TOKEN2" "$BASE$variant")
+  csrf=$(printf '%s' "$page" | python3 -c 'import html,re,sys; m=re.search(r"name=csrf value=\"([^\"]+)\"", sys.stdin.read()); print(html.unescape(m.group(1)) if m else "")')
+  codes="$codes $(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN2" \
+    --data-urlencode "csrf=$csrf" --data-urlencode "artifact=$variant" "$BASE/_gate/request")"
+done
+check "request caps: six spellings of one file, five taken, the sixth refused" " 200 200 200 200 200 429" "$codes"
+check "request caps: every request recorded under the decoded name" 5 \
+  "$(docker compose logs gate 2>/dev/null | grep -c "request-access id=[0-9a-f]* requester=test2@example.com artifact=/artifacts/u/$RUN4/index.html owner=")"
+check "request caps: no record under an encoded spelling" 0 \
+  "$(docker compose logs gate 2>/dev/null | grep -c "request-access id=[0-9a-f]* requester=test2@example.com artifact=/artifacts/u/$RUN4/[^ ]*%")"
 
 # ---- bootstrap-job regression: two-arg `mc admin user add` against real MinIO -----------
 # (helm/artifacts/templates/bootstrap-job.yaml uses the same command shape; the one-arg

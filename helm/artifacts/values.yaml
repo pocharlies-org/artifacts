@@ -117,6 +117,17 @@ gate:
   # true forwards the X-Forwarded-* headers the request carries, i.e. whatever the
   # entrypoint's forwardedHeaders settings let through from the client.
   trustForwardHeader: false
+  # Request-access caps: they bound the messages a requester can cause, never who can read
+  # what. Whole numbers from 1 to 999999 (the chart and the gate refuse anything else).
+  # Requests per requester and file stay at the gate's default, 5 per day.
+  requestCaps:
+    # access requests one signed-in user may send per day, across every artifact
+    # (GATE_REQUESTER_RATE_LIMIT_MAX)
+    perRequester: 20
+    # open requests an owner is sent at a time; above it a request is recorded and logged
+    # but no message is sent, until the owner decides one or its links expire
+    # (GATE_OWNER_PENDING_MAX)
+    ownerPending: 10
   # Container resources. To bound local disk, add ephemeral-storage to both, e.g.
   #   requests: {ephemeral-storage: 16Mi}   limits: {ephemeral-storage: 64Mi}
   resources:
