@@ -79,8 +79,8 @@ Always JSON. `200` with a decision, or an error status (§ table below).
 - `artifact.ttl` — the `ttl` tag as an integer number of days, or `null`.
 - `reason` — informational; only `allowed` is the decision. The exact strings:
   - allowed: `owner`, `user` (listed in `users`), `group` (member of a listed group),
-    `pub: any signed-in tenant user` (a `pub/` key without ACL),
-    `pub: anonymous (anonymous-pub enabled)`;
+    `pub: no ACL (anonymous read by design)` (a signed-in visitor on a `pub/` key without
+    ACL), `pub: anonymous (anonymous-pub enabled)` (an anonymous one);
   - not allowed: `denied` (every deny `decide()` makes: not on the ACL, no ACL outside
     `pub/`, a key with no artifact root, a malformed ACL, an empty groups claim; and a
     refused identity, see below; the detail is written to the gate's log only), `expired` and
@@ -125,7 +125,10 @@ With no session the answer is `allowed: true` **only** for keys under the pub pr
 `artifactsGate.anonymousPubEnabled`) is true. Otherwise `200` with
 `{"allowed": false, "reason": "unauthenticated"}`. The flag must be false before the
 host is reachable outside a trusted network, and the chart refuses to render with
-`anonymousPubEnabled: true` together with `publicExposure: true`.
+`anonymousPubEnabled: true` together with `publicExposure: true`. An anonymous visitor on a
+`pub/` key whose pub root has an ACL gets `denied`; the gate's own anonymous read decision
+(`/_gate/pub-auth`, used when the chart routes `pub/` through the gate) refuses the same
+key, so a plugin and the artifact read agree.
 
 ### When to call
 

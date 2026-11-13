@@ -23,9 +23,12 @@ X-Auth-Request-* headers), then decides against the ACL at the artifact's root (
   - An `.acl.json` below the artifact root is never read and never served.
   - No artifact root (a key directly under `u/` or `g/<slug>/`, `acl/...`, anything outside the
     pub prefixes, `u/` and `g/`): deny, whatever ACL objects exist.
-  - `pub/` objects WITHOUT an ACL: any signed-in user of the tenant. A `pub/` ACL, where one
-    exists, is the one at the key's pub root: `pub/<run>/.acl.json` for `pub/<run>/...` at any
-    depth, `pub/.acl.json` for a single file directly under `pub/` (acl_key_for).
+  - `pub/` is anonymous read by design (see "Anonymous pub/ reads" below): a `pub/` key whose
+    root has no ACL is open to every caller, signed in or not; decide() gives a signed-in
+    caller that answer. A `pub/` ACL, where one exists (no publisher writes one), is the one at
+    the key's pub root: `pub/<run>/.acl.json` for `pub/<run>/...` at any depth, `pub/.acl.json`
+    for a single file directly under `pub/` (acl_key_for); decide() evaluates it for a
+    signed-in caller, and the anonymous decision refuses every key under it.
   - Anything else without an ACL: deny (the request-access button on the deny page goes nowhere).
   - An identity containing `#EXT#` (a directory guest's UPN) is refused on every endpoint.
   - `expires` in the past: deny (still requestable: the owner still exists).
@@ -35,6 +38,20 @@ X-Auth-Request-* headers), then decides against the ACL at the artifact's root (
   - `pub/` takes no access requests and the gate never writes a `pub/` ACL: pub/ is
     anonymous-readable by design, so there is nothing to ask for; its deny page offers no
     request, the request POST is refused on the path alone and grant_access refuses it.
+
+Anonymous pub/ reads: `pub/` is anonymous read by design, for a host that is reachable on a
+private network only, never publicly (the chart refuses artifactsGate.anonymousPubEnabled with
+publicExposure). Where that anonymous decision lives depends on the route:
+
+  - artifactsGate.anonymousPubThroughGate (compose: ARTIFACTS_PUB_MODE=gate): every `pub/` read
+    asks `GET /_gate/pub-auth` on the decision listener through its own forwardAuth middleware
+    (`gate-pub-auth`, on the `pub/` rules only) and is signed like any other allowed read; see
+    pub_auth_decision. It asks no identity, allows only an existing object whose pub root has
+    no ACL, and answers everything else with one uniform 404 (no login redirect).
+  - otherwise: the route serves `pub/` straight from the store under its anonymous `pub/*` read
+    policy, and the gate never sees those reads.
+
+`/_gate/auth` stays the signed-in decision: it never answers 200 without a valid session.
 
 The gate also serves the request-access flow (all state in MinIO under `_gate/`, written with the
 gate's own least-privilege S3 user):
@@ -55,9 +72,10 @@ public surface must not share a port):
                    /_gate/auth: a server without an explicit gate_mode is treated as public, so the
                    decision endpoint is fail-closed here even if a route misdirects public traffic.
     GATE_AUTH_PORT (default 8081) decision listener: /_gate/auth (traefik's forwardAuth target,
-                   helm/artifacts/templates/gate-middlewares.yaml), /_gate/plugin/authz (the plugin
-                   authorization API) plus /_gate/healthz. The public IngressRoute excludes
-                   /_gate/auth and /_gate/healthz
+                   helm/artifacts/templates/gate-middlewares.yaml), /_gate/pub-auth (the anonymous
+                   pub/ decision, target of the gate-pub-auth forwardAuth), /_gate/plugin/authz
+                   (the plugin authorization API) plus /_gate/healthz. The public IngressRoute
+                   excludes /_gate/auth and /_gate/healthz
                    (helm/artifacts/templates/artifacts-routes.yaml): the browser reaches the gate
                    only on 8080, and the decision endpoints only exist on 8081 (healthz answers on
                    both, it leaks nothing and the kubelet probes 8080).
@@ -149,9 +167,11 @@ SLACK_BOT_TOKEN = _env("SLACK_BOT_TOKEN", "")
 PUBLIC_HOST = _env("PUBLIC_HOST", "artifacts.example.com")
 STATE_PREFIX = _env("GATE_STATE_PREFIX", "_gate")            # non-routed MinIO prefix for gate state
 PUB_PREFIXES = tuple(p for p in _env("GATE_PUB_PREFIXES", "pub/").split(",") if p)
-# Anonymous (no session) reads of pub/ — only meaningful for the plugin authz endpoint, since
-# plain anonymous pub/ reads are an edge (route) decision. Fail-closed default: the chart must set
-# it explicitly, and it must be false before any public hostname or tunnel (docs/plugins.md).
+# Anonymous (no session) reads of pub/: the plugin authz endpoint and /_gate/pub-auth (the
+# anonymous pub/ decision, used when the route sends pub/ through the gate) allow them only while
+# this is true; a route that serves pub/ straight from the store does not ask the gate. Fail-closed
+# default: the chart must set it explicitly, and it must be false before any public hostname or
+# tunnel (docs/plugins.md).
 ANONYMOUS_PUB_ENABLED = _env("GATE_ANONYMOUS_PUB_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 PLUGIN_PREFIX = _env("GATE_PLUGIN_PREFIX", "_plugins")  # plugin storage prefix: never served
 # Reserved for an MCP publisher's own bookkeeping objects: never an artifact, never served.
@@ -520,6 +540,13 @@ def acl_key_for(key, pub_prefixes=PUB_PREFIXES):
     return "/".join(parts[:n]) + "/.acl.json"
 
 
+# decide()'s reason for a pub/ key whose root has no ACL: pub/ is the anonymous-read prefix by
+# design, so such a key is open to every caller. A signed-in caller gets this answer from
+# decide(); an anonymous one from pub_auth_decision (or the plugin authz answer), and only while
+# GATE_ANONYMOUS_PUB_ENABLED is true.
+PUB_OPEN_REASON = "pub: no ACL (anonymous read by design)"
+
+
 def decide(user_email, user_groups, key, acl, now, pub_prefixes=PUB_PREFIXES):
     """(allowed, reason). acl is the object at acl_key_for(key); None means it does not exist."""
     if acl_key_for(key, pub_prefixes) is None:
@@ -527,7 +554,7 @@ def decide(user_email, user_groups, key, acl, now, pub_prefixes=PUB_PREFIXES):
         return False, "no-artifact-root: deny"
     if acl is None:
         if key.startswith(pub_prefixes):
-            return True, "pub: any signed-in tenant user"
+            return True, PUB_OPEN_REASON
         return False, "no-acl: deny by default (no owner to ask)"
     if not isinstance(acl, dict):
         return False, "bad-acl"
@@ -576,9 +603,12 @@ def key_from_path(path):
 def _bad_key(key):
     """Keys the gate must never serve, on any route (forwardAuth and plugin authz share this):
     empty, directory listing, ACL files (at the root or nested), gate state, plugin storage,
-    `_mcp/`, traversal segments."""
+    `_mcp/`, traversal segments, an empty segment or NUL."""
     if not key or key.endswith("/"):
         return True                                          # bucket root / dir listing: never
+    if "//" in key or key.startswith("/") or "\x00" in key:
+        return True                                          # empty segment or NUL: the store
+                                                             # refuses both, never decided
     if key == ".acl.json" or key.endswith("/.acl.json"):
         return True                                          # ACLs are never served
     if key == STATE_PREFIX or key.startswith(STATE_PREFIX + "/"):
@@ -677,6 +707,75 @@ def refused_client_headers(headers):
     """Names of the visitor's headers that a forwarded read must not carry (lowercased)."""
     return sorted({k.lower() for k in headers.keys()
                    if k.lower().startswith(_REFUSED_HEADER_PREFIXES)})
+
+
+# --------------------------------------------------------------------------------------------
+# Anonymous pub/ reads: GET /_gate/pub-auth (decision listener only; see the module docstring)
+# --------------------------------------------------------------------------------------------
+# What a pub/ key may not contain after its one decode, on the anonymous path: a second encoding
+# (`%`), a dot-dot anywhere, an empty segment, a backslash, a path parameter (`;`), a fragment or
+# query marker, and every control character (C0, DEL, C1). Each is a way for the key the gate
+# decides and the key the store serves to differ; the signature binds them anyway, this refuses
+# them before any store read.
+_PUB_REFUSED_SUBSTRINGS = ("..", "//", "\\", ";", "%", "#", "?")
+
+
+def pub_key_refused(key):
+    """True when an anonymous pub/ read of `key` (already decoded once) is refused on its
+    characters alone (the list above)."""
+    if any(s in key for s in _PUB_REFUSED_SUBSTRINGS):
+        return True
+    return any(ord(c) < 0x20 or 0x7f <= ord(c) <= 0x9f for c in key)
+
+
+def pub_auth_decision(method, uri, minio, now, header_names=(), enabled=None):
+    """(allowed, key, reason) of one anonymous read, as /_gate/pub-auth decides it.
+
+    Allowed only while anonymous pub/ is enabled (GATE_ANONYMOUS_PUB_ENABLED, or `enabled`),
+    for a GET or HEAD of /<bucket>/<pub prefix>... with no query and no client x-amz-*/x-minio-*
+    header (header_names), whose key, decoded once, is a key the gate serves (_bad_key) and
+    passes pub_key_refused, whose pub root (acl_key_for) holds NO ACL object, and whose object
+    exists. Nothing else is asked: no identity (a session cookie changes nothing here; the
+    signed-in decision is /_gate/auth), no second decode. A store that cannot be read refuses
+    (fail closed). `key` is the decided key (None when the URI was refused before one was
+    read); `reason` is for the log only: the caller answers every refusal the same way."""
+    if not (ANONYMOUS_PUB_ENABLED if enabled is None else enabled):
+        return False, None, "anonymous pub/ disabled"
+    if method not in ("GET", "HEAD"):
+        return False, None, "method"
+    if any(str(h).lower().startswith(_REFUSED_HEADER_PREFIXES) for h in header_names):
+        return False, None, "client S3 header"
+    target = split_forwarded_uri(uri)
+    if target is None or target[1] is not None:
+        return False, None, "malformed URI or a query"
+    path = target[0]
+    if not path.startswith(BUCKET_PATH):
+        return False, None, "outside the bucket"
+    try:
+        # the same one decode as key_from_path, but bytes that are not UTF-8 are refused
+        # instead of replaced (the store would read them differently)
+        key = urllib.parse.unquote(path[len(BUCKET_PATH):], errors="strict")
+    except UnicodeDecodeError:
+        return False, None, "not UTF-8"
+    if not key.startswith(PUB_PREFIXES):
+        return False, key, "not pub/"
+    if _bad_key(key) or pub_key_refused(key):
+        return False, key, "never served"
+    if acl_key_for(key) is None:
+        return False, key, "no pub root"
+    acl, err = read_acl(minio, key, now)
+    if err:
+        # unreadable, or an ACL object that is not JSON (one exists): refuse
+        return False, key, f"acl unreadable ({err})"
+    if acl is not None:
+        return False, key, "acl present"
+    try:
+        exists = minio.head(key) == 200
+    except ConnectionError:
+        exists = False
+    if not exists:
+        return False, key, "object missing"
+    return True, key, "pub: anonymous, no ACL"
 
 
 # The one `reason` a denied visitor is told (docs/plugins.md §1), whatever decide() said:
@@ -1244,6 +1343,27 @@ class GateHandler(BaseHTTPRequestHandler):
         # deny AND missing artifact answer identically (no existence leak)
         return self._send(403, self._deny_page(split_forwarded_uri(uri)[0]))
 
+    # -- anonymous pub/ decision -------------------------------------------------------
+    def _handle_pub_auth(self, method, uri):
+        """GET /_gate/pub-auth: the anonymous pub/ decision (pub_auth_decision), forwardAuth
+        target of the gate-pub-auth middleware. Allow: 200 with the signed upstream read, like
+        /_gate/auth. Everything else: one answer (C28), the same status, headers and body for
+        a missing key, a key whose pub root has an ACL, a listing, an .acl.json, a key outside
+        pub/, a malformed path, a write and a client S3 header, GET and HEAD alike, and never
+        a redirect to a login."""
+        allowed, key, reason = pub_auth_decision(method, uri, MINIO, int(time.time()),
+                                                 header_names=list(self.headers.keys()))
+        if allowed:
+            host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
+                    or PUBLIC_HOST).split(",")[0].strip()
+            sig = upstream_auth_headers(method, host, uri, READ_ACCESS_KEY, READ_SECRET_KEY)
+            if sig is not None:
+                LOG.info("pub-auth key=%s allowed=True reason=%s", key, reason)
+                return self._send(200, b"ok", "text/plain", extra=sig)
+            reason = "not signable"     # unreachable: the decision refuses what this refuses
+        LOG.info("pub-auth uri=%s allowed=False reason=%s", (uri or "")[:300], reason)
+        return self._send(404, self._page("Not found", "<p>Nothing here.</p>"))
+
     # -- plugin authorization API (docs/plugins.md) ------------------------------------
     def _handle_plugin_authz(self, method):
         """POST /_gate/plugin/authz — the plugin authorization API (docs/plugins.md §1). Body:
@@ -1557,6 +1677,13 @@ class GateHandler(BaseHTTPRequestHandler):
             fwd_method = self.headers.get("X-Forwarded-Method", method)
             fwd_uri = self.headers.get("X-Forwarded-Uri", self.path)
             return self._handle_forward_auth(fwd_method, fwd_uri)
+        if path == "/_gate/pub-auth":
+            # The anonymous pub/ decision (gate-pub-auth forwardAuth target). Decision listener
+            # only, exactly like /_gate/auth: on the public listener it 404s.
+            if mode != "auth":
+                return self._send(404, self._page("Not found", "<p>Nothing here.</p>"))
+            return self._handle_pub_auth(self.headers.get("X-Forwarded-Method", method),
+                                         self.headers.get("X-Forwarded-Uri", self.path))
         if path == "/_gate/plugin/authz":
             # Plugin authorization API (docs/plugins.md): internal listener only, exactly like
             # /_gate/auth. The public IngressRoute never points at 8081, and a request that
@@ -1565,7 +1692,8 @@ class GateHandler(BaseHTTPRequestHandler):
                 return self._send(404, self._page("Not found", "<p>Nothing here.</p>"))
             return self._handle_plugin_authz(method)
         if mode == "auth":
-            # the decision listener serves nothing but /_gate/auth (+ healthz): no public endpoints
+            # the decision listener serves nothing but its decision endpoints (+ healthz): no
+            # public endpoints
             return self._send(404, self._page("Not found", "<p>Nothing here.</p>"))
         if path == "/_gate/request" and method == "POST":
             return self._handle_request_access()

@@ -76,12 +76,23 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   `PutObject` (MinIO does; a store that ignores it brings back the lost-update race).
 - **Two listeners, one process**: `:8080` public (request-access pages, approve/deny
   links, health) and `:8081` internal (decision endpoints only: `/_gate/auth`,
-  `/_gate/plugin/authz`). The public routes never reach the decision listener.
+  `/_gate/pub-auth`, `/_gate/plugin/authz`). The public routes never reach the decision
+  listener.
+- **Anonymous `pub/`**: `pub/` is anonymous read by design, for a host reachable on a
+  private network only (the chart refuses `artifactsGate.anonymousPubEnabled` together with
+  `publicExposure`). `/_gate/auth` never answers `200` without a session; the anonymous
+  decision is `GET /_gate/pub-auth`, which asks no identity and allows a read only when the
+  object exists and its pub root has no ACL. Any `pub/` key that, decoded once, contains
+  `..`, `//`, `\`, `;`, `%`, `#`, `?` or a control character is refused before the store is
+  read. Everything it refuses (a missing key, a key with an ACL, a listing, an `.acl.json`, a
+  malformed path, a write) gets one answer: the same `404` page, status, headers and body, for
+  `GET` and `HEAD`, never a login redirect. Whether the route asks it is a chart value, see
+  [Helm](#helm-helmartifactsvaluesyaml).
 - **Expiry**: objects carry a `ttl` tag (`1|7|14|30` days), ILM expires by tag, and a
   catch-all (90 days) takes everything untagged — including `_plugins/`.
 - **Never served**: directory listings, `.acl.json` (at the root or nested), `_gate/` (gate
   state), `_plugins/` (plugin storage), `_mcp/` (an MCP publisher's bookkeeping), and any
-  path with a `.`/`..` segment.
+  path with a `.`/`..` segment, an empty segment (`//`) or a NUL.
 
 ## Quick start (laptop, Docker Compose)
 
@@ -301,7 +312,7 @@ Everything is environment-driven; nothing is hardcoded.
 | `PUBLIC_HOST` | `artifacts.example.com` | host used in generated links |
 | `SLACK_BOT_TOKEN` | empty | optional DM notification on access requests |
 | `GATE_PUB_PREFIXES` | `pub/` | comma list treated as "any signed-in user" without ACL; each entry ends in `/` (one that does not has no artifact root: denied) |
-| `GATE_ANONYMOUS_PUB_ENABLED` | `false` | anonymous reads of `pub/` (plugin authz); must stay false on public hosts |
+| `GATE_ANONYMOUS_PUB_ENABLED` | `false` | anonymous reads of `pub/` (plugin authz and `/_gate/pub-auth`); must stay false on public hosts |
 | `GATE_STATE_PREFIX` | `_gate` | gate state prefix (never served) |
 | `GATE_PLUGIN_PREFIX` | `_plugins` | plugin storage prefix (never served) |
 | `GATE_RATE_LIMIT_MAX` / `GATE_RATE_LIMIT_WINDOW_SECONDS` | `5` / `86400` | access requests per key |

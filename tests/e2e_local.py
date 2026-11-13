@@ -1506,6 +1506,127 @@ class E2ETest(unittest.TestCase):
             _, ans = self.plugin_authz(uri, sid="carol")
             self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), uri)
 
+    # -- the anonymous pub/ decision: GET /_gate/pub-auth (decision listener) ------------
+    def pub_auth(self, uri, method="GET", headers=None, cookie=None, flag=True, port=None):
+        saved = self.gate.ANONYMOUS_PUB_ENABLED
+        self.gate.ANONYMOUS_PUB_ENABLED = flag
+        self.addCleanup(setattr, self.gate, "ANONYMOUS_PUB_ENABLED", saved)
+        base = self.auth_base if port is None else f"http://127.0.0.1:{port}"
+        h = {"X-Forwarded-Method": method, "X-Forwarded-Uri": uri,
+             "X-Forwarded-Host": "artifacts.test.invalid"}
+        h.update(headers or {})
+        return http(base + "/_gate/pub-auth", headers=h, cookie=cookie)
+
+    @staticmethod
+    def _shape(st, body, h):
+        # status, headers and body of an answer, Date aside (it moves with the clock)
+        return st, body, tuple(sorted((k.lower(), v) for k, v in h.items() if k.lower() != "date"))
+
+    def test_pub_auth_allows_an_existing_pub_key_without_acl_and_signs_it(self):
+        uri = "/artifacts/pub/free/index.html"
+        for method in ("GET", "HEAD"):
+            st, body, h = self.pub_auth(uri, method)          # no cookie: anonymous
+            self.assertEqual((st, body), (200, "ok"), method)
+            want = self.gate.upstream_auth_headers(method, "artifacts.test.invalid", uri,
+                                                   "reader", "reader-secret",
+                                                   amzdate=h["X-Amz-Date"])
+            self.assertEqual(h["Authorization"], want["Authorization"], method)
+            self.assertIn("Credential=reader/", h["Authorization"])
+        # a single-file pub artifact (the MCP's layout) too
+        with OBJECTS_LOCK:
+            OBJECTS["pub/mcp-report-0123abcd.html"] = b"<h1>mcp</h1>"
+        self.assertEqual(self.pub_auth("/artifacts/pub/mcp-report-0123abcd.html")[0], 200)
+        # /_gate/auth stays the signed-in decision: never 200 without a session (C27)
+        saved = self.gate.ANONYMOUS_PUB_ENABLED
+        self.gate.ANONYMOUS_PUB_ENABLED = True
+        self.addCleanup(setattr, self.gate, "ANONYMOUS_PUB_ENABLED", saved)
+        for method in ("GET", "HEAD"):
+            st, _, h = self.auth(uri, None, method=method)
+            self.assertEqual(st, 401, method)
+            self.assertNotIn("Authorization", h)
+
+    def test_pub_auth_one_uniform_answer_for_everything_it_refuses(self):
+        # C28: the same status, headers and body for a missing key, a key whose pub root has an
+        # ACL, a listing, an .acl.json, _gate/, _mcp/, a malformed path, a query, a write and a
+        # client S3 header; GET and HEAD alike; no login redirect, nothing from the store
+        self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html")[0], 200)   # control
+        with OBJECTS_LOCK:
+            OBJECTS["pub/closed/index.html"] = b"x"
+            OBJECTS["pub/closed/.acl.json"] = json.dumps(
+                {"owner": "owner@example.com", "users": ["alice@example.com"]}).encode()
+        cases = [("/artifacts/pub/free/ghost.html", {}), ("/artifacts/pub/closed/index.html", {}),
+                 ("/artifacts/pub/free/", {}), ("/artifacts/pub/free/.acl.json", {}),
+                 ("/artifacts/pub/closed/.acl.json", {}), ("/artifacts/_gate/req/x.json", {}),
+                 ("/artifacts/_mcp/x.json", {}), ("/artifacts/pub/free/index.html#x", {}),
+                 ("/artifacts/pub/free/index.html?x=1", {}), ("//evil/artifacts/pub/free/x", {}),
+                 ("/artifacts/u/secret/report.html", {}),
+                 ("/artifacts/pub/free/index.html", {"X-Amz-Checksum-Mode": "ENABLED"})]
+        shapes = set()
+        for uri, extra in cases:
+            for method in ("GET", "HEAD"):
+                st, body, h = self.pub_auth(uri, method, headers=extra)
+                self.assertEqual(st, 404, (uri, method))
+                self.assertNotIn("Location", h)
+                self.assertNotIn("Authorization", h)
+                self.assertTrue(h["Content-Type"].startswith("text/html"), uri)
+                self.assertNotIn("NoSuchKey", body)
+                self.assertNotIn("<?xml", body)
+                shapes.add(self._shape(st, body, h))
+        for method in ("PUT", "DELETE", "POST"):
+            shapes.add(self._shape(*self.pub_auth("/artifacts/pub/free/index.html", method)))
+        self.assertEqual(len(shapes), 1, shapes)
+
+    def test_pub_auth_never_lets_a_c29_spelling_through(self):
+        # canaries in u/, g/, acl/ and _gate/ without an ACL; each probe spelling is refused
+        # before the store is read, and never carries a signature
+        self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html")[0], 200)   # control
+        with OBJECTS_LOCK:
+            for k in ("u/canary/c.html", "g/team-a/canary/c.html", "acl/canary.html",
+                      "_gate/canary.json"):
+                OBJECTS[k] = b"CANARY"
+        for t in ("u/canary/c.html", "g/team-a/canary/c.html", "acl/canary.html",
+                  "_gate/canary.json"):
+            for s in ("pub/../{}", "pub/%2e%2e/{}", "pub/%252e%252e/{}", "pub//../{}",
+                      "pub/x;/../{}", "pub/free/..%2f..%2f{}", "pub/free/%5c..%5c{}"):
+                uri = "/artifacts/" + s.format(t)
+                st, body, h = self.pub_auth(uri)
+                self.assertEqual(st, 404, uri)
+                self.assertNotIn("CANARY", body)
+                self.assertNotIn("Authorization", h, uri)
+
+    def test_pub_auth_ignores_sessions_and_spoofed_targets(self):
+        # a session changes nothing (no identity is asked), and a forwarded URI aimed at u/ or
+        # g/ gets the uniform answer even from a visitor the ACL lists
+        self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html", cookie="sid=alice")[0],
+                         200)
+        with OBJECTS_LOCK:
+            OBJECTS["g/team-a/run1/index.html"] = b"g"
+            OBJECTS["pub/closed/index.html"] = b"x"
+            OBJECTS["pub/closed/.acl.json"] = json.dumps(
+                {"owner": "alice@example.com", "users": ["alice@example.com"]}).encode()
+        for uri in ("/artifacts/u/secret/report.html", "/artifacts/g/team-a/run1/index.html",
+                    "/artifacts/pub/closed/index.html"):
+            for cookie in (None, "sid=alice", "sid=owner"):
+                st, body, h = self.pub_auth(uri, cookie=cookie)
+                self.assertEqual(st, 404, (uri, cookie))
+                self.assertNotIn("Authorization", h)
+                self.assertIn("Nothing here", body)
+
+    def test_pub_auth_only_on_the_decision_listener_and_only_when_enabled(self):
+        uri = "/artifacts/pub/free/index.html"
+        self.assertEqual(self.pub_auth(uri)[0], 200)                           # control
+        st, _, h = self.pub_auth(uri, port=self.port_of(self.gate_public))
+        self.assertEqual(st, 404)
+        self.assertNotIn("Authorization", h)
+        st, _, h = self.pub_auth(uri, flag=False)
+        self.assertEqual(st, 404)
+        self.assertNotIn("Authorization", h)
+
+    def test_pub_signed_in_reason_says_anonymous_read_by_design(self):
+        st, ans = self.plugin_authz("/artifacts/pub/free/index.html", sid="alice")
+        self.assertEqual((st, ans["allowed"], ans["reason"]),
+                         (200, True, "pub: no ACL (anonymous read by design)"))
+
     def test_keys_without_artifact_root_denied(self):
         # an ACL where the old per-directory lookup would find one lets nobody in
         acl = json.dumps({"owner": "alice@example.com", "users": ["alice@example.com"]}).encode()
