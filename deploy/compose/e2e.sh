@@ -352,10 +352,13 @@ spec.loader.exec_module(g)
 print(g.make_action_token(os.environ["RID"], "approve", g._KEY, int(time.time())))
 PY
 )
-check "approval flow: owner opens the confirm page" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
-  --get --data-urlencode "token=$approve_token" "$BASE/_gate/approve")"
+confirm_page=$(curl -s -H "Authorization: Bearer $TOKEN" --get --data-urlencode "token=$approve_token" "$BASE/_gate/approve")
+check "approval flow: the confirm page says the whole artifact is granted" 1 \
+  "$(printf '%s' "$confirm_page" | grep -c "access to the whole artifact <code>/artifacts/u/$RUN3/</code>")"
 approve_page=$(curl -s -H "Authorization: Bearer $TOKEN" --data-urlencode "token=$approve_token" "$BASE/_gate/approve")
 check "approval flow: owner's POST approves" 1 "$(printf '%s' "$approve_page" | grep -c '<title>Request approved</title>')"
+check "approval flow: the result page says the whole artifact" 1 \
+  "$(printf '%s' "$approve_page" | grep -c "can now open the whole artifact <code>/artifacts/u/$RUN3/</code>")"
 check "approval flow: test2 reads after approval" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN2" "$BASE$GRANT_PATH")"
 check "approval flow: the ACL keeps its ttl tag" "$tags_before" "$(acl_tags)"
 check "approval flow: owner, users and expiry kept, test2 added" "test@example.com ['test2@example.com', 'test@example.com'] True" \

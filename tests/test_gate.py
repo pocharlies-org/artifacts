@@ -1289,6 +1289,15 @@ class AclRootTest(unittest.TestCase):
             self.assertEqual(gate.grant_access(m, path, "new@x.com"), (False, "no artifact root"), path)
         self.assertEqual((m.gets, m.puts), ([], []))
 
+    def test_artifact_root_path_is_what_a_grant_covers(self):
+        for path, want in (("/artifacts/u/r/index.html", "/artifacts/u/r/"),
+                           ("/artifacts/u/r/a/b/c.css", "/artifacts/u/r/"),
+                           ("/artifacts/g/team/r/a/b.js", "/artifacts/g/team/r/"),
+                           ("/artifacts/pub/run/a/x.html", "/artifacts/pub/run/a/"),
+                           ("/artifacts/u/x.html", None), ("/artifacts/acl/r.json", None),
+                           ("/elsewhere/u/r/x.html", None)):
+            self.assertEqual(gate.artifact_root_path(path), want, path)
+
     def test_mcp_prefix_is_never_served(self):
         for key in ("_mcp", "_mcp/x.json", "_mcp/sessions/a/b.json", "_mcp/.acl.json"):
             self.assertTrue(gate._bad_key(key), key)

@@ -56,10 +56,13 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   `?`) answers 404 and is never signed. A forwarded read carrying any `x-amz-*` or
   `x-minio-*` request header is refused with 400 before the gate signs anything.
 - **Request access**: a denied visitor can ask the artifact's owner, who gets a one-click
-  approve/deny link (Slack DM). An approval adds the requester to the root ACL with a
-  conditional write: the gate reads the ACL with its ETag and writes it back with `If-Match`,
-  so a change made by anyone else in between is never overwritten (the store answers `412`;
-  the gate reads again and retries once, then gives up). Everything else in the ACL (`owner`,
+  approve/deny link (Slack DM). An approval covers the whole artifact, not only the file that
+  was asked for (the owner's message, the confirm page and the requester's message name the
+  artifact root); a key with no artifact root offers no request (there is no owner to ask).
+  The approval adds the requester to the root ACL with a conditional write: the gate reads
+  the ACL with its ETag and writes it back with `If-Match`, so a change made by anyone else in
+  between is never overwritten (the store answers `412`; the gate reads again and retries
+  once, then gives up). Everything else in the ACL (`owner`,
   `groups`, `expires`, unknown fields) and the ACL's tags (its `ttl`) are kept. A write that
   fails is never reported as approved: the requester is told nothing, the owner sees that
   access was not granted, and the request stays open. Your store must honour `If-Match` on

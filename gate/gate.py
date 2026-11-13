@@ -524,6 +524,17 @@ def decide(user_email, user_groups, key, acl, now, pub_prefixes=PUB_PREFIXES):
     return False, "not-listed"
 
 
+def artifact_root_path(artifact_path):
+    """What an access grant for `artifact_path` covers, as a path: the directory of the ACL that
+    governs it (acl_key_for), e.g. `/artifacts/u/<run>/` for any file of that artifact at any
+    depth. None when no ACL can govern the path."""
+    key = key_from_path(artifact_path)
+    acl_key = acl_key_for(key) if key is not None else None
+    if acl_key is None:
+        return None
+    return BUCKET_PATH + acl_key[:-len(".acl.json")]
+
+
 def key_from_path(path):
     """Object key if `path` is under the bucket's public path, else None.
 
@@ -1109,6 +1120,14 @@ class GateHandler(BaseHTTPRequestHandler):
             f"<button type=submit>Request access</button></form>"
             f"<p class=muted>artifact-gate</p>"), status=403)
 
+    def _no_artifact_page(self, path):
+        # a key with no artifact root (acl_key_for is None): no ACL, so no owner to ask. The
+        # answer depends on the shape of the path only, never on what exists.
+        return self._page("Access required", (
+            f"<p>You do not have access to <code>{html.escape(path, quote=True)}</code>.</p>"
+            f"<p>This address is not inside a published artifact, so there is no owner to "
+            f"ask for access.</p><p class=muted>artifact-gate</p>"))
+
     def _refused_page(self):
         # the same page for every key and endpoint: it depends on the identity only
         return self._page("Access refused", "<p>This account cannot open artifacts here.</p>"
@@ -1182,6 +1201,8 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._send(500, b"identity backend error", "text/plain")
         if verdict == "bad_path":
             return self._send(404, self._page("Not found", "<p>Nothing here.</p>"))
+        if acl_key_for(key) is None:
+            return self._send(403, self._no_artifact_page(split_forwarded_uri(uri)[0]))
         # deny AND missing artifact answer identically (no existence leak)
         return self._send(403, self._deny_page(split_forwarded_uri(uri)[0]))
 
@@ -1307,7 +1328,9 @@ class GateHandler(BaseHTTPRequestHandler):
             deny = f"https://{PUBLIC_HOST}/_gate/deny?token=" + \
                 urllib.parse.quote(make_action_token(rid, "deny", _KEY, int(time.time())))
             text = (f":lock: *Access requested*\n"
-                    f"Requester: `{email}`\nArtifact: `{path}`\n"
+                    f"Requester: `{email}`\nRequested file: `{path}`\n"
+                    f"Approving gives access to the whole artifact `{artifact_root_path(path)}`: "
+                    f"every file in it, not only this one.\n"
                     f"[Approve]({approve}) · [Deny]({deny})\n"
                     f"Links expire in {TOKEN_TTL // 86400} days and work once, only for you.")
             ok, detail = NOTIFIER.send(owner, text)
@@ -1361,9 +1384,15 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._send(410, self._page("Already decided",
                                               f"<p>This request was already <b>{decided}</b>.</p>"))
         art = html.escape(rec["artifact"], quote=True)
+        root = artifact_root_path(rec["artifact"]) or rec["artifact"]
+        root_html = html.escape(root, quote=True)
+        requester = html.escape(rec["requester"])
         if not via_post:
+            scope = (f"<p>Approving gives <b>{requester}</b> access to the whole artifact "
+                     f"<code>{root_html}</code>: every file in it, not only this one.</p>"
+                     if action == "approve" else "")
             return self._send(200, self._page(f"Confirm: {action} access?", (
-                f"<p><b>{html.escape(rec['requester'])}</b> asked for <code>{art}</code>.</p>"
+                f"<p><b>{requester}</b> asked for <code>{art}</code>.</p>{scope}"
                 f"<p>Clicking the button below ({action}) is final: the link works once.</p>"
                 f"<form method=POST action=https://{PUBLIC_HOST}/_gate/{action}>"
                 f"<input type=hidden name=token value=\"{html.escape(token, quote=True)}\">"
@@ -1387,18 +1416,24 @@ class GateHandler(BaseHTTPRequestHandler):
                           "request reopened=%s, requester not notified)",
                           rec["id"], note, rec["requester"], rec["artifact"], reopened)
                 return self._send(503, self._page("Access not granted", (
-                    f"<p><b>{html.escape(rec['requester'])}</b> was <b>not</b> given access to "
-                    f"<code>{art}</code>: the artifact's access list could not be updated. "
+                    f"<p><b>{requester}</b> was <b>not</b> given access to the artifact "
+                    f"<code>{root_html}</code>: its access list could not be updated. "
                     f"Nothing was changed and they were not notified.</p>"
                     + ("<p>The request is still open: the same link can be used again.</p>"
                        if reopened else ""))))
-        msg = (f"Your access request for `{rec['artifact']}` was "
-               f"{'approved — the link works now.' if action == 'approve' else 'denied.'}")
+        if action == "approve":
+            msg = (f"Your access request for `{rec['artifact']}` was approved: you can now open "
+                   f"the whole artifact `{root}`.")
+            done = (f"<p><b>{requester}</b> can now open the whole artifact "
+                    f"<code>{root_html}</code>. They were notified.</p>")
+        else:
+            msg = f"Your access request for `{rec['artifact']}` was denied."
+            done = f"<p>{requester} was notified.</p>"
         ok, detail = NOTIFIER.send(rec["requester"], msg)
         LOG.info("action=%s id=%s by=%s requester=%s artifact=%s acl_note=%s notify_ok=%s detail=%s",
                  action, rec["id"], email, rec["requester"], rec["artifact"], note, ok, detail)
-        return self._send(200, self._page(f"Request {action}d",
-                                          f"<p>{html.escape(rec['requester'])} was notified.</p>"))
+        return self._send(200, self._page(
+            "Request approved" if action == "approve" else "Request denied", done))
 
     # -- routing ---------------------------------------------------------------------
     def do_GET(self):  # noqa: N802

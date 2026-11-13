@@ -653,10 +653,70 @@ class E2ETest(unittest.TestCase):
         token = self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time()))
         st, page, _ = self._post_action("deny", token)
         self.assertEqual(st, 200)
+        self.assertIn("<title>Request denied</title>", page)
         self.assertEqual(len(sent), 1)
         self.assertIn("denied", sent[0][1])
         self.assertNotIn("approved", sent[0][1])
         self.assertEqual([k for k, *_x in PUTS if k.endswith(".acl.json")], [])
+
+    # -- an approval grants the whole artifact: every message says so --------------------
+    def test_owner_dm_names_the_whole_artifact(self):
+        sent = self.record_notifications()
+        USERS["nina"] = ("nina@example.com", "aaaa")
+        uri = "/artifacts/u/secret/assets/app.css"
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/assets/app.css"] = b"body{}"
+        st, page, _ = self.auth(uri, "nina")
+        csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
+        st, _, _ = http(self.base + "/_gate/request", method="POST",
+                        data=urllib.parse.urlencode({"csrf": csrf, "artifact": uri}),
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        cookie="sid=nina")
+        self.assertEqual(st, 200)
+        self.assertEqual([to for to, _ in sent], ["owner@example.com"])
+        text = sent[0][1]
+        self.assertIn("Requested file: `/artifacts/u/secret/assets/app.css`", text)
+        self.assertIn("Approving gives access to the whole artifact `/artifacts/u/secret/`", text)
+
+    def test_confirm_and_result_pages_name_the_whole_artifact(self):
+        sent = self.record_notifications()
+        rid = self.gate.REQUESTS.create("olga@example.com", "/artifacts/u/secret/assets/app.css",
+                                        "owner@example.com", int(time.time()))
+        approve = self.gate.make_action_token(rid, "approve", self.gate._KEY, int(time.time()))
+        st, page, _ = http(self.base + "/_gate/approve?token=" + urllib.parse.quote(approve, safe=""),
+                           cookie="sid=owner")
+        self.assertEqual(st, 200)
+        self.assertIn("asked for <code>/artifacts/u/secret/assets/app.css</code>", page)
+        self.assertIn("access to the whole artifact <code>/artifacts/u/secret/</code>", page)
+        deny = self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time()))
+        st, page, _ = http(self.base + "/_gate/deny?token=" + urllib.parse.quote(deny, safe=""),
+                           cookie="sid=owner")
+        self.assertEqual(st, 200)
+        self.assertNotIn("whole artifact", page)
+        st, page, _ = self._post_action("approve", approve)
+        self.assertEqual(st, 200)
+        self.assertIn("<title>Request approved</title>", page)
+        self.assertIn("can now open the whole artifact <code>/artifacts/u/secret/</code>", page)
+        self.assertEqual(sent, [("olga@example.com",
+                                 "Your access request for `/artifacts/u/secret/assets/app.css` was "
+                                 "approved: you can now open the whole artifact `/artifacts/u/secret/`.")])
+
+    def test_key_without_artifact_root_promises_no_owner(self):
+        acl = json.dumps({"owner": "alice@example.com", "users": []}).encode()
+        with OBJECTS_LOCK:
+            OBJECTS["u/.acl.json"] = acl
+            OBJECTS["u/loose.html"] = b"x"
+        USERS["pete"] = ("pete@example.com", "aaaa")
+        for uri in ("/artifacts/u/loose.html", "/artifacts/u/ghost.html", "/artifacts/acl/run.json"):
+            st, body, _ = self.auth(uri, "pete")
+            self.assertEqual(st, 403, uri)
+            self.assertIn("Access required", body)
+            self.assertIn("no owner to ask", body)
+            self.assertNotIn("Request access", body)
+            self.assertNotIn("name=csrf", body)
+        st, body, _ = self.auth("/artifacts/u/secret/report.html", "pete")   # a real artifact: the form
+        self.assertEqual(st, 403)
+        self.assertIn("Request access", body)
 
     def test_request_access_missing_artifact_uniform_response_no_state(self):
         USERS["frank"] = ("frank@example.com", "aaaa")
