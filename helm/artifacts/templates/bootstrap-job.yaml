@@ -22,7 +22,7 @@
                           _plugins/<name>/ only (docs/plugins.md §3). */ -}}
 {{- if .Values.bootstrap.enabled }}
 {{- $m := .Values.minio }}
-{{- $b := $m.bucket }}
+{{- $b := include "artifacts.bucket" . }}
 {{- $pluginNames := list }}
 {{- range $p := .Values.plugins }}
 {{- $n := required "each plugin needs a name" $p.name | toString }}

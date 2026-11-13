@@ -13,8 +13,9 @@ container resources of the gate, the login proxy and the bootstrap Job (ephemera
 from values), the route that keeps /_gate/plugin/ off the public gate listener, and the
 example login-proxy image (digest-pinned, v7.15.5 or newer, the same image the compose stack
 runs), the names written into Traefik rules: artifactsHost, artifactsExtraHosts and
-plugins[].pathPrefix (a safe charset only, so a backtick can never rewrite a rule), and the
-gate's request-access caps (gate.requestCaps, whole numbers only). Every refusal the chart
+plugins[].pathPrefix (a safe charset only, so a backtick can never rewrite a rule),
+minio.bucket (an S3 bucket name only, for the same reason), and the gate's request-access
+caps (gate.requestCaps, whole numbers only). Every refusal the chart
 makes for these values is exercised too. Stdlib only.
 """
 import json
@@ -273,6 +274,16 @@ check(host_match + " && PathPrefix(`/_canvas/v2/`)" in rules
       "set: nested plugin prefixes and '_' / '-' in a segment are accepted")
 check(all(m.count("`") % 2 == 0 for m in rules), "set: every rule has balanced backticks")
 
+# ---- the bucket name: written into PathPrefix(`/<bucket>...`), GATE_BUCKET and the Job --------
+for bucket in ("team-reports.v2", "abc", "a" * 63, "1artifacts9"):
+    out = ok_render({"minio": {"bucket": bucket}})
+    rules = [m for _p, m, _s in routing.routes(out)]
+    check(len(rules) >= 3 and all("PathPrefix(`/%s" % bucket in m for m in rules
+                                       if "PathPrefix(`/_" not in m and "oauth2" not in m),
+          "set: minio.bucket %s is accepted and lands in every bucket rule" % bucket[:20])
+    check(gate_env(documents(out)[("Deployment", "artifact-gate")]).get("GATE_BUCKET") == bucket,
+          "set: minio.bucket %s reaches the gate's GATE_BUCKET" % bucket[:20])
+
 # ---- refusals ----------------------------------------------------------------------------
 OP = "oauth2Proxy"
 refusals = [
@@ -343,6 +354,12 @@ refusals = [
     for val in (0, -1, 1.5, 1000000, "20", "", True, None, [5], {"n": 5})
 ] + [
     ({"gate": {"requestCaps": "20"}}, "gate.requestCaps must be a map"),
+] + [
+    # the bucket: written verbatim into three Traefik rules, so an S3 bucket name only
+    ({"minio": {"bucket": b}}, "is not a bucket name")
+    for b in ("artifacts`) || PathPrefix(`/", "artifacts`) || Host(`evil.example", "artifacts)",
+              "artifacts`", "Artifacts", "ab", "a" * 64, "-artifacts", "artifacts-", ".artifacts",
+              "art_ifacts", "art ifacts", "artifacts/x", "artifacts\n", "", 123, True, None)
 ]
 for values, needle in refusals:
     rc, _, err = render(values)

@@ -95,7 +95,7 @@ spec:
             - name: MINIO_ENDPOINT
               value: http://{{ .Values.minio.service }}.{{ .Values.minio.namespace }}.svc.cluster.local:{{ .Values.minio.port }}
             - name: GATE_BUCKET
-              value: {{ .Values.minio.bucket | quote }}
+              value: {{ include "artifacts.bucket" . | quote }}
             - name: OAUTH2_AUTH_URL
               value: http://oauth2-proxy-artifacts.{{ $sso }}.svc.cluster.local:4180/oauth2-artifacts/auth
             - name: PUBLIC_HOST

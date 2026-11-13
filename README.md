@@ -369,9 +369,10 @@ Everything is environment-driven; nothing is hardcoded.
 `artifact-gate-code`) to the gate image `gate.bakedImageRepository@gate.bakedImageDigest`
 (see [Gate image](#gate-image)). Plugin
 names must be DNS-1123 labels (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`), plugin prefixes
-`/_<segment>/[<segment>/...]` of `[a-z0-9_-]`, and `artifactsHost` / `artifactsExtraHosts`
-lowercase DNS names (no port, no wildcard): they are written into Traefik rules, and the chart
-refuses anything else.
+`/_<segment>/[<segment>/...]` of `[a-z0-9_-]`, `artifactsHost` / `artifactsExtraHosts`
+lowercase DNS names (no port, no wildcard), and `minio.bucket` an S3 bucket name
+(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`, as a string): they are written into Traefik rules, and
+the chart refuses anything else.
 
 | Value | Default | Meaning |
 |---|---|---|

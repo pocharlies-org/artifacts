@@ -68,6 +68,8 @@ minio:
   namespace: minio
   service: minio
   port: 9000
+  # S3 bucket name, written into Traefik rules: 3-63 of lowercase letters, digits, '.' and
+  # '-', starting and ending with a letter or digit (the chart refuses anything else)
   bucket: artifacts
   tlsSecret: artifacts-minio-tls       # cert for the MinIO service (used by the old host pattern; optional)
   gateTlsSecret: artifacts-gate-tls    # cert served on the artifacts host routes
