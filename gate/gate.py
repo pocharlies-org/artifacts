@@ -56,8 +56,10 @@ publicExposure). Where that anonymous decision lives depends on the route:
 The gate also serves the request-access flow (all state in MinIO under `_gate/`, written with the
 gate's own least-privilege S3 user):
 
-    POST /_gate/request   CSRF-bound, rate limited per user+artifact -> records the request under
-                          _gate/req/<id>.json and DMs the owner (Slack) Approve/Deny links.
+    POST /_gate/request   CSRF-bound, rate limited per user + decoded object key and per user
+                          across artifacts -> records the request under _gate/req/<id>.json and
+                          DMs the owner (Slack) Approve/Deny links, unless the owner already has
+                          GATE_OWNER_PENDING_MAX open requests (then it is recorded, not sent).
     GET  /_gate/approve   renders a confirmation page (GET never changes state: Slack unfurls GETs).
     POST /_gate/approve   single-use signed token, acts only for the ACL owner: adds the requester
                           to the root ACL (a conditional write, see grant_access) and DMs them; a
@@ -99,6 +101,7 @@ import hashlib
 import hmac
 import html
 import http.client
+import io
 import json
 import logging
 import os
@@ -147,6 +150,15 @@ def _env(name, default=None, required=False):
     return v
 
 
+def _positive_int_env(name, default):
+    """A whole number from 1 to 999999 from the environment (default when unset); the gate
+    refuses to start on anything else, so a typo never turns a limit off."""
+    raw = _env(name, str(default)).strip()
+    if not re.fullmatch(r"[1-9][0-9]{0,5}", raw):
+        raise RuntimeError(f"{name} must be a whole number from 1 to 999999, got {raw!r}")
+    return int(raw)
+
+
 BUCKET = _env("GATE_BUCKET", "artifacts")
 BUCKET_PATH = "/" + BUCKET.strip("/") + "/"  # bucket public path prefix (path-style links)
 MINIO_ENDPOINT = _env("MINIO_ENDPOINT", "http://minio-s3.minio.svc.cluster.local:9000")
@@ -178,8 +190,12 @@ ANONYMOUS_PUB_ENABLED = _env("GATE_ANONYMOUS_PUB_ENABLED", "false").lower() in (
 PLUGIN_PREFIX = _env("GATE_PLUGIN_PREFIX", "_plugins")  # plugin storage prefix: never served
 # Reserved for an MCP publisher's own bookkeeping objects: never an artifact, never served.
 MCP_PREFIX = "_mcp"
-RATE_LIMIT_MAX = int(_env("GATE_RATE_LIMIT_MAX", "5"))
+RATE_LIMIT_MAX = int(_env("GATE_RATE_LIMIT_MAX", "5"))     # access requests per requester + file
 RATE_LIMIT_WINDOW = int(_env("GATE_RATE_LIMIT_WINDOW_SECONDS", "86400"))
+# Access requests one requester may send per window, across every artifact.
+REQUESTER_RATE_LIMIT_MAX = _positive_int_env("GATE_REQUESTER_RATE_LIMIT_MAX", 20)
+# Open requests an owner is sent at once: above it a request is recorded but not sent.
+OWNER_PENDING_MAX = _positive_int_env("GATE_OWNER_PENDING_MAX", 10)
 TOKEN_TTL = int(_env("GATE_TOKEN_TTL_SECONDS", "604800"))    # approve/deny links: 7 days
 CSRF_TTL = int(_env("GATE_CSRF_TTL_SECONDS", "3600"))
 # Negative/positive ACL cache TTL. This 15 s is the REAL default (the
@@ -591,15 +607,28 @@ def artifact_root_path(artifact_path):
     return BUCKET_PATH + acl_key[:-len(".acl.json")]
 
 
-def key_from_path(path):
+def key_from_path(path, errors="replace"):
     """Object key if `path` is under the bucket's public path, else None.
 
     Delivered links (CLI/MCP, docs/plugins.md §5) embed the configured bucket name
     (path-style), so the gate must accept `/<bucket>/<key>` — never a hardcoded
-    /artifacts/. With the default bucket this is /artifacts/<key>."""
+    /artifacts/. With the default bucket this is /artifacts/<key>. errors="strict" raises
+    UnicodeDecodeError for escapes that are not UTF-8, instead of reading them as U+FFFD."""
     if not path.startswith(BUCKET_PATH):
         return None
-    return urllib.parse.unquote(path[len(BUCKET_PATH):])
+    return urllib.parse.unquote(path[len(BUCKET_PATH):], errors=errors)
+
+
+def canonical_artifact_path(path):
+    """`/<bucket>/<key>` with the key decoded once (key_from_path) and percent-encoded again in
+    one fixed way, or None outside the bucket. Every spelling of one object key gives the same
+    string (`…/index.html`, `…/%69ndex.html` and `…/%69%6edex.html` are one artifact), and
+    key_from_path() of the result is that key again, never a second decode of it. Access
+    requests are counted, recorded and shown under this name."""
+    key = key_from_path(path)
+    if key is None:
+        return None
+    return BUCKET_PATH + urllib.parse.quote(key, safe="/")
 
 
 def _bad_key(key):
@@ -892,14 +921,25 @@ def refused_identity(email):
 
 
 class RateLimiter:
-    """Per (user, artifact) request-access limit. State: one JSON object per pair; last-write-wins
+    """Request-access limit over a sliding window: at most max_n requests per window.
+
+    Per (user, artifact) by default: `allow(email, artifact_path, now)`. The artifact is its
+    decoded object key (canonical_artifact_path), never the path as the client spelled it, so
+    `…/index.html` and `…/%69ndex.html` count against one limit. With per_requester=True, per
+    user across every artifact: `allow(email, None, now)`.
+
+    State: one JSON object per bucket (rl/ per user and artifact, rq/ per user); last-write-wins
     (acceptable for the PoC; a race can at most let one extra request through)."""
 
-    def __init__(self, store, max_n=RATE_LIMIT_MAX, window=RATE_LIMIT_WINDOW):
+    def __init__(self, store, max_n=RATE_LIMIT_MAX, window=RATE_LIMIT_WINDOW, per_requester=False):
         self.store, self.max_n, self.window = store, max_n, window
+        self.per_requester = per_requester
 
     def _key(self, email, artifact):
-        return "rl/" + hashlib.sha256(f"{email}\n{artifact}".encode()).hexdigest() + ".json"
+        if self.per_requester:
+            return "rq/" + hashlib.sha256(email.encode()).hexdigest() + ".json"
+        ident = canonical_artifact_path(artifact) or artifact
+        return "rl/" + hashlib.sha256(f"{email}\n{ident}".encode()).hexdigest() + ".json"
 
     def allow(self, email, artifact, now):
         k = self._key(email, artifact)
@@ -918,47 +958,97 @@ class RateLimiter:
 
 
 class RequestStore:
-    """Pending access requests as _gate/req/<id>.json. status: pending -> approved|denied (single-use)."""
+    """Access requests as _gate/req/<id>.json. status: pending -> approve|deny (single-use).
 
-    def __init__(self, store):
-        self.store = store
+    A request names its artifact by the decoded object key (canonical_artifact_path): every
+    spelling of one file is one artifact in the record, in the owner's message and in the grant.
+
+    Per owner, _gate/owner/<sha256(owner)>.json lists the pending requests that owner was sent
+    ([id, created]): reserve_owner_slot admits one more only while fewer than max_pending are
+    listed, release_owner_slot drops one once it is decided or could not be sent, and an entry
+    older than the approve/deny links (link_ttl) is dropped when read, since its links no
+    longer work. Last-write-wins between gate processes, like RateLimiter."""
+
+    def __init__(self, store, max_pending=OWNER_PENDING_MAX, link_ttl=TOKEN_TTL):
+        self.store, self.max_pending, self.link_ttl = store, max_pending, link_ttl
+        self._owner_lock = threading.Lock()
 
     def create(self, requester, artifact, owner, now):
         rid = secrets.token_hex(16)
         self.store.put_json(f"req/{rid}.json", {"id": rid, "requester": requester,
-                                                "artifact": artifact, "owner": owner,
-                                                "created": now, "status": "pending"})
+                                                "artifact": canonical_artifact_path(artifact)
+                                                or artifact,
+                                                "owner": owner, "created": now,
+                                                "status": "pending"})
         return rid
 
-    def get(self, rid):
+    @staticmethod
+    def _owner_rel(owner):
+        return "owner/" + hashlib.sha256((owner or "").lower().encode()).hexdigest() + ".json"
+
+    def _owner_pending(self, owner, now):
+        """[[id, created], ...] of the requests `owner` was sent whose links still work. State
+        that cannot be read or is malformed reads as none (an abuse control, like
+        RateLimiter: it never decides who can read what)."""
+        try:
+            rec = self.store.get_json(self._owner_rel(owner))
+        except (ConnectionError, ValueError):
+            rec = None
+        items = rec.get("pending") if isinstance(rec, dict) else None
+        return [[i[0], i[1]] for i in (items if isinstance(items, list) else ())
+                if isinstance(i, list) and len(i) == 2 and isinstance(i[0], str)
+                and isinstance(i[1], int) and now - i[1] < self.link_ttl]
+
+    def reserve_owner_slot(self, owner, rid, now):
+        """True when request `rid` may be sent to `owner` (fewer than max_pending of their
+        requests are open) and is now listed; False at the cap. Raises ConnectionError when
+        the list cannot be written (then nothing is sent either)."""
+        with self._owner_lock:
+            pending = self._owner_pending(owner, now)
+            if len(pending) >= self.max_pending:
+                return False
+            self.store.put_json(self._owner_rel(owner), {"pending": pending + [[rid, now]]})
+            return True
+
+    def release_owner_slot(self, owner, rid, now):
+        """Drop request `rid` from `owner`'s open requests (decided, or never sent). Raises
+        ConnectionError when the list cannot be written; the entry then goes when its links
+        expire."""
+        with self._owner_lock:
+            pending = self._owner_pending(owner, now)
+            kept = [p for p in pending if p[0] != rid]
+            if len(kept) != len(pending):
+                self.store.put_json(self._owner_rel(owner), {"pending": kept})
+
+    def get(self, rid, strict=False):
+        """The record, or None when the id is malformed, the record is missing or not JSON.
+        A store that cannot be read is None too, unless strict: then the ConnectionError is
+        raised, since an unreadable record is not a missing or decided one."""
         if not rid or not all(c in "0123456789abcdef" for c in rid) or len(rid) > 64:
             return None
         try:
             return self.store.get_json(f"req/{rid}.json")
-        except (ConnectionError, ValueError):
+        except ConnectionError:
+            if strict:
+                raise
+            return None
+        except ValueError:
             return None
 
     def mark(self, rid, status, now):
-        """Transition pending -> approved|denied. Returns the record ONLY when this call performed
-        the transition; None when missing or already decided. Single-use without a CAS primitive:
-        two concurrent POSTs that both read `pending` can both act (grant is idempotent; the
-        requester could get a duplicate DM) — acceptable for the PoC, see README residual risks."""
-        rec = self.get(rid)
+        """Transition pending -> approve|deny. Returns the record ONLY when this call performed
+        the transition; None when missing or already decided. Raises ConnectionError when the
+        record cannot be read or written (never "already decided" for a store error). An
+        approval calls it only after the grant succeeded (_handle_action). Single-use without a
+        CAS primitive: two concurrent POSTs that both read `pending` can both act (grant is
+        idempotent; the requester could get a duplicate DM) — acceptable for the PoC, see
+        README residual risks."""
+        rec = self.get(rid, strict=True)
         if rec is None or rec.get("status") != "pending":
             return None
         rec["status"], rec["updated"] = status, now
         self.store.put_json(f"req/{rid}.json", rec)
         return rec
-
-    def reopen(self, rid, status, now):
-        """Put a request that this process just marked `status` back to pending (an approval
-        whose ACL write failed): the owner's link works again. True when it was reopened."""
-        rec = self.get(rid)
-        if rec is None or rec.get("status") != status:
-            return False
-        rec["status"], rec["updated"] = "pending", now
-        self.store.put_json(f"req/{rid}.json", rec)
-        return True
 
 
 # --------------------------------------------------------------------------------------------
@@ -1042,16 +1132,82 @@ _LINGER_MAX = 64 * 1024
 _LINGER_SECONDS = 2
 # Approve/deny tokens never reach a log line (the request line of /_gate/approve?token=...).
 _TOKEN_IN_LOG_RE = re.compile(r"(token=)[^&\s\"']+")
+# Total deadlines, not per-read timeouts: a client that sends one byte at a time still holds a
+# thread (one per connection) for at most this long.
+#   REQUEST_HEAD_SECONDS: from the start of a request (on a kept-alive connection, from the end
+#     of the previous answer: the idle wait counts) to the end of its headers. Missed: the
+#     connection is closed without an answer, as for an idle connection.
+#   POST_BODY_SECONDS: from the end of the headers to the end of the body (at most
+#     POST_BODY_MAX bytes). Missed: 408 and the connection is closed.
+REQUEST_HEAD_SECONDS = 30
+POST_BODY_SECONDS = 10
+
+
+class _DeadlineReader(io.RawIOBase):
+    """The raw reads of one connection (GateHandler.rfile reads through it), each bounded by
+    the socket timeout and, while `deadline` (a time.monotonic() value) is set, by that
+    deadline too. A read at or after the deadline raises socket.timeout, which
+    BaseHTTPRequestHandler answers by closing the connection. A connection reset by the
+    client reads as its end (no traceback for a client that went away)."""
+
+    def __init__(self, sock, timeout):
+        super().__init__()
+        self._sock, self._timeout = sock, timeout
+        self.deadline = None
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        if self.deadline is None:
+            return self._recv_into(buf)
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("read deadline passed")     # = TimeoutError since 3.10
+        self._sock.settimeout(left if self._timeout is None else min(left, self._timeout))
+        try:
+            return self._recv_into(buf)
+        finally:
+            self._sock.settimeout(self._timeout)      # writes and later reads: the usual timeout
+
+    def _recv_into(self, buf):
+        try:
+            return self._sock.recv_into(buf)
+        except ConnectionResetError:
+            return 0
 
 
 class GateHandler(BaseHTTPRequestHandler):
     server_version = "artifact-gate/1.0"
     protocol_version = "HTTP/1.1"
-    # Socket timeout for every read and write of a connection (request line, headers, body,
-    # idle keep-alive): a client that stops sending holds a thread for at most this long.
+    # Socket timeout of every single read and write; the request line and headers, and a POST
+    # body, have total deadlines on top (REQUEST_HEAD_SECONDS, POST_BODY_SECONDS).
     timeout = 30
 
     # -- plumbing ------------------------------------------------------------------
+    def setup(self):
+        super().setup()
+        # every read of the request goes through the deadline reader (same buffering as the
+        # stock socket file it replaces)
+        stock, self._reader = self.rfile, _DeadlineReader(self.connection, self.timeout)
+        self.rfile = io.BufferedReader(self._reader)
+        stock.close()
+
+    def handle_one_request(self):
+        # the request line and headers (and the idle wait before them) must arrive in time:
+        # a miss raises socket.timeout in the read, and the connection is closed
+        self._reader.deadline = time.monotonic() + REQUEST_HEAD_SECONDS
+        try:
+            super().handle_one_request()
+        finally:
+            self._reader.deadline = None
+
+    def parse_request(self):
+        try:
+            return super().parse_request()      # reads the headers
+        finally:
+            self._reader.deadline = None        # the head is in: no deadline for the handler
+
     def version_string(self):
         return self.server_version          # no Python version in the Server header
 
@@ -1120,6 +1276,36 @@ class GateHandler(BaseHTTPRequestHandler):
         return self._send(status, self._page(HTTPStatus(status).phrase,
                                              f"<p>{html.escape(text)}</p>"))
 
+    def send_error(self, code, message=None, explain=None):
+        """The answers the HTTP layer writes itself (an unsupported method, a malformed request
+        line or header, a request line or header block too long) carry the same headers as
+        every gate page: no framing, no caching, no Python version. (http.server answers a
+        request line whose version it cannot read the HTTP/0.9 way, without any header.)
+        The status line keeps the standard reason phrase; the detail (which can echo the
+        client's request line) is escaped into the page only. The connection is closed."""
+        try:
+            phrase, long_text = self.responses[code]
+        except KeyError:
+            phrase, long_text = "Error", ""
+        message = phrase if message is None else message
+        explain = long_text if explain is None else explain
+        self.log_error("code %d, message %s", code, message)
+        self.send_response(code)
+        self.send_header("Connection", "close")
+        body = b""
+        if code >= 200 and code not in (HTTPStatus.NO_CONTENT, HTTPStatus.RESET_CONTENT,
+                                        HTTPStatus.NOT_MODIFIED):
+            body = self._page(phrase, f"<p>{html.escape(message)}</p>"
+                                      f"<p class=muted>{html.escape(explain)}</p>").encode()
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", PAGE_CSP)
+        self.send_header("X-Frame-Options", "DENY")
+        self.end_headers()
+        if self.command != "HEAD" and body:
+            self.wfile.write(body)
+
     def _body_framing(self):
         """How the request delimits its body: ("transfer-encoding", None) for any
         Transfer-Encoding, ("none", 0) without Content-Length, ("invalid", None) for a repeated
@@ -1129,17 +1315,20 @@ class GateHandler(BaseHTTPRequestHandler):
         values = self.headers.get_all("Content-Length")
         if not values:
             return "none", 0
-        if len(values) != 1 or not _CONTENT_LENGTH_RE.fullmatch(values[0].strip()):
+        # only space and tab around the digits (RFC 9110 OWS): str.strip() would also take
+        # Unicode whitespace such as NBSP, which no HTTP parser in front of the gate accepts
+        if len(values) != 1 or not _CONTENT_LENGTH_RE.fullmatch(values[0].strip(" \t")):
             return "invalid", None
-        return "length", int(values[0].strip())
+        return "length", int(values[0].strip(" \t"))
 
     def _has_body(self):
         return self._body_framing() not in (("none", 0), ("length", 0))
 
     def _read_post_body(self, as_json=False):
         """The body of a POST endpoint, or None after a refusal (connection closed). Requires one
-        valid Content-Length of at most POST_BODY_MAX; reads exactly that many bytes (bounded by
-        the socket timeout). Keeps keep-alive in sync: an accepted body is read in full."""
+        valid Content-Length of at most POST_BODY_MAX; reads exactly that many bytes within
+        POST_BODY_SECONDS in total (a miss: 408). Keeps keep-alive in sync: an accepted body is
+        read in full."""
         kind, n = self._body_framing()
         if kind in ("transfer-encoding", "none"):
             return self._refuse(411, "Send the body with a Content-Length "
@@ -1148,7 +1337,14 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._refuse(400, "Invalid Content-Length.", as_json)
         if n > POST_BODY_MAX:
             return self._refuse(413, f"Request body larger than {POST_BODY_MAX} bytes.", as_json)
-        data = self.rfile.read(n) if n else b""
+        self._reader.deadline = time.monotonic() + POST_BODY_SECONDS
+        try:
+            data = self.rfile.read(n) if n else b""
+        except socket.timeout:
+            return self._refuse(408, f"The request body did not arrive within "
+                                     f"{POST_BODY_SECONDS} s.", as_json)
+        finally:
+            self._reader.deadline = None
         if len(data) != n:
             return self._refuse(400, "Request body shorter than its Content-Length.", as_json)
         return data
@@ -1240,8 +1436,7 @@ class GateHandler(BaseHTTPRequestHandler):
         csrf = make_csrf(self._email, artifact, _KEY, int(time.time()))
         return self._page("Access required", (
             f"<p>You do not have access to <code>{art}</code>.</p>"
-            f"<p>If you need it, ask the owner. The request is recorded and the owner is notified "
-            f"and can approve or deny it with one click.</p>"
+            f"<p>If you need it, you can ask the artifact's owner for access.</p>"
             f"<form method=POST action=https://{PUBLIC_HOST}/_gate/request>"
             f"<input type=hidden name=csrf value=\"{html.escape(csrf, quote=True)}\">"
             f"<input type=hidden name=artifact value=\"{art}\">"
@@ -1391,13 +1586,22 @@ class GateHandler(BaseHTTPRequestHandler):
                                   "application/json")
         else:
             artifact = self._form().get("artifact", "")
-        path = urllib.parse.urlsplit(artifact).path
-        key = key_from_path(path)
+        try:
+            path = urllib.parse.urlsplit(artifact).path
+        except ValueError:
+            path = ""                     # client text urlsplit cannot read: not a bucket path
+        try:
+            # decoded once and strictly, as the edge reads a key (pub_auth_decision): escapes
+            # that are not UTF-8 are refused, never decided as U+FFFD
+            key = key_from_path(path, errors="strict")
+            bad_bytes = False
+        except UnicodeDecodeError:
+            key, bad_bytes = "", True
         if key is None:
             return self._send(400, json.dumps(
                 {"error": f"artifact must be a {BUCKET_PATH.rstrip('/')}/ path"}),
                 "application/json")
-        if _bad_key(key):
+        if bad_bytes or _bad_key(key):
             return self._send(400, json.dumps({"error": "artifact path not allowed"}),
                               "application/json")
         email, groups, status = self._authenticate()
@@ -1466,7 +1670,14 @@ class GateHandler(BaseHTTPRequestHandler):
     def _handle_request_access(self):
         form = self._form()
         artifact = form.get("artifact") or ""
-        path = urllib.parse.urlsplit(artifact).path
+        try:
+            path = urllib.parse.urlsplit(artifact).path
+        except ValueError:
+            # client text urlsplit cannot read (`//[x`): not a path inside an artifact
+            LOG.warning("request-access refused: the artifact value is not a path")
+            return self._send(400, self._page("Bad request",
+                                              "<p>This address is not inside a published "
+                                              "artifact.</p>"))
         key = key_from_path(path)
         if key is None:
             return self._send(400, self._page("Bad request", "<p>Missing artifact.</p>"))
@@ -1499,14 +1710,26 @@ class GateHandler(BaseHTTPRequestHandler):
             LOG.warning("csrf rejected user=%s artifact=%s", email, path)
             return self._send(403, self._page("Bad request",
                                               "<p>Stale form. Go back, reload the page and try again.</p>"))
-        if not RATE_LIMITER.allow(email, path, int(time.time())):
-            LOG.warning("rate limit user=%s artifact=%s (no notification sent)", email, path)
+        # The limits count the artifact by its decoded key (canonical_artifact_path), whatever
+        # spelling the form carried. Both are checked before the store is read, so the answer
+        # stays the same whether or not the artifact exists.
+        now = int(time.time())
+        canon = canonical_artifact_path(path)
+        if not RATE_LIMITER.allow(email, path, now):
+            LOG.warning("rate limit user=%s artifact=%s (no notification sent)", email, canon)
             return self._send(429, self._page("Too many requests",
                                               "<p>You already asked for this artifact recently. "
                                               "Please wait before asking again.</p>"))
+        if not REQUESTER_LIMITER.allow(email, None, now):
+            LOG.warning("rate limit user=%s: %d access requests in %d s across artifacts "
+                        "(no notification sent)", email, REQUESTER_LIMITER.max_n,
+                        REQUESTER_LIMITER.window)
+            return self._send(429, self._page("Too many requests",
+                                              "<p>You have sent many access requests recently. "
+                                              "Please wait before asking again.</p>"))
         # Same response whether or not the artifact exists / has an owner (no existence leak);
         # the request is only recorded when it can actually be answered.
-        acl, err = read_acl(MINIO, key, now=int(time.time()))
+        acl, err = read_acl(MINIO, key, now=now)
         exists = MINIO.head(key) == 200
         owner = (acl or {}).get("owner") if isinstance(acl, dict) else None
         if err:
@@ -1515,26 +1738,49 @@ class GateHandler(BaseHTTPRequestHandler):
             # would be an existence leak), but ops must be able to tell this case apart in logs.
             LOG.error("request-access acl-error key=%s err=%s", key, err)
         if exists and owner:
-            rid = REQUESTS.create(email, path, owner, int(time.time()))
+            rid = REQUESTS.create(email, path, owner, now)
+            # Per-owner cap: an owner is sent at most REQUESTS.max_pending open requests at a
+            # time; above it the request is still recorded (and logged) but nothing is sent.
+            try:
+                admitted = REQUESTS.reserve_owner_slot(owner, rid, now)
+                held = f"the owner already has {REQUESTS.max_pending} open requests"
+            except ConnectionError as e:
+                admitted, held = False, f"the owner's open requests could not be written: {e}"
+            if not admitted:
+                LOG.warning("request-access id=%s requester=%s artifact=%s owner=%s held: %s "
+                            "(recorded, no notification sent)", rid, email, canon, owner, held)
+                return self._request_sent()
             approve = f"https://{PUBLIC_HOST}/_gate/approve?token=" + \
-                urllib.parse.quote(make_action_token(rid, "approve", _KEY, int(time.time())))
+                urllib.parse.quote(make_action_token(rid, "approve", _KEY, now))
             deny = f"https://{PUBLIC_HOST}/_gate/deny?token=" + \
-                urllib.parse.quote(make_action_token(rid, "deny", _KEY, int(time.time())))
+                urllib.parse.quote(make_action_token(rid, "deny", _KEY, now))
             text = (f":lock: *Access requested*\n"
-                    f"Requester: `{email}`\nRequested file: `{path}`\n"
-                    f"Approving gives access to the whole artifact `{artifact_root_path(path)}`: "
+                    f"Requester: `{email}`\nRequested file: `{canon}`\n"
+                    f"Approving gives access to the whole artifact `{artifact_root_path(canon)}`: "
                     f"every file in it, not only this one.\n"
                     f"[Approve]({approve}) · [Deny]({deny})\n"
                     f"Links expire in {TOKEN_TTL // 86400} days and work once, only for you.")
             ok, detail = NOTIFIER.send(owner, text)
+            if not ok:
+                # never sent: it does not hold one of the owner's open-request places
+                try:
+                    REQUESTS.release_owner_slot(owner, rid, now)
+                except ConnectionError as e:
+                    LOG.error("request-access id=%s: owner's open requests not updated: %s", rid, e)
             LOG.info("request-access id=%s requester=%s artifact=%s owner=%s notify_ok=%s detail=%s",
-                     rid, email, path, owner, ok, detail)
+                     rid, email, canon, owner, ok, detail)
         else:
             LOG.info("request-access ignored (missing artifact or owner) requester=%s artifact=%s",
-                     email, path)
+                     email, canon)
+        return self._request_sent()
+
+    def _request_sent(self):
+        # one answer for a request that was sent, held at the owner's cap, or not recorded
+        # (missing artifact or owner): telling them apart would leak what exists
+        # The text promises nothing: a held or unrecorded request is never sent.
         return self._send(200, self._page("Request sent",
-                                          "<p>The owner has been notified. You will get a message "
-                                          "when they decide.</p>"))
+                                          "<p>Your request has been received. If you do not "
+                                          "hear back, ask the owner directly.</p>"))
 
     # -- approve / deny ----------------------------------------------------------------
     def _handle_action(self, action, via_post):
@@ -1590,69 +1836,121 @@ class GateHandler(BaseHTTPRequestHandler):
                 f"<form method=POST action=https://{PUBLIC_HOST}/_gate/{action}>"
                 f"<input type=hidden name=token value=\"{html.escape(token, quote=True)}\">"
                 f"<button type=submit>Confirm {action}</button></form>")))
-        # POST: perform. Single-use: only a still-pending request transitions (last-writer-wins).
-        updated = REQUESTS.mark(rec["id"], action, int(time.time()))
-        if updated is None or updated["status"] != action:
-            return self._send(410, self._page("Already decided", "<p>Another decision won the race.</p>"))
+        # POST: perform. An approval grants first and records the decision second. The grant
+        # is idempotent (a requester already listed is not written again), so a cut reply on
+        # the request's record, or a gate stopped between the two writes, leaves at worst a
+        # pending request whose access is already granted (the same link closes it), never a
+        # request recorded as approved with nothing granted.
         note = ""
         if action == "approve":
             try:
                 ok, note = grant_access(MINIO, rec["artifact"], rec["requester"])
-            except Exception as e:  # noqa: BLE001 - defensive: the request is already marked
+            except Exception as e:  # noqa: BLE001 - defensive
                 # Any failure grant_access does not report itself is still a failed grant: the
-                # same answer as below, never a dropped connection that leaves the request
-                # marked approved with no grant. The log gets the class name only (no text,
-                # no traceback: either could carry request or store data).
+                # same answer as below, never a dropped connection. The log gets the class
+                # name only (no text, no traceback: either could carry request or store data).
                 ok, note = False, f"unexpected {type(e).__name__}"
+            if not ok and note == GRANT_EXPIRED:
+                # the artifact expired: nobody can open it, so there is nothing to approve
+                LOG.warning("approve %s: the artifact has expired, nothing written (requester=%s "
+                            "artifact=%s, request still pending, requester not notified)",
+                            rec["id"], rec["requester"], rec["artifact"])
+                return self._send(410, self._page("Artifact expired", (
+                    f"<p>The artifact <code>{root_html}</code> has expired: nobody can open it "
+                    f"any more, so <b>{requester}</b> was not given access. Nothing was changed "
+                    f"and they were not notified.</p>")))
             if not ok:
                 # Never "approved" for a grant that did not happen: the requester is not told
-                # anything, the request goes back to pending (the same link can be used again)
-                # and the owner's page says what happened. The cause stays in the log.
-                try:
-                    reopened = REQUESTS.reopen(rec["id"], action, int(time.time()))
-                except ConnectionError:
-                    reopened = False
+                # anything, the request is still pending (it was not marked, so the same link
+                # can be used again) and the owner's page says what happened. The cause stays
+                # in the log.
                 unknown = grant_outcome_unknown(note)
                 LOG.error("approve %s: ACL write failed: %s (requester=%s artifact=%s "
-                          "request reopened=%s, requester not notified, access list %s)",
-                          rec["id"], note, rec["requester"], rec["artifact"], reopened,
+                          "request still pending, requester not notified, access list %s)",
+                          rec["id"], note, rec["requester"], rec["artifact"],
                           "may or may not have been updated" if unknown else "unchanged")
                 if unknown:
                     # The store may have applied the write (its reply was lost or was a 5xx,
-                    # and a re-read did not settle it): never "nothing was changed" here. A retry of the same
-                    # link finishes the approval and never adds anyone twice; Deny writes no ACL,
-                    # so it would not take back an access that was already added.
+                    # and a re-read did not settle it): never "nothing was changed" here. A
+                    # retry of the same link finishes the approval and never adds anyone twice;
+                    # Deny writes no ACL, so it would not take back an access already added.
                     return self._send(503, self._page("Access not confirmed", (
                         f"<p>It is not known whether <b>{requester}</b> was given access to the "
                         f"artifact <code>{root_html}</code>: the store did not confirm the "
                         f"update, so its access list may or may not have been updated. They "
                         f"were not notified.</p>"
-                        + ("<p>Use the same link again to finish: it reads the access list "
-                           "again and never adds anyone twice.</p>" if reopened else
-                           "<p>The request could not be reopened, so this link will not work "
-                           "again: ask them to request access again (an approval never adds "
-                           "anyone twice).</p>")
-                        + "<p>Deny does not remove access that was already added: to take it "
-                          "back, publish the artifact's access list again without them.</p>")))
+                        "<p>Use the same link again to finish: it reads the access list "
+                        "again and never adds anyone twice.</p>"
+                        "<p>Deny does not remove access that was already added: to take it "
+                        "back, publish the artifact's access list again without them.</p>")))
                 return self._send(503, self._page("Access not granted", (
                     f"<p><b>{requester}</b> was <b>not</b> given access to the artifact "
                     f"<code>{root_html}</code>: its access list could not be updated. "
                     f"Nothing was changed and they were not notified.</p>"
-                    + ("<p>The request is still open: the same link can be used again.</p>"
-                       if reopened else ""))))
+                    "<p>The request is still open: the same link can be used again.</p>")))
+        # Record the decision. Single-use: only a still-pending request transitions
+        # (last-writer-wins).
+        try:
+            updated = REQUESTS.mark(rec["id"], action, int(time.time()))
+        except ConnectionError as e:
+            if action == "deny":
+                LOG.error("deny %s: the decision could not be recorded: %s (requester=%s "
+                          "artifact=%s, requester not notified)", rec["id"], e,
+                          rec["requester"], rec["artifact"])
+                return self._send(503, self._page("Decision not confirmed", (
+                    f"<p>The store did not confirm that the request of <b>{requester}</b> "
+                    f"is denied. They were not notified.</p>"
+                    "<p>Use the same link again: it denies the request if it is still "
+                    "open.</p>")))
+            # The access is granted, and that is the outcome: the requester is told. The record
+            # may still say pending; then the same link closes it (the grant finds the
+            # requester listed and writes nothing).
+            LOG.error("approve %s: access granted, but the decision could not be recorded: %s "
+                      "(requester=%s artifact=%s)", rec["id"], e, rec["requester"],
+                      rec["artifact"])
+            updated = {"status": action}
+        if updated is None or updated["status"] != action:
+            current = (REQUESTS.get(rec["id"]) or {}).get("status")
+            if action == "approve" and current == "deny":
+                # Approve and Deny of one request at the same time: this approval granted the
+                # access, the Deny recorded the decision. Say both; Deny writes no ACL.
+                LOG.warning("approve %s: access granted (%s), but a deny was recorded at the "
+                            "same time (requester=%s artifact=%s, not notified of the approval)",
+                            rec["id"], note, rec["requester"], rec["artifact"])
+                return self._send(409, self._page("Decided twice", (
+                    f"<p><b>{requester}</b> was given access to the whole artifact "
+                    f"<code>{root_html}</code> by this approval, but a Deny of the same request "
+                    f"was recorded at the same time. They were not told about the approval.</p>"
+                    "<p>Deny does not remove access that was already added: to take it back, "
+                    "publish the artifact's access list again without them.</p>")))
+            return self._send(410, self._page("Already decided", "<p>Another decision won the race.</p>"))
+        self._release_owner_slot(rec)
         if action == "approve":
             msg = (f"Your access request for `{rec['artifact']}` was approved: you can now open "
                    f"the whole artifact `{root}`.")
-            done = (f"<p><b>{requester}</b> can now open the whole artifact "
-                    f"<code>{root_html}</code>. They were notified.</p>")
         else:
             msg = f"Your access request for `{rec['artifact']}` was denied."
-            done = f"<p>{requester} was notified.</p>"
         ok, detail = NOTIFIER.send(rec["requester"], msg)
+        # "notified" only when the message went out
+        if action == "approve":
+            done = (f"<p><b>{requester}</b> can now open the whole artifact "
+                    f"<code>{root_html}</code>. "
+                    + ("They were notified.</p>" if ok else
+                       "They could not be notified: tell them yourself.</p>"))
+        else:
+            done = (f"<p>{requester} was notified.</p>" if ok else
+                    f"<p>The request is denied. {requester} could not be notified.</p>")
         LOG.info("action=%s id=%s by=%s requester=%s artifact=%s acl_note=%s notify_ok=%s detail=%s",
                  action, rec["id"], email, rec["requester"], rec["artifact"], note, ok, detail)
         return self._send(200, self._page(
             "Request approved" if action == "approve" else "Request denied", done))
+
+    def _release_owner_slot(self, rec):
+        """A decided request no longer holds one of its owner's open-request places."""
+        try:
+            REQUESTS.release_owner_slot(rec.get("owner"), rec["id"], int(time.time()))
+        except ConnectionError as e:
+            LOG.error("request %s decided, owner's open requests not updated: %s", rec["id"], e)
 
     # -- routing ---------------------------------------------------------------------
     def do_GET(self):  # noqa: N802
@@ -1676,7 +1974,12 @@ class GateHandler(BaseHTTPRequestHandler):
 
     def _route(self, method):
         self._body, self._drop_body = b"", False
-        path = urllib.parse.urlsplit(self.path).path
+        try:
+            path = urllib.parse.urlsplit(self.path).path
+        except ValueError:
+            # a request target urlsplit cannot read (`http://[x/`): nothing is routed for it,
+            # and its body (if any) is not read
+            return self._refuse(400, "Bad request target.")
         # Which listener this request arrived on (see module docstring). A server without an
         # explicit gate_mode is treated as PUBLIC: fail-closed for the decision endpoint.
         mode = getattr(self.server, "gate_mode", "public")
@@ -1881,7 +2184,12 @@ def _confirm_unknown_write(minio, acl_key, requester, failure, cause):
     return False, f"{failure}; not listed on a re-read"
 
 
-def grant_access(minio, artifact_path, requester):
+# grant_access's note when the ACL has expired: nobody can open the artifact, so nothing is
+# written (a known refusal, see grant_outcome_unknown).
+GRANT_EXPIRED = "artifact expired"
+
+
+def grant_access(minio, artifact_path, requester, now=None):
     """Add `requester` to the ACL users of `artifact_path`. (ok, note).
 
     Writes only the ACL that governs the path (acl_key_for: the artifact root for u/ and g/,
@@ -1898,7 +2206,9 @@ def grant_access(minio, artifact_path, requester):
       - a write whose reply is lost, or that the store answers with a 5xx (it may have applied
         it either way), is checked with one fresh read: the requester listed is a grant;
         anything else keeps the failure's note ("put failed: ..." or "put HTTP 5xx") and the
-        outcome stays unknown (grant_outcome_unknown)."""
+        outcome stays unknown (grant_outcome_unknown);
+      - an ACL whose `expires` has passed (at `now`, default the current time) is not
+        written: (False, GRANT_EXPIRED), since nobody can open the artifact any more."""
     key = key_from_path(artifact_path)
     if key is None or _bad_key(key):
         # a path the gate would never serve (dot segments, an ACL, gate state, a listing) never
@@ -1917,6 +2227,9 @@ def grant_access(minio, artifact_path, requester):
             acl, etag, err = read_acl_for_write(minio, acl_key)    # write path: never the cache
             if err:
                 return False, f"acl unreadable: {err}"
+            exp = _parse_expires(acl.get("expires"))
+            if exp is not None and (time.time() if now is None else now) > exp:
+                return False, GRANT_EXPIRED
             users = acl.get("users") or []
             if not isinstance(users, list):
                 return False, "acl unreadable: users is not a list"
@@ -1958,6 +2271,7 @@ def grant_access(minio, artifact_path, requester):
 MINIO = MinioClient(MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, BUCKET)
 STATE = MinioStateStore(MINIO)
 RATE_LIMITER = RateLimiter(STATE)
+REQUESTER_LIMITER = RateLimiter(STATE, REQUESTER_RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, per_requester=True)
 REQUESTS = RequestStore(STATE)
 NOTIFIER = SlackNotifier(SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else LogNotifier()
 
@@ -1976,9 +2290,11 @@ def _build_servers():
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     LOG.info("artifact-gate starting: host=%s bucket=%s oauth2=%s pub_prefixes=%s rate=%d/%ds "
-             "token_ttl=%ds slack=%s anonymous_pub=%s plugin_prefix=%s",
+             "requester_rate=%d/%ds owner_pending=%d token_ttl=%ds slack=%s anonymous_pub=%s "
+             "plugin_prefix=%s",
              PUBLIC_HOST, BUCKET, OAUTH2_AUTH_URL, PUB_PREFIXES,
-             RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, TOKEN_TTL, bool(SLACK_BOT_TOKEN),
+             RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, REQUESTER_RATE_LIMIT_MAX, RATE_LIMIT_WINDOW,
+             OWNER_PENDING_MAX, TOKEN_TTL, bool(SLACK_BOT_TOKEN),
              ANONYMOUS_PUB_ENABLED, PLUGIN_PREFIX)
     # Two listeners (see module docstring): the decision endpoint lives ONLY on the auth one.
     public_server, auth_server = _build_servers()

@@ -16,6 +16,7 @@
        A future public hostname reuses these routes: add it to artifactsExtraHosts and its
        callback to the IdP app. */ -}}
 {{- $m := .Values.minio }}
+{{- $bucket := include "artifacts.bucket" . }}
 {{- $sso := .Values.namespaces.sso }}
 {{- $hostMatch := include "artifacts.hostMatch" . }}
 {{- /* Edge block: a request carrying the unsigned-payload trailer sha256 or a snowball extract
@@ -58,7 +59,7 @@ spec:
     - kind: Rule
       priority: 600
       match: >-
-        {{ $hostMatch }} && PathPrefix(`/{{ $m.bucket }}`) && !(Method(`GET`) || Method(`HEAD`))
+        {{ $hostMatch }} && PathPrefix(`/{{ $bucket }}`) && !(Method(`GET`) || Method(`HEAD`))
       services:
         - {name: artifact-gate, namespace: {{ $sso }}, port: 8080}
     {{- /*
@@ -82,7 +83,7 @@ spec:
     - kind: Rule
       priority: 550
       match: >-
-        {{ $hostMatch }} && PathPrefix(`/{{ $m.bucket }}/pub/`) && (Method(`GET`) || Method(`HEAD`)) && {{ $edge }}
+        {{ $hostMatch }} && PathPrefix(`/{{ $bucket }}/pub/`) && (Method(`GET`) || Method(`HEAD`)) && {{ $edge }}
       middlewares:
         - {name: artifacts-csp, namespace: {{ $sso }}}
         - {name: gate-pub-auth, namespace: {{ $sso }}}
@@ -104,7 +105,7 @@ spec:
     - kind: Rule
       priority: 550
       match: >-
-        {{ $hostMatch }} && PathPrefix(`/{{ $m.bucket }}/pub/`) && (Method(`GET`) || Method(`HEAD`))
+        {{ $hostMatch }} && PathPrefix(`/{{ $bucket }}/pub/`) && (Method(`GET`) || Method(`HEAD`))
         && !PathRegexp(`\.acl\.json$`) && !PathRegexp(`/$`) && {{ $edge }}
       middlewares:
         - {name: artifacts-strip-to-minio, namespace: {{ $sso }}}
@@ -126,7 +127,7 @@ spec:
     - kind: Rule
       priority: 500
       match: >-
-        {{ $hostMatch }} && PathPrefix(`/{{ $m.bucket }}/`) && (Method(`GET`) || Method(`HEAD`)) && {{ $edge }}
+        {{ $hostMatch }} && PathPrefix(`/{{ $bucket }}/`) && (Method(`GET`) || Method(`HEAD`)) && {{ $edge }}
       middlewares:
         - {name: artifacts-errors, namespace: {{ $sso }}}
         - {name: gate-auth, namespace: {{ $sso }}}

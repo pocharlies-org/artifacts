@@ -12,9 +12,11 @@ oauth2Proxy.trustedProxyIPs and oauth2Proxy.extraArgs (login proxy flags; no
 container resources of the gate, the login proxy and the bootstrap Job (ephemeral-storage
 from values), the route that keeps /_gate/plugin/ off the public gate listener, and the
 example login-proxy image (digest-pinned, v7.15.5 or newer, the same image the compose stack
-runs), and the names written into Traefik rules: artifactsHost, artifactsExtraHosts and
-plugins[].pathPrefix (a safe charset only, so a backtick can never rewrite a rule). Every
-refusal the chart makes for these values is exercised too. Stdlib only.
+runs), the names written into Traefik rules: artifactsHost, artifactsExtraHosts and
+plugins[].pathPrefix (a safe charset only, so a backtick can never rewrite a rule),
+minio.bucket (an S3 bucket name only, for the same reason), and the gate's request-access
+caps (gate.requestCaps, whole numbers only). Every refusal the chart
+makes for these values is exercised too. Stdlib only.
 """
 import json
 import os
@@ -120,6 +122,22 @@ def resources(doc):
     return out
 
 
+def gate_env(doc):
+    """{name: value} of the gate container's plain env entries (`- name:` + `value:` lines)."""
+    out, name = {}, None
+    for ln in doc.splitlines():
+        s = ln.strip()
+        if s.startswith("- name: "):
+            name = s[len("- name: "):]
+        elif s.startswith("value: ") and name is not None:
+            v = s[len("value: "):]
+            out[name] = json.loads(v) if v.startswith('"') else v
+            name = None
+        else:
+            name = None
+    return out
+
+
 def winner(text, path):
     """Service names of the rule Traefik picks for a GET of path on the artifacts host."""
     rs = sorted(((p, m, s, routing.parse(m)) for p, m, s in routing.routes(text)),
@@ -178,6 +196,9 @@ check(resources(docs[("Deployment", "oauth2-proxy-artifacts")]) == GATE_RES,
 check(resources(docs[("Job", "artifacts-bootstrap")]) == JOB_RES,
       "default: bootstrap Job resources unchanged (10m/32Mi requests, 200m/128Mi limits)")
 check("ephemeral-storage" not in default, "default: no ephemeral-storage anywhere")
+env = gate_env(docs[("Deployment", "artifact-gate")])
+check((env.get("GATE_REQUESTER_RATE_LIMIT_MAX"), env.get("GATE_OWNER_PENDING_MAX")) == ("20", "10"),
+      "default: request caps 20 per requester and 10 open per owner, as quoted strings")
 
 # the gate's public listener gets request-access paths, never a decision endpoint
 for path in ("/_gate/plugin/authz", "/_gate/plugin/", "/_gate/plugin/x", "/_gate/auth", "/_gate/healthz"):
@@ -191,7 +212,8 @@ full = ok_render({
     "plugins": PLUGIN,
     "artifactsExtraHosts": ["b.example.com"],
     "ingressRouteAnnotations": ANN,
-    "gate": {"trustForwardHeader": True, "resources": EPH},
+    "gate": {"trustForwardHeader": True, "resources": EPH,
+             "requestCaps": {"perRequester": 7, "ownerPending": 999999}},
     "oauth2Proxy": {"emailDomains": ["example.com", "*.example.org"],
                     "trustedProxyIPs": ["10.42.0.0/16", "fd00::/8", "192.0.2.10"],
                     "extraArgs": ["--allowed-group=00000000-0000-0000-0000-000000000001",
@@ -229,6 +251,9 @@ check(one_group[-1] == "--allowed-group=00000000-0000-0000-0000-000000000001"
       "set: extraArgs accepts --allowed-group=<id> (rendered once, last)")
 check(resources(docs[("Deployment", "artifact-gate")]) == with_eph(GATE_RES),
       "set: gate ephemeral-storage request and limit from values (cpu/memory defaults kept)")
+env = gate_env(docs[("Deployment", "artifact-gate")])
+check((env.get("GATE_REQUESTER_RATE_LIMIT_MAX"), env.get("GATE_OWNER_PENDING_MAX")) == ("7", "999999"),
+      "set: gate.requestCaps reach the gate (7 per requester, 999999 open per owner)")
 check(resources(docs[("Deployment", "oauth2-proxy-artifacts")]) == with_eph(GATE_RES),
       "set: login proxy ephemeral-storage request and limit from values")
 check(resources(docs[("Job", "artifacts-bootstrap")]) == with_eph(JOB_RES),
@@ -248,6 +273,16 @@ check(host_match + " && PathPrefix(`/_canvas/v2/`)" in rules
       and host_match + " && PathPrefix(`/_x-1_y/`)" in rules,
       "set: nested plugin prefixes and '_' / '-' in a segment are accepted")
 check(all(m.count("`") % 2 == 0 for m in rules), "set: every rule has balanced backticks")
+
+# ---- the bucket name: written into PathPrefix(`/<bucket>...`), GATE_BUCKET and the Job --------
+for bucket in ("team-reports.v2", "abc", "a" * 63, "1artifacts9"):
+    out = ok_render({"minio": {"bucket": bucket}})
+    rules = [m for _p, m, _s in routing.routes(out)]
+    check(len(rules) >= 3 and all("PathPrefix(`/%s" % bucket in m for m in rules
+                                       if "PathPrefix(`/_" not in m and "oauth2" not in m),
+          "set: minio.bucket %s is accepted and lands in every bucket rule" % bucket[:20])
+    check(gate_env(documents(out)[("Deployment", "artifact-gate")]).get("GATE_BUCKET") == bucket,
+          "set: minio.bucket %s reaches the gate's GATE_BUCKET" % bucket[:20])
 
 # ---- refusals ----------------------------------------------------------------------------
 OP = "oauth2Proxy"
@@ -312,6 +347,19 @@ refusals = [
     for val in vals
 ] + [
     ({"artifactsExtraHosts": "b.example.com"}, "artifactsExtraHosts must be a list"),
+] + [
+    # request caps: a whole number from 1 to 999999, never a string, a fraction or nothing
+    ({"gate": {"requestCaps": {key: val}}}, "gate.requestCaps.%s must be a whole number" % key)
+    for key in ("perRequester", "ownerPending")
+    for val in (0, -1, 1.5, 1000000, "20", "", True, None, [5], {"n": 5})
+] + [
+    ({"gate": {"requestCaps": "20"}}, "gate.requestCaps must be a map"),
+] + [
+    # the bucket: written verbatim into three Traefik rules, so an S3 bucket name only
+    ({"minio": {"bucket": b}}, "is not a bucket name")
+    for b in ("artifacts`) || PathPrefix(`/", "artifacts`) || Host(`evil.example", "artifacts)",
+              "artifacts`", "Artifacts", "ab", "a" * 64, "-artifacts", "artifacts-", ".artifacts",
+              "art_ifacts", "art ifacts", "artifacts/x", "artifacts\n", "", 123, True, None)
 ]
 for values, needle in refusals:
     rc, _, err = render(values)

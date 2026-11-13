@@ -916,6 +916,202 @@ class E2ETest(unittest.TestCase):
         self.assertIn("tess@example.com", json.loads(OBJECTS["u/secret/.acl.json"])["users"])
         self.assertEqual(len(sent), 1)
 
+    # -- the grant comes first, then the request's record: a cut reply or a stop between the
+    #    two writes never leaves a request "approved" with no access granted ----------------
+    def _approval_state(self, rid, requester):
+        with OBJECTS_LOCK:
+            status = json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"]
+            listed = requester in json.loads(OBJECTS["u/secret/.acl.json"])["users"]
+        return status, listed
+
+    def _post_action_or_dropped(self, endpoint, token):
+        try:
+            return self._post_action(endpoint, token)
+        except (OSError, http_client.HTTPException):
+            return None, "", {}                       # the connection was dropped unanswered
+
+    def test_cut_reply_on_the_request_record_never_leaves_approved_without_access(self):
+        # the store applies the write of the request's new status but its reply is cut
+        sent = self.record_notifications()
+        rid, token = self._approve("cora@example.com")
+        with OBJECTS_LOCK:
+            PLAN[("PUT", f"_gate/req/{rid}.json")] = ["cut"]
+        st, page, _ = self._post_action_or_dropped("approve", token)
+        status, listed = self._approval_state(rid, "cora@example.com")
+        if status == "approve":
+            self.assertTrue(listed, "the request is recorded as approved and nothing was granted")
+        # the access was granted, so that is what the owner and the requester are told
+        self.assertEqual((st, status, listed), (200, "approve", True), page)
+        self.assertIn("<title>Request approved</title>", page)
+        self.assertEqual([to for to, _ in sent], ["cora@example.com"])
+        st, page, _ = self._post_action("approve", token)        # the link was used
+        self.assertEqual(st, 410, page)
+        self.assertIn("already <b>approved</b>", page)
+
+    def test_lost_write_of_the_request_record_leaves_it_open_with_the_access(self):
+        # the write of the request's status is lost (not applied, no answer): the access was
+        # granted, the request is still pending, and the same link closes it without a
+        # second ACL write
+        sent = self.record_notifications()
+        rid, token = self._approve("dina@example.com")
+        with OBJECTS_LOCK:
+            PLAN[("PUT", f"_gate/req/{rid}.json")] = ["drop"]
+        st, page, _ = self._post_action_or_dropped("approve", token)
+        self.assertEqual(self._approval_state(rid, "dina@example.com"), ("pending", True))
+        self.assertEqual(st, 200, page)
+        self.assertIn("<title>Request approved</title>", page)
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "dina@example.com"), ("approve", True))
+        with OBJECTS_LOCK:
+            self.assertEqual([s for k, _im, _t, s in PUTS if k == "u/secret/.acl.json"], [200])
+        self.assertEqual(len(sent), 2)                      # told on each click that granted
+
+    def test_a_gate_stopped_between_the_two_writes_never_leaves_approved_without_access(self):
+        class Stopped(BaseException):
+            """The process ends here (killed, OOM): nothing after it runs."""
+        rid, token = self._approve("elio@example.com")
+        calls = []
+
+        def stop_on_second_write(name, real):
+            def run(*args, **kwargs):
+                calls.append(name)
+                if len(calls) == 2:
+                    raise Stopped(name)
+                return real(*args, **kwargs)
+            return run
+        with mock.patch.object(self.gate, "grant_access",
+                               stop_on_second_write("grant", self.gate.grant_access)), \
+                mock.patch.object(self.gate.REQUESTS, "mark",
+                                  stop_on_second_write("mark", self.gate.REQUESTS.mark)), \
+                mock.patch.object(threading, "excepthook", lambda args: None):
+            self._post_action_or_dropped("approve", token)
+        status, listed = self._approval_state(rid, "elio@example.com")
+        if status == "approve":
+            self.assertTrue(listed, "the request is recorded as approved and nothing was granted")
+        self.assertEqual(calls, ["grant", "mark"])
+        self.assertEqual((status, listed), ("pending", True))
+        st, page, _ = self._post_action("approve", token)      # the same link finishes it
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "elio@example.com"), ("approve", True))
+
+    def _owner_places(self):
+        with OBJECTS_LOCK:
+            return [p[0] for k in OBJECTS if k.startswith("_gate/owner/")
+                    for p in json.loads(OBJECTS[k])["pending"]]
+
+    def test_unreadable_record_at_the_mark_after_a_grant_is_not_already_decided(self):
+        # the record is read at the top of the handler, then again inside mark(); when that
+        # second read fails after the grant was written, the owner is not told "another
+        # decision won": the access is granted and said so, its place is freed, and the same
+        # link closes the record without a second ACL write
+        sent = self.record_notifications()
+        rid, token = self._approve("lou@example.com")
+        self.assertTrue(self.gate.REQUESTS.reserve_owner_slot("owner@example.com", rid,
+                                                              int(time.time())))
+        with OBJECTS_LOCK:
+            PLAN[("GET", f"_gate/req/{rid}.json")] = ["ok", "drop"]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertIn("<title>Request approved</title>", page)
+        self.assertNotIn("Another decision", page)
+        self.assertEqual(self._approval_state(rid, "lou@example.com"), ("pending", True))
+        self.assertEqual([to for to, _ in sent], ["lou@example.com"])
+        self.assertNotIn(rid, self._owner_places())
+        st, page, _ = self._post_action("approve", token)        # the same link closes it
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "lou@example.com"), ("approve", True))
+        with OBJECTS_LOCK:
+            self.assertEqual([s for k, _im, _t, s in PUTS if k == "u/secret/.acl.json"], [200])
+
+    def test_unreadable_record_at_the_mark_of_a_deny_is_not_already_decided(self):
+        sent = self.record_notifications()
+        rid = self._pending_request("max@example.com")
+        token = self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time()))
+        self.assertTrue(self.gate.REQUESTS.reserve_owner_slot("owner@example.com", rid,
+                                                              int(time.time())))
+        with OBJECTS_LOCK:
+            PLAN[("GET", f"_gate/req/{rid}.json")] = ["ok", "drop"]
+        st, page, _ = self._post_action("deny", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("<title>Decision not confirmed</title>", page)
+        self.assertNotIn("Another decision", page)
+        self.assertEqual(self._approval_state(rid, "max@example.com"), ("pending", False))
+        self.assertEqual(sent, [])
+        self.assertIn(rid, self._owner_places())                 # still open: place kept
+        st, page, _ = self._post_action("deny", token)           # the same link denies
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "max@example.com"), ("deny", False))
+        self.assertNotIn(rid, self._owner_places())
+
+    def test_approve_and_deny_at_the_same_time_says_what_happened(self):
+        # the owner's Deny is recorded while this approval is granting: the page says both
+        sent = self.record_notifications()
+        rid, token = self._approve("gus@example.com")
+        real_grant = self.gate.grant_access
+
+        def grant_then_a_deny_lands(*args, **kwargs):
+            out = real_grant(*args, **kwargs)
+            self.gate.REQUESTS.mark(rid, "deny", int(time.time()))
+            return out
+        with mock.patch.object(self.gate, "grant_access", grant_then_a_deny_lands):
+            st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 409, page)
+        self.assertIn("<title>Decided twice</title>", page)
+        self.assertIn("Deny does not remove access that was already added", page)
+        self.assertEqual(self._approval_state(rid, "gus@example.com"), ("deny", True))
+        self.assertEqual(sent, [])
+
+    def test_result_page_says_notified_only_when_the_message_went_out(self):
+        # without a transport (the default LogNotifier) nobody is told: the pages say so
+        for action in ("approve", "deny"):
+            rid = self._pending_request(f"hal-{action}@example.com")
+            token = self.gate.make_action_token(rid, action, self.gate._KEY, int(time.time()))
+            st, page, _ = self._post_action(action, token)
+            self.assertEqual(st, 200, page)
+            self.assertNotIn("were notified", page, action)
+            self.assertNotIn("was notified", page, action)
+            self.assertIn("could not be notified", page, action)
+        # with a transport that delivers: "notified"
+        self.record_notifications()
+        rid, token = self._approve("ivy2@example.com")
+        st, page, _ = self._post_action("approve", token)
+        self.assertIn("They were notified.", page)
+        rid = self._pending_request("jon@example.com")
+        st, page, _ = self._post_action(
+            "deny", self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time())))
+        self.assertIn("jon@example.com was notified.", page)
+
+    def test_approval_on_an_expired_artifact_says_it_expired(self):
+        sent = self.record_notifications()
+        with OBJECTS_LOCK:
+            acl = json.loads(OBJECTS["u/secret/.acl.json"])
+            acl["expires"] = "2020-01-01"
+            OBJECTS["u/secret/.acl.json"] = json.dumps(acl).encode()
+        rid, token = self._approve("kai@example.com")
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 410, page)
+        self.assertIn("<title>Artifact expired</title>", page)
+        self.assertNotIn("approved", page)
+        self.assertEqual(self._approval_state(rid, "kai@example.com"), ("pending", False))
+        with OBJECTS_LOCK:
+            self.assertEqual([k for k, *_x in PUTS if k.endswith(".acl.json")], [])
+        self.assertEqual(sent, [])
+
+    def test_deny_whose_record_cannot_be_written_says_so(self):
+        sent = self.record_notifications()
+        rid = self._pending_request("fay@example.com")
+        token = self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time()))
+        with OBJECTS_LOCK:
+            PLAN[("PUT", f"_gate/req/{rid}.json")] = ["drop"]
+        st, page, _ = self._post_action_or_dropped("deny", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("<title>Decision not confirmed</title>", page)
+        self.assertEqual(sent, [])
+        st, page, _ = self._post_action("deny", token)          # the same link works again
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "fay@example.com"), ("deny", False))
+
     def test_deny_message_unchanged(self):
         sent = self.record_notifications()
         rid = self._pending_request("mike@example.com")
@@ -1057,6 +1253,36 @@ class E2ETest(unittest.TestCase):
             self.assertEqual([k for k, *_x in PUTS if k.endswith(".acl.json")], [])
         self.assertEqual(sent, [])
 
+    def test_request_pages_promise_no_message(self):
+        # a held or unrecorded request is never sent, so neither the form nor the answer to it
+        # promises that the owner is told or that a message will come
+        USERS["nia"] = ("nia@example.com", "aaaa")
+        st, form, _ = self.auth("/artifacts/u/secret/report.html", "nia")
+        self.assertEqual(st, 403)
+        self.assertIn("you can ask the artifact's owner for access", form)
+        # one answer whether the request was sent, held at the owner's cap, could not be sent,
+        # or was not recorded (missing artifact): the same status and body
+        answers = []
+        with mock.patch.object(self.gate.REQUESTS, "max_pending", 1):
+            # no transport yet (LogNotifier): recorded, could not be sent
+            answers.append(self._request_access("nia", "/artifacts/u/secret/report.html"))
+            sent = self.record_notifications()
+            USERS["noa"] = ("noa@example.com", "aaaa")
+            answers.append(self._request_access("noa", "/artifacts/u/secret/report.html"))  # sent
+            USERS["nel"] = ("nel@example.com", "aaaa")
+            answers.append(self._request_access("nel", "/artifacts/u/secret/report.html"))  # held
+            answers.append(self._request_access("nel", "/artifacts/u/secret/ghost.html"))   # missing
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len({a for a in answers}), 1, answers)
+        st, page = answers[0]
+        self.assertEqual(st, 200)
+        self.assertIn("<p>Your request has been received. If you do not hear back, ask the "
+                      "owner directly.</p>", page)
+        for text in (form, page):
+            for promise in ("will get a message", "is notified", "has been notified",
+                            "when the owner decides", "with one click"):
+                self.assertNotIn(promise, text)
+
     def test_request_access_missing_artifact_uniform_response_no_state(self):
         USERS["frank"] = ("frank@example.com", "aaaa")
         st, page, _ = self.auth("/artifacts/u/secret/ghost.html", "frank")
@@ -1091,6 +1317,101 @@ class E2ETest(unittest.TestCase):
                            cookie="sid=gina")
         self.assertEqual(st, 429)
         self.assertIn("Too many requests", page)
+
+    # -- request-access caps: the decoded key, per requester, per owner -------------------
+    def _request_access(self, sid, uri):
+        """Open `uri` as `sid` (the deny page carries the CSRF token bound to that spelling)
+        and send its request-access form: (status, page)."""
+        st, page, _ = self.auth(uri, sid)
+        self.assertEqual(st, 403, (sid, uri))
+        csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
+        st, page, _ = http(self.base + "/_gate/request", method="POST",
+                           data=urllib.parse.urlencode({"csrf": csrf, "artifact": uri}),
+                           headers={"Content-Type": "application/x-www-form-urlencoded"},
+                           cookie=f"sid={sid}")
+        return st, page
+
+    @staticmethod
+    def _records():
+        with OBJECTS_LOCK:
+            return [json.loads(OBJECTS[k]) for k in OBJECTS if k.startswith("_gate/req/")]
+
+    def test_request_access_encoded_variants_share_one_limit(self):
+        # six spellings of one file by one requester: GATE_RATE_LIMIT_MAX (2) of them are
+        # recorded and sent, under the decoded name; the rest are refused before any store read
+        sent = self.record_notifications()
+        USERS["rita"] = ("rita@example.com", "aaaa")
+        variants = ("/artifacts/u/secret/report.html", "/artifacts/u/secret/%72eport.html",
+                    "/artifacts/u/secret/r%65port%2ehtml", "/artifacts/%75/secret/report.html",
+                    "/artifacts/u/%73ecret/report.html",
+                    "/artifacts/u/secret/%72%65%70%6F%72%74.html")
+        codes = [self._request_access("rita", v)[0] for v in variants]
+        self.assertEqual(codes, [200, 200, 429, 429, 429, 429])
+        self.assertEqual([r["artifact"] for r in self._records()],
+                         ["/artifacts/u/secret/report.html"] * 2)
+        self.assertEqual([to for to, _ in sent], ["owner@example.com"] * 2)
+        for _to, text in sent:
+            self.assertIn("Requested file: `/artifacts/u/secret/report.html`", text)
+
+    def test_request_access_per_requester_limit_across_artifacts(self):
+        sent = self.record_notifications()
+        USERS["rob"] = ("rob@example.com", "aaaa")
+        acl = json.dumps({"owner": "owner@example.com", "users": []}).encode()
+        with OBJECTS_LOCK:
+            for i in range(3):
+                OBJECTS[f"u/r{i}/index.html"] = b"x"
+                OBJECTS[f"u/r{i}/.acl.json"] = acl
+        uris = [f"/artifacts/u/r{i}/index.html" for i in range(3)] + [
+            "/artifacts/u/r0/ghost.html",                      # missing: counted all the same
+            "/artifacts/u/secret/report.html"]
+        with mock.patch.object(self.gate.REQUESTER_LIMITER, "max_n", 4):
+            answers = [self._request_access("rob", u) for u in uris]
+        self.assertEqual([st for st, _ in answers], [200, 200, 200, 200, 429])
+        self.assertIn("many access requests", answers[4][1])
+        self.assertEqual(sorted(r["artifact"] for r in self._records()), uris[:3])
+        self.assertEqual(len(sent), 3)
+        # another requester has their own count
+        USERS["ros"] = ("ros@example.com", "aaaa")
+        self.assertEqual(self._request_access("ros", "/artifacts/u/secret/report.html")[0], 200)
+
+    def test_owner_pending_cap_records_but_does_not_send(self):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        uri = "/artifacts/u/secret/report.html"
+        names = ("ola", "pia", "quy", "ria")
+        for n in names:
+            USERS[n] = (f"{n}@example.com", "aaaa")
+        with mock.patch.object(self.gate.REQUESTS, "max_pending", 2):
+            self.assertEqual([self._request_access(n, uri)[0] for n in names[:3]], [200] * 3)
+            recs = self._records()
+            self.assertEqual(len(recs), 3)                      # every request is recorded
+            self.assertEqual(len(sent), 2)                      # the owner is sent two
+            held = [ln for ln in log.getvalue().splitlines() if " held: " in ln]
+            self.assertEqual(len(held), 1, held)
+            self.assertIn("requester=quy@example.com", held[0])
+            self.assertIn("the owner already has 2 open requests (recorded, no notification sent)",
+                          held[0])
+            # the owner decides one: its place frees up and the next request is sent
+            first = next(r for r in recs if r["requester"] == "ola@example.com")
+            token = self.gate.make_action_token(first["id"], "deny", self.gate._KEY, int(time.time()))
+            self.assertEqual(self._post_action("deny", token)[0], 200)
+            self.assertEqual(self._request_access(names[3], uri)[0], 200)
+        to_owner = [t for to, t in sent if to == "owner@example.com"]
+        self.assertEqual(len(to_owner), 3)
+        self.assertIn("Requester: `ria@example.com`", to_owner[-1])
+
+    def test_unsent_request_holds_no_owner_place(self):
+        # a message that could not be sent (no transport, Slack error) leaves no open request
+        # behind, so it never fills the owner's places
+        uri = "/artifacts/u/secret/report.html"
+        with mock.patch.object(self.gate.REQUESTS, "max_pending", 1):
+            for n in ("sia", "tom"):
+                USERS[n] = (f"{n}@example.com", "aaaa")
+                self.assertEqual(self._request_access(n, uri)[0], 200)
+        with OBJECTS_LOCK:
+            index = [json.loads(OBJECTS[k]) for k in OBJECTS if k.startswith("_gate/owner/")]
+        self.assertEqual(len(self._records()), 2)
+        self.assertEqual([i["pending"] for i in index], [[]])
 
     def test_csrf_rejected_on_foreign_or_stale_token(self):
         USERS["hank"] = ("hank@example.com", "aaaa")
@@ -1331,6 +1652,22 @@ class E2ETest(unittest.TestCase):
         st, ans = self.plugin_authz("/artifacts/pub/a;b/x.html", sid="alice")
         self.assertEqual((st, ans["allowed"]), (200, True))
 
+    def test_plugin_authz_refuses_a_key_that_is_not_utf8(self):
+        # the edge reads a key decoded once and strictly; a key whose bytes are not UTF-8 is
+        # refused here too (400) instead of being decided with U+FFFD in place of the bytes
+        with OBJECTS_LOCK:
+            OBJECTS["pub/ok\ufffdx"] = b"x"
+        for sid in (None, "alice"):
+            for bad in ("/artifacts/pub/ok%efx", "/artifacts/pub/ok%ff", "/artifacts/u/secret/r%c3"):
+                st, ans = self.plugin_authz(bad, sid=sid, flag=True)
+                self.assertEqual(st, 400, (sid, bad, ans))
+                self.assertEqual(ans, {"error": "artifact path not allowed"}, (sid, bad))
+            # the valid spelling of that character is decided as before
+            st, ans = self.plugin_authz("/artifacts/pub/ok%EF%BF%BDx", sid=sid, flag=True)
+            self.assertEqual((st, ans["artifact"]["key"]), (200, "pub/ok\ufffdx"), sid)
+        st, ans = self.plugin_authz("/artifacts/pub/caf%C3%A9", sid="alice")
+        self.assertEqual((st, ans["artifact"]["key"]), (200, "pub/caf\u00e9"))
+
     def test_plugin_authz_pub_signed_in_allowed(self):
         st, ans = self.plugin_authz("/artifacts/pub/free/index.html", sid="alice")
         self.assertEqual((st, ans["allowed"]), (200, True))
@@ -1538,7 +1875,8 @@ class E2ETest(unittest.TestCase):
         self.assertEqual((st, h.get("connection")), (405, None))   # no body: keep-alive
 
     def test_stalled_body_times_out(self):
-        # a client that stops sending holds the connection for GateHandler.timeout at most
+        # a client that stops sending holds the connection for GateHandler.timeout at most:
+        # then the body is late, so 408 and the connection is closed
         self.assertEqual(self.gate.GateHandler.timeout, 30)
 
         class Quick(self.gate.GateHandler):
@@ -1551,12 +1889,169 @@ class E2ETest(unittest.TestCase):
         self.addCleanup(sock.close)
         sock.sendall(b"POST /_gate/request HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\ncsrf=")
         t0 = time.monotonic()
+        got = b""
         try:
-            got = sock.recv(1024)
+            while True:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                got += piece
         except socket.timeout:
-            got = None
-        self.assertEqual(got, b"", "the gate kept waiting for the rest of the body")
+            self.fail("the gate kept waiting for the rest of the body")
+        self.assertTrue(got.startswith(b"HTTP/1.1 408 "), got[:80])
+        self.assertIn(b"\r\nConnection: close\r\n", got)
         self.assertLess(time.monotonic() - t0, 4)
+
+    def _drip(self, port, head, drip, until):
+        """Send `head`, then one byte of `drip` every 0.25 s until the gate answers or closes,
+        or `until` seconds pass. (seconds to the first answer byte or the close, the bytes
+        received, whether the gate closed)."""
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall(head)
+        t0 = time.monotonic()
+        got, closed, i, answered = b"", False, 0, None
+        while time.monotonic() - t0 < until:
+            try:
+                sock.sendall(drip[i % len(drip):i % len(drip) + 1])
+                i += 1
+            except OSError:
+                closed = True
+                break
+            sock.settimeout(0.25)
+            try:
+                piece = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                closed = True
+                break
+            if answered is None:
+                answered = time.monotonic() - t0
+            if not piece:
+                closed = True
+                break
+            got += piece
+        return (answered if answered is not None else time.monotonic() - t0), got, closed
+
+    def test_dripped_body_is_cut_at_the_deadline(self):
+        # one body byte every 0.25 s never trips the 30 s read timeout; the total body
+        # deadline (POST_BODY_SECONDS, 1.5 s here) does: 408, then the connection closes
+        for port, path in ((self.port_of(self.gate_public), "/_gate/request"),
+                           (self.port_of(self.gate_auth), "/_gate/plugin/authz")):
+            with mock.patch.object(self.gate, "POST_BODY_SECONDS", 1.5, create=True):
+                took, got, closed = self._drip(
+                    port, f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 16384\r\n\r\n".encode(),
+                    b"artifact=x&", until=8)
+            self.assertTrue(got.startswith(b"HTTP/1.1 408 "), (path, got[:80]))
+            self.assertTrue(closed, path)
+            self.assertLess(took, 1.5 + 1.5, path)            # the deadline plus a margin
+        self.assertEqual(self.gate.POST_BODY_SECONDS, 10)
+        self.assertEqual(self.gate.GateHandler.timeout, 30)
+
+    def test_dripped_request_head_is_cut_at_the_deadline(self):
+        # a request line and headers sent one byte every 0.25 s: closed at the head deadline
+        # (REQUEST_HEAD_SECONDS, 1.5 s here) without an answer, as for an idle connection
+        head = b"GET /_gate/healthz HTTP/1.1\r\nHost: x\r\n" + b"X-Pad: " + b"a" * 200
+        with mock.patch.object(self.gate, "REQUEST_HEAD_SECONDS", 1.5, create=True):
+            took, got, closed = self._drip(self.port_of(self.gate_public), b"", head, until=8)
+            self.assertEqual((got, closed), (b"", True))
+            self.assertLess(took, 1.5 + 1.5)
+            # an idle connection: the same deadline
+            sock = socket.create_connection(("127.0.0.1", self.port_of(self.gate_public)), timeout=5)
+            self.addCleanup(sock.close)
+            t0 = time.monotonic()
+            self.assertEqual(sock.recv(10), b"")
+            self.assertLess(time.monotonic() - t0, 1.5 + 1.5)
+            # a request that arrives in time is answered, and the next one on the same
+            # connection gets its own deadline
+            conn = http_client.HTTPConnection(self.base.split("//", 1)[1], timeout=5)
+            self.addCleanup(conn.close)
+            for _ in range(2):
+                conn.request("GET", "/_gate/healthz")
+                r = conn.getresponse()
+                self.assertEqual((r.status, r.read()), (200, b"ok"))
+                time.sleep(1.0)
+        self.assertEqual(self.gate.REQUEST_HEAD_SECONDS, 30)
+
+    def test_targets_urlsplit_cannot_read_answer_400(self):
+        # urlsplit raises ValueError on some client text (`//[x`, `http://[x/`): each handler
+        # that parses one answers 400 instead of dropping the connection unanswered
+        for bad in ("//[x", "http://[x/", "//[::1/artifacts/u/secret/report.html"):
+            st, body, _ = http(self.base + "/_gate/request", method="POST",
+                               data=urllib.parse.urlencode({"csrf": "x", "artifact": bad}),
+                               headers={"Content-Type": "application/x-www-form-urlencoded"},
+                               cookie="sid=alice")
+            self.assertEqual(st, 400, bad)
+            self.assertIn("not inside a published artifact", body, bad)
+            st, ans = self.plugin_authz(bad, sid="alice")
+            self.assertEqual(st, 400, bad)
+            self.assertIn("error", ans, bad)
+        for port in (self.port_of(self.gate_public), self.port_of(self.gate_auth)):
+            for target in (b"http://[x/", b"http://[x/_gate/healthz"):
+                st, h, sock = self.raw(port, b"GET " + target + b" HTTP/1.1\r\nHost: x\r\n\r\n")
+                sock.close()
+                self.assertEqual((st, h.get("connection")), (400, "close"), (port, target))
+        # the listeners still answer afterwards
+        self.assertEqual(http(self.base + "/_gate/healthz")[:2], (200, "ok"))
+
+    def test_http_layer_error_pages_cannot_be_framed(self):
+        # answers the HTTP layer writes itself (send_error: an unsupported method, a malformed
+        # request line, a line or header block too long) carry the same headers as every gate
+        # page. (A request line whose version cannot be read, or HTTP/2.0, is answered the
+        # HTTP/0.9 way by http.server, with no header block at all.)
+        long_line = b"GET /" + b"a" * 70000 + b" HTTP/1.1\r\n\r\n"
+        many_headers = b"GET /_gate/healthz HTTP/1.1\r\n" + b"".join(
+            b"X-H%d: v\r\n" % i for i in range(120)) + b"\r\n"
+        cases = ((b"PROPFIND /artifacts/x HTTP/1.1\r\nHost: x\r\n\r\n", 501),
+                 (b"GET / extra HTTP/1.1\r\n\r\n", 400),
+
+                 (long_line, 414),
+                 (many_headers, 431))
+        for port in (self.port_of(self.gate_public), self.port_of(self.gate_auth)):
+            for data, want in cases:
+                st, h, sock = self.raw(port, data)
+                sock.close()
+                self.assertEqual(st, want, data[:40])
+                self.assertEqual(h.get("x-frame-options"), "DENY", data[:40])
+                self.assertIn("frame-ancestors 'none'", h.get("content-security-policy", ""), data[:40])
+                self.assertIn("default-src 'none'", h.get("content-security-policy", ""), data[:40])
+                self.assertEqual(h.get("cache-control"), "no-store", data[:40])
+                self.assertEqual(h.get("server"), "artifact-gate/1.0", data[:40])
+                self.assertEqual(h.get("connection"), "close", data[:40])
+                self.assertEqual(h.get("content-type"), "text/html; charset=utf-8", data[:40])
+        # the echoed request text is escaped, never markup
+        st, h, sock = self.raw(self.port_of(self.gate_public),
+                               b"<script>x</script> / HTTP/1.1\r\n\r\n", timeout=3)
+        rest = b""
+        try:
+            while True:
+                piece = sock.recv(65536)
+                if not piece:
+                    break
+                rest += piece
+        except OSError:
+            pass
+        sock.close()
+        self.assertEqual(st, 501)
+        self.assertNotIn(b"<script>", rest)
+
+    def test_content_length_takes_only_space_and_tab_around_it(self):
+        # str.strip() also removes Unicode whitespace (NBSP, U+001C..U+001F): such a length
+        # is malformed (400), while spaces and tabs around the digits stay accepted
+        pub = self.port_of(self.gate_public)
+        for hdr in (b"Content-Length: \xa05\r\n", b"Content-Length: 5\xa0\r\n",
+                    b"Content-Length: 5\x1c\r\n", b"Content-Length: \x1f5\r\n",
+                    b"Content-Length: 5\x85\r\n"):
+            st, h, sock = self.raw(pub, b"POST /_gate/request HTTP/1.1\r\nHost: x\r\n" + hdr
+                                   + b"\r\ncsrf=", timeout=3)
+            sock.close()
+            self.assertEqual((st, h.get("connection")), (400, "close"), hdr)
+        body = b"artifact=/artifacts/u/secret/report.html"
+        st, h, sock = self.raw(pub, b"POST /_gate/request HTTP/1.1\r\nHost: x\r\n"
+                               b"Content-Length: \t%d \t\r\n\r\n" % len(body) + body, timeout=3)
+        sock.close()
+        self.assertEqual((st, h.get("connection")), (401, None))   # read, parsed, no session
 
     def test_forwarded_uri_read_two_ways_is_refused(self):
         # L1: "#frag" was decided as pub/free/index.html and signed as ".../index.html#frag";

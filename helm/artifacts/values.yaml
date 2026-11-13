@@ -68,6 +68,8 @@ minio:
   namespace: minio
   service: minio
   port: 9000
+  # S3 bucket name, written into Traefik rules: 3-63 of lowercase letters, digits, '.' and
+  # '-', starting and ending with a letter or digit (the chart refuses anything else)
   bucket: artifacts
   tlsSecret: artifacts-minio-tls       # cert for the MinIO service (used by the old host pattern; optional)
   gateTlsSecret: artifacts-gate-tls    # cert served on the artifacts host routes
@@ -117,6 +119,17 @@ gate:
   # true forwards the X-Forwarded-* headers the request carries, i.e. whatever the
   # entrypoint's forwardedHeaders settings let through from the client.
   trustForwardHeader: false
+  # Request-access caps: they bound the messages a requester can cause, never who can read
+  # what. Whole numbers from 1 to 999999 (the chart and the gate refuse anything else).
+  # Requests per requester and file stay at the gate's default, 5 per day.
+  requestCaps:
+    # access requests one signed-in user may send per day, across every artifact
+    # (GATE_REQUESTER_RATE_LIMIT_MAX)
+    perRequester: 20
+    # open requests an owner is sent at a time; above it a request is recorded and logged
+    # but the owner is never messaged about it (the requester can ask again once the owner
+    # has decided one or its links have expired) (GATE_OWNER_PENDING_MAX)
+    ownerPending: 10
   # Container resources. To bound local disk, add ephemeral-storage to both, e.g.
   #   requests: {ephemeral-storage: 16Mi}   limits: {ephemeral-storage: 64Mi}
   resources:

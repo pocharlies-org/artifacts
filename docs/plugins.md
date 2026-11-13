@@ -114,10 +114,11 @@ Always JSON. `200` with a decision, or an error status (§ table below).
 | Status | When |
 |---|---|
 | `200` | A decision was made (including `allowed: false` — a denial is not an HTTP error) |
-| `400` | Body/path malformed: missing `artifact`, not an `/artifacts/` path, or the path is refused outright (traversal, `.acl.json`, `_gate/`, `_plugins/`, `_mcp/`, trailing slash); or an invalid or repeated `Content-Length` |
+| `400` | Body/path malformed: missing `artifact`, not an `/artifacts/` path, or the path is refused outright (traversal, `.acl.json`, `_gate/`, `_plugins/`, `_mcp/`, trailing slash, a key that is not UTF-8 once decoded: `%ef`, `%ff`); or an invalid or repeated `Content-Length` |
 | `405` | Any method other than POST |
 | `411` | No `Content-Length`, or any `Transfer-Encoding` (chunked): the body is not read |
 | `413` | `Content-Length` above 16384: the body is not read |
+| `408` | The body did not arrive within 10 s of the headers; the connection is closed |
 | `500` | Identity backend (oauth2-proxy) error — fail closed, deny the visitor |
 | `404` | Request hit the public listener (the endpoint is not routed there) |
 

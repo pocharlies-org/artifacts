@@ -37,3 +37,15 @@ annotations:
 {{- end }}
 {{- printf "(%s)" (join " || " $hm) }}
 {{- end }}
+{{- /* The bucket name (values minio.bucket), checked: it is written verbatim into Traefik rules
+       (PathPrefix(`/<bucket>...`)), the gate's GATE_BUCKET and the bootstrap Job, so it must be
+       an S3 bucket name: 3 to 63 of lowercase letters, digits, '.' and '-', starting and ending
+       with a letter or digit. Anything else is refused: a backtick or ')' would rewrite a rule.
+       Call with the root context:  {{- $bucket := include "artifacts.bucket" . }} */ -}}
+{{- define "artifacts.bucket" -}}
+{{- $b := .Values.minio.bucket }}
+{{- if not (and (kindIs "string" $b) (regexMatch "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$" $b)) }}
+{{- fail (printf "minio.bucket %q is not a bucket name (a string of 3-63 lowercase letters, digits, '.' and '-', starting and ending with a letter or digit)" (toString $b)) }}
+{{- end }}
+{{- $b }}
+{{- end }}

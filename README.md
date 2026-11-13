@@ -67,6 +67,15 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   `pub/` takes no requests at all: it is anonymous-readable by design, so its deny page
   offers none, a request for it is refused, and the gate never writes a `pub/` ACL (its S3
   policy refuses that write too).
+  Requests are capped, and the page is the same whether or not the artifact exists: per
+  requester and object key (`GATE_RATE_LIMIT_MAX`, 5 a day), counted on the decoded key, so
+  `…/index.html` and `…/%69ndex.html` are one artifact (the request record and the owner's
+  message carry that one name too); per requester across all artifacts
+  (`GATE_REQUESTER_RATE_LIMIT_MAX`, 20 a day); and per owner, at most
+  `GATE_OWNER_PENDING_MAX` (10) open requests sent at a time: above it a request is recorded
+  and logged, but the owner is not messaged about it, then or later; the requester sees the
+  same page and can ask again later, once the owner has decided an open request or its links
+  have expired (7 days). A message that cannot be sent holds no place.
   The approval adds the requester to the root ACL with a conditional write: the gate reads
   the ACL with its ETag and writes it back with `If-Match`, so a change made by anyone else in
   between is never overwritten (the store answers `412`; the gate reads again and retries
@@ -78,7 +87,13 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   the ACL once more: the requester listed means approved; otherwise the owner is told the
   access list may or may not have been updated, to use the same link again (it never adds
   anyone twice), and that Deny does not take back an access already added. "Nothing was
-  changed" is said only when that is known (a refusal before the write, or a 4xx). Your store must honour `If-Match` on `PutObject` (MinIO does; a store that ignores
+  changed" is said only when that is known (a refusal before the write, or a 4xx). The
+  approval writes the ACL first and records the decision second, so a failure between the
+  two (a lost reply, a gate stopped in between) leaves the request open with the access
+  already granted, never recorded as approved without it; the same link then closes it.
+  An approval of an artifact whose `expires` has passed writes nothing and tells the owner
+  the artifact has expired. The result pages say the requester was notified only when the
+  message went out. Your store must honour `If-Match` on `PutObject` (MinIO does; a store that ignores
   it brings back the lost-update race).
 - **Two listeners, one process**: `:8080` public (request-access pages, approve/deny
   links, health) and `:8081` internal (decision endpoints only: `/_gate/auth`,
@@ -324,7 +339,9 @@ Everything is environment-driven; nothing is hardcoded.
 | `GATE_ANONYMOUS_PUB_ENABLED` | `false` | anonymous reads of `pub/` (plugin authz and `/_gate/pub-auth`); must stay false on public hosts |
 | `GATE_STATE_PREFIX` | `_gate` | gate state prefix (never served) |
 | `GATE_PLUGIN_PREFIX` | `_plugins` | plugin storage prefix (never served) |
-| `GATE_RATE_LIMIT_MAX` / `GATE_RATE_LIMIT_WINDOW_SECONDS` | `5` / `86400` | access requests per key |
+| `GATE_RATE_LIMIT_MAX` / `GATE_RATE_LIMIT_WINDOW_SECONDS` | `5` / `86400` | access requests per requester and object key (decoded: every spelling of one key counts once), per window |
+| `GATE_REQUESTER_RATE_LIMIT_MAX` | `20` | access requests per requester across all artifacts, per the same window; a whole number from 1 to 999999 (the gate refuses to start otherwise) |
+| `GATE_OWNER_PENDING_MAX` | `10` | open requests an owner is sent at a time; above it a request is recorded and logged but the owner is never messaged about it (the requester can ask again once the owner has decided one or its links have expired); a whole number from 1 to 999999 |
 | `GATE_TOKEN_TTL_SECONDS` / `GATE_CSRF_TTL_SECONDS` | `604800` / `3600` | approve/deny link, CSRF |
 | `GATE_ACL_CACHE_SECONDS` | `15` | ACL cache: how long an entry is used |
 | `GATE_ACL_CACHE_MAX_ENTRIES` | `10000` | ACL cache: most entries kept (least recently used evicted first) |
@@ -356,13 +373,15 @@ Everything is environment-driven; nothing is hardcoded.
 `artifact-gate-code`) to the gate image `gate.bakedImageRepository@gate.bakedImageDigest`
 (see [Gate image](#gate-image)). Plugin
 names must be DNS-1123 labels (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`), plugin prefixes
-`/_<segment>/[<segment>/...]` of `[a-z0-9_-]`, and `artifactsHost` / `artifactsExtraHosts`
-lowercase DNS names (no port, no wildcard): they are written into Traefik rules, and the chart
-refuses anything else.
+`/_<segment>/[<segment>/...]` of `[a-z0-9_-]`, `artifactsHost` / `artifactsExtraHosts`
+lowercase DNS names (no port, no wildcard), and `minio.bucket` an S3 bucket name
+(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`, as a string): they are written into Traefik rules, and
+the chart refuses anything else.
 
 | Value | Default | Meaning |
 |---|---|---|
 | `ingressRouteAnnotations` | `{}` | annotations on every IngressRoute (artifacts host and plugin routes), e.g. `kubernetes.io/ingress.class: traefik-internal` |
+| `gate.requestCaps.perRequester` / `gate.requestCaps.ownerPending` | `20` / `10` | `GATE_REQUESTER_RATE_LIMIT_MAX` / `GATE_OWNER_PENDING_MAX` of the gate (see the gate table); whole numbers from 1 to 999999, anything else is refused |
 | `gate.trustForwardHeader` | `false` | `trustForwardHeader` of the `gate-auth` forwardAuth middleware; `false` makes Traefik set the `X-Forwarded-*` headers the gate decides on from the request itself |
 | `artifactsGate.anonymousPubThroughGate` | `false` | with `artifactsGate.anonymousPubEnabled`: `false` serves `pub/` straight from MinIO (rule 2, `.acl.json` and listings kept off it); `true` makes rule 2 ask the gate's anonymous decision first (middleware `gate-pub-auth`, `/_gate/pub-auth`, `trustForwardHeader` always `false`), so a missing key, a key with an ACL, a listing and an `.acl.json` get the gate's one `404` page and never MinIO's error. `gate-pub-auth` is rendered whenever anonymous `pub/` is on, so turning this on changes routes only; the chart refuses `true` without anonymous `pub/` |
 | `oauth2Proxy.emailDomains` | `[]` | one `--email-domain` per entry; empty renders `--email-domain=*`; an entry `*` is refused |
@@ -403,9 +422,18 @@ their real types).
   `/_gate/approve`, `/_gate/deny`, `/_gate/plugin/authz`) read a body, and only with a
   `Content-Length` of at most 16 KiB. A chunked body (`411`), a larger one (`413`), a missing
   or invalid length, and a body on any other request are refused without being read, and the
-  connection is closed. A client that stops sending is cut off after 30 s.
-- **Gate pages and logs**: the gate's own pages send `frame-ancestors 'none'` and
-  `X-Frame-Options: DENY` (they cannot be framed) and no Python version in `Server`. The access
+  connection is closed. Slow clients are cut off by total deadlines, not per-read timeouts,
+  so sending one byte at a time extends neither: a request line and its headers must
+  arrive within 30 s (on a kept-alive connection counted from the previous answer, so an
+  idle connection is also closed after 30 s; closed without an answer), and a POST body
+  within 10 s of its headers (`408`, then the connection is closed).
+- **Gate pages and logs**: every answer with a header block that the gate writes, its own
+  pages and the error pages of its HTTP layer (an unsupported method such as `PROPFIND`, a
+  malformed request line, a request line or header block too long) alike, sends
+  `frame-ancestors 'none'` and `X-Frame-Options: DENY` (it cannot be framed),
+  `Cache-Control: no-store` and no Python version in `Server`. The one exception is a request
+  line whose HTTP version cannot be read (or `HTTP/2.0`): Python's `http.server` answers it
+  the HTTP/0.9 way, with no header block at all. The access
   log carries paths without query strings, so approve/deny tokens never reach a log line, and
   control characters in any logged value are written as escapes (no forged lines). The
   approve link of a visitor without a session still passes through oauth2-proxy's sign-in as
