@@ -62,9 +62,9 @@ gate's own least-privilege S3 user):
     POST /_gate/approve   single-use signed token, acts only for the ACL owner: adds the requester
                           to the root ACL (a conditional write, see grant_access) and DMs them; a
                           failed write is never reported as approved and leaves the request
-                          pending, and when the store may have applied it (a lost reply that
-                          one re-read did not settle) the owner is told so, never "nothing was
-                          changed". /_gate/deny mirrors it without touching the ACL.
+                          pending, and when the store may have applied it (a lost reply or a
+                          5xx that one re-read did not settle) the owner is told so, never
+                          "nothing was changed". /_gate/deny mirrors it without touching the ACL.
 
 Two listeners, one process (— the forwardAuth decision endpoint and the
 public surface must not share a port):
@@ -1618,8 +1618,8 @@ class GateHandler(BaseHTTPRequestHandler):
                           rec["id"], note, rec["requester"], rec["artifact"], reopened,
                           "may or may not have been updated" if unknown else "unchanged")
                 if unknown:
-                    # The store may have applied the write (its reply was lost, and a re-read
-                    # did not settle it): never "nothing was changed" here. A retry of the same
+                    # The store may have applied the write (its reply was lost or was a 5xx,
+                    # and a re-read did not settle it): never "nothing was changed" here. A retry of the same
                     # link finishes the approval and never adds anyone twice; Deny writes no ACL,
                     # so it would not take back an access that was already added.
                     return self._send(503, self._page("Access not confirmed", (
@@ -1852,11 +1852,12 @@ def read_acl_for_write(minio, acl_key):
 GRANT_ATTEMPTS = 2
 
 # grant_access notes after which the access list may or may not have been updated: the reply to
-# the write was lost and one re-read did not show the requester listed ("put failed: ..."), or
+# the write was lost ("put failed: ...") or was a server error ("put HTTP 5xx": a store may
+# fail after applying the write), and one re-read did not show the requester listed; or
 # something unexpected was raised inside the grant ("unexpected <Class>", see _handle_action).
 # Every other failed grant is known to have changed nothing: it stopped before the write, or
-# the store refused the write with a status code.
-_GRANT_OUTCOME_UNKNOWN = ("put failed:", "unexpected ")
+# the store refused the write with a 4xx status (412, 403, ...).
+_GRANT_OUTCOME_UNKNOWN = ("put failed:", "unexpected ", "put HTTP 5")
 
 
 def grant_outcome_unknown(note):
@@ -1864,18 +1865,20 @@ def grant_outcome_unknown(note):
     return isinstance(note, str) and note.startswith(_GRANT_OUTCOME_UNKNOWN)
 
 
-def _confirm_lost_write(minio, acl_key, requester, error):
-    """After an ACL write whose reply was lost (the store may or may not have applied it): one
-    fresh read. (True, note) when the requester is listed now, so the grant happened; else
-    (False, "put failed: ...") saying what the read found, and the outcome stays unknown."""
+def _confirm_unknown_write(minio, acl_key, requester, failure, cause):
+    """After an ACL write the store may or may not have applied (its reply was lost, or it was
+    a server error; `failure` is the note for it, "put failed: ..." or "put HTTP 5xx"): one
+    fresh read. (True, note) when the requester is listed now, so the grant happened (`cause`
+    names what made the outcome unknown); else (False, "<failure>; ...") saying what the read
+    found, and the outcome stays unknown."""
     acl, _etag, err = read_acl_for_write(minio, acl_key)
     if err is not None:
-        return False, f"put failed: {error}; the confirming read failed too: {err}"
+        return False, f"{failure}; the confirming read failed too: {err}"
     users = acl.get("users")
     if isinstance(users, list) and requester.lower() in [u.lower() for u in users
                                                          if isinstance(u, str)]:
-        return True, "added (confirmed by a re-read after a lost reply)"
-    return False, f"put failed: {error}; not listed on a re-read"
+        return True, f"added (confirmed by a re-read after {cause})"
+    return False, f"{failure}; not listed on a re-read"
 
 
 def grant_access(minio, artifact_path, requester):
@@ -1892,8 +1895,9 @@ def grant_access(minio, artifact_path, requester):
       - everything else in the ACL (owner, groups, expires, unknown fields) is written back as
         read, and the ACL keeps its tags (ttl, which drives its expiry): they are read before
         the write and sent with it; if they cannot be read, nothing is written;
-      - a write whose reply is lost (the store may have applied it) is checked with one fresh
-        read: the requester listed is a grant; anything else is "put failed: ..." and the
+      - a write whose reply is lost, or that the store answers with a 5xx (it may have applied
+        it either way), is checked with one fresh read: the requester listed is a grant;
+        anything else keeps the failure's note ("put failed: ..." or "put HTTP 5xx") and the
         outcome stays unknown (grant_outcome_unknown)."""
     key = key_from_path(artifact_path)
     if key is None or _bad_key(key):
@@ -1927,7 +1931,16 @@ def grant_access(minio, artifact_path, requester):
                                    if_match=etag,
                                    tagging=urllib.parse.urlencode(sorted(tags.items())) or None)
             except ConnectionError as e:
-                ok, note = _confirm_lost_write(minio, acl_key, requester, e)
+                ok, note = _confirm_unknown_write(minio, acl_key, requester, f"put failed: {e}",
+                                                  "a lost reply")
+                if not ok:
+                    return False, note
+                status, added = 200, note
+                break
+            if 500 <= status <= 599:
+                # a server error: the store may have applied the write before failing
+                ok, note = _confirm_unknown_write(minio, acl_key, requester, f"put HTTP {status}",
+                                                  f"HTTP {status}")
                 if not ok:
                     return False, note
                 status, added = 200, note

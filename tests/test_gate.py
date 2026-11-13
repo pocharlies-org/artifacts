@@ -488,14 +488,62 @@ class ConditionalGrantTest(unittest.TestCase):
         self.assertTrue(gate.grant_outcome_unknown(note))
         self.assertIn("new@x.com", json.loads(m.objects[self.KEY])["users"])   # it was applied
 
+    class ServerErrorMinio(FakeMinio):
+        """The ACL write answers a 5xx, after applying it (applied=True) or without applying it;
+        reads after the write can fail too."""
+
+        def __init__(self, *a, status=500, applied=False, reads_after_fail=False, **kw):
+            super().__init__(*a, **kw)
+            self.status, self.applied = status, applied
+            self.reads_after_fail, self.written = reads_after_fail, False
+
+        def put(self, key, data, ctype=None, if_match=None, tagging=None):
+            if key.endswith(".acl.json"):
+                if self.applied:
+                    super().put(key, data, ctype, if_match=if_match, tagging=tagging)
+                self.written = True
+                self.put_calls.append((key, if_match, tagging, self.status))
+                return self.status
+            return super().put(key, data, ctype, if_match=if_match, tagging=tagging)
+
+        def get(self, key):
+            if self.written and self.reads_after_fail:
+                raise ConnectionError(f"minio GET {key}: timed out")
+            return super().get(key)
+
+    def test_store_5xx_on_the_write_is_an_unknown_outcome_with_a_re_read(self):
+        for status in (500, 503):
+            # not applied: the re-read does not list the requester, the outcome stays unknown
+            m = self.ServerErrorMinio({self.KEY: json.dumps(self.ACL).encode()}, status=status)
+            ok, note = gate.grant_access(m, self.PATH, "new@x.com")
+            self.assertEqual((ok, note), (False, f"put HTTP {status}; not listed on a re-read"))
+            self.assertTrue(gate.grant_outcome_unknown(note))
+            self.assertEqual(m.gets, [self.KEY, self.KEY])            # the read, then one re-read
+            self.assertEqual(len([c for c in m.put_calls if c[3] == status]), 1)   # no retry
+            # applied, then the 5xx: the re-read lists the requester, so the grant happened
+            m = self.ServerErrorMinio({self.KEY: json.dumps(self.ACL).encode()}, status=status,
+                                      applied=True, tags={self.KEY: {"ttl": "7"}})
+            self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"),
+                             (True, f"added (confirmed by a re-read after HTTP {status})"))
+            self.assertEqual(json.loads(m.objects[self.KEY])["users"], ["a@x.com", "new@x.com"])
+            # applied, and the re-read fails too: unknown, and the requester is in fact listed
+            m = self.ServerErrorMinio({self.KEY: json.dumps(self.ACL).encode()}, status=status,
+                                      applied=True, reads_after_fail=True)
+            ok, note = gate.grant_access(m, self.PATH, "new@x.com")
+            self.assertEqual((ok, note), (False, f"put HTTP {status}; the confirming read failed "
+                                                 f"too: minio GET u/r/.acl.json: timed out"))
+            self.assertTrue(gate.grant_outcome_unknown(note))
+
     def test_which_failed_grants_may_have_changed_the_acl(self):
         # unknown: a lost write reply (after the re-read), an exception raised inside the grant;
         # known to have changed nothing: every refusal before the write and every status code
         for note in ("put failed: minio PUT k: IncompleteRead; not listed on a re-read",
                      "put failed: minio PUT k: timed out; the confirming read failed too: x",
-                     "unexpected RuntimeError"):
+                     "unexpected RuntimeError", "put HTTP 500; not listed on a re-read",
+                     "put HTTP 503; the confirming read failed too: x", "put HTTP 500"):
             self.assertTrue(gate.grant_outcome_unknown(note), note)
-        for note in ("put HTTP 412", "put HTTP 403", "put HTTP 500", "acl unreadable: missing",
+        for note in ("put HTTP 412", "put HTTP 403", "put HTTP 400", "put HTTP 404",
+                     "put HTTP 409", "acl unreadable: missing",
                      "acl unreadable: minio GET k: IncompleteRead", "acl tags unreadable: HTTP 403",
                      "acl unreadable: users is not a list", "no artifact root", "bad artifact path",
                      "pub/ takes no access grants", "", None):

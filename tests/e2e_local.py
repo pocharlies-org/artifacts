@@ -51,7 +51,8 @@ TRUNCATE = {}
 # (method, key) -> [action, ...]: each such request pops the next action, before TRUNCATE is
 # looked at. "ok" answers normally; "drop" closes the connection without any answer (a PUT is
 # then NOT applied: the client cannot tell it from a reply lost after the write); "cut" is
-# TRUNCATE's cut reply (a PUT is applied). method is "GET" or "PUT".
+# TRUNCATE's cut reply (a PUT is applied). A PUT may also get "<status>" (that status, NOT
+# applied) or "applied <status>" (applied, then that status). method is "GET" or "PUT".
 PLAN = {}
 
 
@@ -139,6 +140,14 @@ class MinioHandler(BaseHTTPRequestHandler):
         step = self._plan("PUT", key)
         if step == "drop":
             return self._drop()
+        if step not in ("ok", "cut"):
+            applied, _, code = step.rpartition(" ")
+            with OBJECTS_LOCK:
+                if applied == "applied":
+                    OBJECTS[key] = body
+                PUTS.append((key, self.headers.get("If-Match"), self.headers.get("x-amz-tagging"),
+                             int(code)))
+            return self._reply(int(code), b"InternalError" if code.startswith("5") else b"Refused")
         if_match, tagging = self.headers.get("If-Match"), self.headers.get("x-amz-tagging")
         with OBJECTS_LOCK:
             current = OBJECTS.get(key)
@@ -822,6 +831,47 @@ class E2ETest(unittest.TestCase):
             self.assertEqual(json.loads(OBJECTS[acl_key])["users"].count("vic@example.com"), 1)
         self.assertEqual(len(sent), 1)
         self.assertIn("acl_note=already listed", log.getvalue())
+
+    def test_store_5xx_on_the_acl_write_is_an_unknown_outcome(self):
+        # a store may fail after applying the write: a 5xx gets the confirming re-read and,
+        # unless it shows the requester listed, the unknown-outcome page, never "Nothing was
+        # changed"; the same link finishes it. A 4xx (403) is still a known refusal.
+        acl_key = "u/secret/.acl.json"
+        sent = self.record_notifications()
+        log = self.capture_log()
+        for code in ("500", "503"):
+            rid, token = self._approve(f"yan{code}@example.com")
+            with OBJECTS_LOCK:
+                PLAN[("PUT", acl_key)] = [code]                       # not applied
+            st, page, _ = self._post_action("approve", token)
+            self.assertEqual(st, 503, page)
+            self._assert_unknown_outcome_page(page)
+            self.assertIn(f"ACL write failed: put HTTP {code}; not listed on a re-read", log.getvalue())
+            with OBJECTS_LOCK:
+                self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+            self.assertEqual(sent, [])
+            st, page, _ = self._post_action("approve", token)         # the same link finishes it
+            self.assertEqual(st, 200, page)
+            self.assertIn(f"yan{code}@example.com", json.loads(OBJECTS[acl_key])["users"])
+            sent.clear()
+        # applied, then a 503: the re-read lists the requester, so the first click approves
+        rid, token = self._approve("zed@example.com")
+        with OBJECTS_LOCK:
+            PLAN[("PUT", acl_key)] = ["applied 503"]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertIn("<title>Request approved</title>", page)
+        self.assertIn("acl_note=added (confirmed by a re-read after HTTP 503)", log.getvalue())
+        self.assertEqual(len(sent), 1)
+        # a 403 is a known refusal: "Access not granted", "Nothing was changed"
+        rid, token = self._approve("ann@example.com")
+        with OBJECTS_LOCK:
+            PLAN[("PUT", acl_key)] = ["403"]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("<title>Access not granted</title>", page)
+        self.assertIn("Nothing was changed", page)
+        self.assertNotIn("may or may not", page)
 
     def test_only_a_known_refusal_says_nothing_was_changed(self):
         # a write refused with a status code changed nothing and says so; a lost reply never does
