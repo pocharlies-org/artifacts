@@ -7,6 +7,7 @@ CSRF, rate limit, request store, ACL write. Run:
 
 import base64
 import hashlib
+import http.client
 import io
 import json
 import logging
@@ -566,6 +567,53 @@ class MinioClientWriteTest(unittest.TestCase):
         c.put("_gate/req/x.json", b"{}", "application/json")
         sent = {k.lower() for k, _ in seen["req"].header_items()}
         self.assertFalse({"if-match", "x-amz-tagging"} & sent, sent)
+
+    def test_cut_or_malformed_reply_is_a_connection_error(self):
+        # http.client.HTTPException is not an OSError: a store reply cut short (IncompleteRead)
+        # or malformed must still come out as ConnectionError, which every caller handles, and
+        # carry the class name only, never bytes of the reply
+        from unittest import mock
+
+        class Cut:
+            status, headers = 200, {}
+
+            def read(self):
+                raise http.client.IncompleteRead(b'{"owner": "partial-reply-bytes', 16)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class CutBody:
+            def read(self, *a):
+                raise http.client.IncompleteRead(b"partial-reply-bytes", 16)
+
+            def close(self):
+                pass
+
+        def http_error(req, timeout=10):
+            raise gate.urllib.error.HTTPError(req.full_url, 412, "Precondition Failed", {}, CutBody())
+
+        c = gate.MinioClient("http://minio:9000", "AK", "SK", "artifacts")
+        for opener in (lambda req, timeout=10: Cut(), http_error,
+                       mock.Mock(side_effect=http.client.BadStatusLine("partial-reply-bytes"))):
+            with mock.patch.object(gate.urllib.request, "urlopen", opener):
+                with self.assertRaises(ConnectionError) as cm:
+                    c.get_with_etag("u/r/.acl.json")
+                msg = str(cm.exception)
+                self.assertTrue(msg.startswith("minio GET u/r/.acl.json: "), msg)
+                self.assertNotIn("partial-reply-bytes", msg)
+                with self.assertRaises(ConnectionError):
+                    c.put("u/r/.acl.json", b"{}", "application/json", if_match='"e"')
+                tags, err = c.get_tags_checked("u/r/.acl.json")
+                self.assertIsNone(tags)
+                self.assertNotIn("partial-reply-bytes", err)
+        with mock.patch.object(gate.urllib.request, "urlopen", lambda req, timeout=10: Cut()):
+            with self.assertRaises(ConnectionError) as cm:
+                c.get("u/r/.acl.json")
+        self.assertEqual(str(cm.exception), "minio GET u/r/.acl.json: IncompleteRead")
 
     def test_tags_checked_fails_closed_where_get_tags_is_best_effort(self):
         c, _ = self._client_with(403, b"<Error/>")

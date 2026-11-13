@@ -44,6 +44,10 @@ LAST_MODIFIED = "Wed, 21 Oct 2026 07:28:00 GMT"
 # and the reader's next request.
 AFTER_GET = {}
 PUTS = []          # (key, If-Match, x-amz-tagging, status) of every PUT
+# (method, key) -> n: the next n answers to that request are cut short (Content-Length promises
+# more than is sent, then the connection closes: the client gets http.client.IncompleteRead).
+# method is "GET", "GET?tagging" or "PUT"; a cut PUT is still applied, as a store may do.
+TRUNCATE = {}
 
 
 def etag_of(body):
@@ -58,6 +62,22 @@ class MinioHandler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         return urllib.parse.unquote(path[len("/artifacts/"):])
 
+    def _cut(self, method, key):
+        with OBJECTS_LOCK:
+            n = TRUNCATE.get((method, key), 0)
+            if n:
+                TRUNCATE[(method, key)] = n - 1
+        return bool(n)
+
+    def _reply_cut(self, status, body, headers=None):
+        self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body) + 16))
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
     def do_GET(self):
         if "tagging" in urllib.parse.urlsplit(self.path).query:
             key = self._key()
@@ -70,6 +90,8 @@ class MinioHandler(BaseHTTPRequestHandler):
                    + "".join(f"<Tag><Key>{k}</Key><Value>{v}</Value></Tag>"
                              for k, v in (tags or {}).items())
                    + "</TagSet></Tagging>")
+            if self._cut("GET?tagging", key):
+                return self._reply_cut(200, xml.encode())
             return self._reply(200, xml.encode())
         key = self._key()
         with OBJECTS_LOCK:
@@ -80,6 +102,8 @@ class MinioHandler(BaseHTTPRequestHandler):
             hook()
         if body is None:
             return self._reply(404, b"NoSuchKey")
+        if self._cut("GET", key):
+            return self._reply_cut(200, body, {"ETag": etag_of(body)})
         self._reply(200, body, {"ETag": etag_of(body)})
 
     def do_HEAD(self):
@@ -109,6 +133,8 @@ class MinioHandler(BaseHTTPRequestHandler):
                 else:
                     TAGS.pop(key, None)
             PUTS.append((key, if_match, tagging, status))
+        if self._cut("PUT", key):
+            return self._reply_cut(status, b"")
         self._reply(status, b"" if status == 200 else b"PreconditionFailed")
 
     def _reply(self, status, body, headers=None):
@@ -228,6 +254,7 @@ class E2ETest(unittest.TestCase):
             TAGS.clear()
             AFTER_GET.clear()
             PUTS.clear()
+            TRUNCATE.clear()
         self.gate._acl_cache.clear()
         # pub artifact without ACL; private artifact with ACL (owner + bob's group); ACL for it
         OBJECTS["pub/free/index.html"] = b"<h1>free</h1>"
@@ -646,6 +673,76 @@ class E2ETest(unittest.TestCase):
         self.assertIn("lena@example.com", json.loads(OBJECTS["u/secret/.acl.json"])["users"])
         self.assertEqual(TAGS.get("u/secret/.acl.json"), {"ttl": "7"})
         self.assertEqual([t for k, _im, t, _st in PUTS if k == "u/secret/.acl.json"], ["ttl=7"])
+
+    # a store reply cut short (http.client.IncompleteRead, not an OSError) on any request of the
+    # grant, or any other unexpected exception, is a failed grant like the others: 503, request
+    # back to pending, no message, one clean log line; the same link works once the store does
+    def _approval_with_a_cut_store_reply(self, method):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        acl_key = "u/secret/.acl.json"
+        with OBJECTS_LOCK:
+            TAGS[acl_key] = {"ttl": "7"}
+            TRUNCATE[(method, acl_key)] = 1
+        rid, token = self._approve("sam@example.com")
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("Access not granted", page)
+        self.assertEqual(sent, [])
+        with OBJECTS_LOCK:
+            self.assertEqual(TRUNCATE[(method, acl_key)], 0)        # the cut reply was sent
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+        lines = [ln for ln in log.getvalue().splitlines() if "ACL write failed" in ln]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn(": IncompleteRead (requester=sam@example.com", lines[0])
+        for leak in ("more expected", "bytes read", "alice@example.com", '"users"'):
+            self.assertNotIn(leak, lines[0])
+        st, page, _ = self._post_action("approve", token)      # the store answers in full again
+        self.assertEqual(st, 200, page)
+        acl = json.loads(OBJECTS[acl_key])
+        self.assertEqual(acl["users"].count("sam@example.com"), 1)
+        self.assertEqual(TAGS[acl_key], {"ttl": "7"})
+        self.assertEqual(len(sent), 1)
+        self.assertIn("approved", sent[0][1])
+        return lines[0]
+
+    def test_cut_reply_on_the_acl_read_is_a_failed_grant(self):
+        line = self._approval_with_a_cut_store_reply("GET")
+        self.assertIn("acl unreadable: minio GET u/secret/.acl.json: IncompleteRead", line)
+
+    def test_cut_reply_on_the_tag_read_is_a_failed_grant(self):
+        line = self._approval_with_a_cut_store_reply("GET?tagging")
+        self.assertIn("acl tags unreadable: minio GET u/secret/.acl.json: IncompleteRead", line)
+
+    def test_cut_reply_on_the_acl_write_is_a_failed_grant(self):
+        # the store applied the write but its reply was cut: the next click finds the requester
+        # listed and finishes the approval without writing again
+        line = self._approval_with_a_cut_store_reply("PUT")
+        self.assertIn("put failed: minio PUT u/secret/.acl.json: IncompleteRead", line)
+        self.assertEqual([st for k, _im, _t, st in PUTS if k == "u/secret/.acl.json"], [200])
+
+    def test_unexpected_exception_in_the_grant_is_a_failed_grant(self):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        rid, token = self._approve("tess@example.com")
+        secretish = "Authorization: AWS4-HMAC-SHA256 Credential=leak-marker"
+        with mock.patch.object(self.gate, "grant_access", side_effect=RuntimeError(secretish)):
+            st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("Access not granted", page)
+        self.assertEqual(sent, [])
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+        out = log.getvalue()
+        self.assertNotIn("leak-marker", out)
+        self.assertNotIn("Traceback", out)
+        lines = [ln for ln in out.splitlines() if "ACL write failed" in ln]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("ACL write failed: unexpected RuntimeError (requester=tess@example.com", lines[0])
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertIn("tess@example.com", json.loads(OBJECTS["u/secret/.acl.json"])["users"])
+        self.assertEqual(len(sent), 1)
 
     def test_deny_message_unchanged(self):
         sent = self.record_notifications()

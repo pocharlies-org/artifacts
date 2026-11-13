@@ -74,6 +74,7 @@ import base64
 import hashlib
 import hmac
 import html
+import http.client
 import json
 import logging
 import os
@@ -270,12 +271,18 @@ class MinioClient:
                                body or b"", self.ak, self.sk)
         req = urllib.request.Request(self._url(key, query), data=body, method=method, headers=signed)
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return r.status, r.read(), _lower_headers(r.headers)
-        except urllib.error.HTTPError as e:
-            return e.code, e.read(), _lower_headers(e.headers)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    return r.status, r.read(), _lower_headers(r.headers)
+            except urllib.error.HTTPError as e:
+                return e.code, e.read(), _lower_headers(e.headers)   # reading the body can fail too
         except OSError as e:
             raise ConnectionError(f"minio {method} {key}: {e}") from e
+        except http.client.HTTPException as e:
+            # A reply cut short or malformed (IncompleteRead, BadStatusLine, ...) is not an
+            # OSError but is the same failure: the store could not be read. Only the class
+            # name is kept: the exception's text can carry bytes of the store's reply.
+            raise ConnectionError(f"minio {method} {key}: {type(e).__name__}") from e
 
     def get(self, key):
         status, body, _ = self._call("GET", key)
@@ -1424,7 +1431,14 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._send(410, self._page("Already decided", "<p>Another decision won the race.</p>"))
         note = ""
         if action == "approve":
-            ok, note = grant_access(MINIO, rec["artifact"], rec["requester"])
+            try:
+                ok, note = grant_access(MINIO, rec["artifact"], rec["requester"])
+            except Exception as e:  # noqa: BLE001 - defensive: the request is already marked
+                # Any failure grant_access does not report itself is still a failed grant: the
+                # same answer as below, never a dropped connection that leaves the request
+                # marked approved with no grant. The log gets the class name only (no text,
+                # no traceback: either could carry request or store data).
+                ok, note = False, f"unexpected {type(e).__name__}"
             if not ok:
                 # Never "approved" for a grant that did not happen: the requester is not told
                 # anything, the request goes back to pending (the same link can be used again)
