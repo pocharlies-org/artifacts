@@ -9,9 +9,9 @@
 
        Users (credentials come from Secrets, never from git):
          artifact-gate    from <sso ns sibling> gate.s3SecretName: GetObject + GetObjectTagging
-                          on the bucket, PutObject only on the artifact-root ACLs (u/<run>/.acl.json,
-                          g/<slug>/<run>/.acl.json, explicit Deny on any deeper .acl.json) and _gate/*.
-                          The gate's ACL/state work only.
+                          on the bucket, PutObject + PutObjectTagging only on the artifact-root ACLs
+                          (u/<run>/.acl.json, g/<slug>/<run>/.acl.json, explicit Deny on any deeper
+                          .acl.json), PutObject on _gate/*. The gate's ACL/state work only.
          artifact-gate-read from <sso ns sibling> gate.readS3SecretName: GetObject on the bucket
                           with an explicit Deny on _gate/*, _plugins/* and every .acl.json, nothing
                           else. Signs ONLY the forwarded artifact reads.
@@ -116,13 +116,16 @@ spec:
                 mc admin policy attach local "$3" --user "$user_id" >/dev/null
               }
 
-              # gate: ACL writes only at the artifact root (gate/gate.py acl_key_for). A policy `*`
+              # gate: ACL writes only at the artifact root (gate/gate.py acl_key_for). An approval
+              # sends the ACL's tags (its ttl) on the same PUT: PutObjectTagging for the stores that
+              # check it separately (AWS S3; MinIO accepts it with PutObject alone). A policy `*`
               # also matches `/`, so the Allow on u/*/.acl.json and g/*/*/.acl.json would cover a
               # deeper .acl.json too: the explicit Deny on one more level takes those back.
               cat > /tmp/policy-gate.json <<JSON
               {"Version":"2012-10-17","Statement":[
                 {"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
-                {"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::${BUCKET}/u/*/.acl.json","arn:aws:s3:::${BUCKET}/g/*/*/.acl.json","arn:aws:s3:::${BUCKET}/_gate/*"]},
+                {"Effect":"Allow","Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/u/*/.acl.json","arn:aws:s3:::${BUCKET}/g/*/*/.acl.json"]},
+                {"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::${BUCKET}/_gate/*"]},
                 {"Effect":"Deny","Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/u/*/*/.acl.json","arn:aws:s3:::${BUCKET}/g/*/*/*/.acl.json"]}]}
               JSON
               put_policy artifact-gate /tmp/policy-gate.json

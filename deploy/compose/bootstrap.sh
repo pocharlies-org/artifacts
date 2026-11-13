@@ -31,12 +31,15 @@ JSON
 mc anonymous set-json /tmp/anonymous-pub.json "local/$BUCKET" >/dev/null
 
 # Gate user: ACL + state work (HEAD/GET/tagging on the bucket, writes only to the artifact-root
-# ACLs and _gate/). A policy `*` also matches `/`, so the Allow on u/*/.acl.json and
-# g/*/*/.acl.json would cover a deeper .acl.json too: the explicit Deny takes those back.
+# ACLs and _gate/). An approval sends the ACL's tags (its ttl) on the same PUT: PutObjectTagging
+# for the stores that check it separately (AWS S3; MinIO accepts it with PutObject alone). A
+# policy `*` also matches `/`, so the Allow on u/*/.acl.json and g/*/*/.acl.json would cover a
+# deeper .acl.json too: the explicit Deny takes those back.
 cat > /tmp/policy-gate.json <<JSON
 {"Version":"2012-10-17","Statement":[
   {"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/*"]},
-  {"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::${BUCKET}/u/*/.acl.json","arn:aws:s3:::${BUCKET}/g/*/*/.acl.json","arn:aws:s3:::${BUCKET}/_gate/*"]},
+  {"Effect":"Allow","Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/u/*/.acl.json","arn:aws:s3:::${BUCKET}/g/*/*/.acl.json"]},
+  {"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::${BUCKET}/_gate/*"]},
   {"Effect":"Deny","Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":["arn:aws:s3:::${BUCKET}/u/*/*/.acl.json","arn:aws:s3:::${BUCKET}/g/*/*/*/.acl.json"]}]}
 JSON
 # Read-signing user: signs ONLY the forwarded artifact reads. GetObject on the bucket, nothing

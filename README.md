@@ -55,6 +55,15 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   an artifact read (`?acl`, `?lambdaArn=`, `?versionId`, `response-*`, even `?v=2` or a bare
   `?`) answers 404 and is never signed. A forwarded read carrying any `x-amz-*` or
   `x-minio-*` request header is refused with 400 before the gate signs anything.
+- **Request access**: a denied visitor can ask the artifact's owner, who gets a one-click
+  approve/deny link (Slack DM). An approval adds the requester to the root ACL with a
+  conditional write: the gate reads the ACL with its ETag and writes it back with `If-Match`,
+  so a change made by anyone else in between is never overwritten (the store answers `412`;
+  the gate reads again and retries once, then gives up). Everything else in the ACL (`owner`,
+  `groups`, `expires`, unknown fields) and the ACL's tags (its `ttl`) are kept. A write that
+  fails is never reported as approved: the requester is told nothing, the owner sees that
+  access was not granted, and the request stays open. Your store must honour `If-Match` on
+  `PutObject` (MinIO does; a store that ignores it brings back the lost-update race).
 - **Two listeners, one process**: `:8080` public (request-access pages, approve/deny
   links, health) and `:8081` internal (decision endpoints only: `/_gate/auth`,
   `/_gate/plugin/authz`). The public routes never reach the decision listener.
@@ -149,8 +158,9 @@ Prerequisites and what the chart does:
     code is inside the image, referenced by digest; no ConfigMap. See [Gate image](#gate-image).
 - The bootstrap Job (helm hook) creates the bucket, the ILM rules, the anonymous `pub/`
   policy, and the least-privilege S3 users: `artifact-gate` (GetObject + GetObjectTagging
-  on `artifacts/*`, PutObject only on the artifact-root ACLs `u/*/.acl.json` and
-  `g/*/*/.acl.json`, with an explicit Deny one level deeper, and on `_gate/*`; ACL/state work),
+  on `artifacts/*`, PutObject and PutObjectTagging only on the artifact-root ACLs
+  `u/*/.acl.json` and `g/*/*/.acl.json`, with an explicit Deny one level deeper, PutObject on
+  `_gate/*`; ACL/state work),
   `artifact-gate-read` (GetObject on `artifacts/*` with an explicit Deny on `_gate/*`,
   `_plugins/*` and every `.acl.json`; signs the forwarded reads only),
   `artifact-publisher` (optional; Put/Get/tagging on `artifacts/*` including `.acl.json`,

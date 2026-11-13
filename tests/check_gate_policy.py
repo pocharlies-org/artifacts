@@ -44,7 +44,7 @@ EVERY_KEY = ROOT_ACLS + NESTED_ACLS + ROOTLESS_ACLS + OBJECTS + STATE
 # action -> the keys it must be allowed on; every other key of EVERY_KEY must be denied.
 EXPECTED = {
     "s3:PutObject": ROOT_ACLS + STATE,
-    "s3:PutObjectTagging": [],
+    "s3:PutObjectTagging": ROOT_ACLS,      # an approval sends the ACL's tags with its PUT
     "s3:GetObject": EVERY_KEY,
     "s3:GetObjectTagging": EVERY_KEY,
     "s3:DeleteObject": [],
@@ -104,7 +104,8 @@ def main():
         check(not wrong, "%s allowed on exactly %d of %d keys%s" % (
             action, len(want), len(EVERY_KEY), "" if not wrong else ": wrong %s" % wrong))
     for k in NESTED_ACLS + ROOTLESS_ACLS:
-        check(not allowed(chart, "s3:PutObject", k), "gate cannot write %s" % k)
+        check(not allowed(chart, "s3:PutObject", k) and not allowed(chart, "s3:PutObjectTagging", k),
+              "gate cannot write or tag %s" % k)
 
 
 if __name__ == "__main__":

@@ -39,7 +39,9 @@ gate's own least-privilege S3 user):
                           _gate/req/<id>.json and DMs the owner (Slack) Approve/Deny links.
     GET  /_gate/approve   renders a confirmation page (GET never changes state: Slack unfurls GETs).
     POST /_gate/approve   single-use signed token, acts only for the ACL owner: adds the requester
-                          to the ACL and DMs them. /_gate/deny mirrors it without touching the ACL.
+                          to the root ACL (a conditional write, see grant_access) and DMs them; a
+                          failed write is never reported as approved and leaves the request
+                          pending. /_gate/deny mirrors it without touching the ACL.
 
 Two listeners, one process (— the forwardAuth decision endpoint and the
 public surface must not share a port):
@@ -232,6 +234,11 @@ def sigv4_headers(method, host, path, query_pairs, extra_headers, payload, acces
     return headers
 
 
+def _lower_headers(headers):
+    """Response headers as {lower-case name: value} (a repeated header keeps its last value)."""
+    return {k.lower(): v for k, v in (headers.items() if headers else ())}
+
+
 class MinioClient:
     """Tiny path-style S3 client: get/head/put of one object, signed with the gate's own user."""
 
@@ -247,29 +254,41 @@ class MinioClient:
         u = self.endpoint + "/".join(_q(seg, True) for seg in path.split("/"))
         return u + (("?" + query) if query else "")
 
-    def _call(self, method, key, body=None, ctype=None, query=""):
+    def _call(self, method, key, body=None, ctype=None, query="", headers=None):
+        """(status, body, response headers) of one signed request. `headers` are sent AND
+        signed (If-Match, x-amz-tagging): the store refuses a signed request whose signed
+        headers were changed. Response header names come back lower-case."""
         path = f"/{self.bucket}/{key}" if key else f"/{self.bucket}"
         # keep_blank_values: a bare subresource (`?tagging`) must be signed as `tagging=`;
         # dropping it made every GetObjectTagging a 403 (SignatureDoesNotMatch) on real MinIO,
         # so the plugin authz never reported the ttl/expiry.
         qp = urllib.parse.parse_qsl(query, keep_blank_values=True)
-        headers = sigv4_headers(method, self.host, path, qp,
-                                {"content-type": ctype} if ctype else None,
-                                body or b"", self.ak, self.sk)
-        req = urllib.request.Request(self._url(key, query), data=body, method=method, headers=headers)
+        extra = {k.lower(): v for k, v in (headers or {}).items()}
+        if ctype:
+            extra["content-type"] = ctype
+        signed = sigv4_headers(method, self.host, path, qp, extra or None,
+                               body or b"", self.ak, self.sk)
+        req = urllib.request.Request(self._url(key, query), data=body, method=method, headers=signed)
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                return r.status, r.read()
+                return r.status, r.read(), _lower_headers(r.headers)
         except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            return e.code, e.read(), _lower_headers(e.headers)
         except OSError as e:
             raise ConnectionError(f"minio {method} {key}: {e}") from e
 
     def get(self, key):
-        return self._call("GET", key)
+        status, body, _ = self._call("GET", key)
+        return status, body
+
+    def get_with_etag(self, key):
+        """(status, body, ETag as sent by the store or None): the read half of a conditional
+        write (put(..., if_match=etag))."""
+        status, body, headers = self._call("GET", key)
+        return status, body, headers.get("etag")
 
     def head(self, key):
-        status, _ = self._call("HEAD", key)
+        status, _, _ = self._call("HEAD", key)
         return status
 
     def head_full(self, key):
@@ -285,29 +304,44 @@ class MinioClient:
         except OSError as e:
             raise ConnectionError(f"minio HEAD {key}: {e}") from e
 
-    def get_tags(self, key):
-        """GetObjectTagging as {tag: value}. Best-effort: {} on any failure — expiry reporting
-        must never change the allow/deny decision."""
+    def get_tags_checked(self, key):
+        """GetObjectTagging as ({tag: value}, None), or (None, error) when the tag set could not
+        be read: a write that must keep the tags fails closed on a read it cannot trust."""
         try:
-            status, body = self._call("GET", key, query="tagging")
-        except ConnectionError:
-            return {}
+            status, body, _ = self._call("GET", key, query="tagging")
+        except ConnectionError as e:
+            return None, str(e)
         if status != 200:
-            return {}
+            return None, f"HTTP {status}"
         try:
             root = ET.fromstring(body)
         except ET.ParseError:
-            return {}
+            return None, "malformed tagging XML"
         out = {}
         for tag in root.iter():
             if tag.tag.rsplit("}", 1)[-1] == "Tag":
                 fields = {c.tag.rsplit("}", 1)[-1]: (c.text or "") for c in tag}
                 if fields.get("Key"):
                     out[fields["Key"]] = fields.get("Value", "")
-        return out
+        return out, None
 
-    def put(self, key, data, ctype="application/octet-stream"):
-        status, _ = self._call("PUT", key, data, ctype)
+    def get_tags(self, key):
+        """GetObjectTagging as {tag: value}. Best-effort: {} on any failure — expiry reporting
+        must never change the allow/deny decision."""
+        tags, err = self.get_tags_checked(key)
+        return tags if err is None else {}
+
+    def put(self, key, data, ctype="application/octet-stream", if_match=None, tagging=None):
+        """PUT one object, returns the status. if_match: the ETag the caller read; the store
+        then writes only if the object is still that version and answers 412 otherwise.
+        tagging: the object's tag set in x-amz-tagging form (`ttl=7`); a PUT replaces the tag
+        set, so an overwrite without it leaves the object untagged."""
+        headers = {}
+        if if_match:
+            headers["if-match"] = if_match
+        if tagging:
+            headers["x-amz-tagging"] = tagging
+        status, _, _ = self._call("PUT", key, data, ctype, headers=headers)
         return status
 
 
@@ -776,6 +810,16 @@ class RequestStore:
         rec["status"], rec["updated"] = status, now
         self.store.put_json(f"req/{rid}.json", rec)
         return rec
+
+    def reopen(self, rid, status, now):
+        """Put a request that this process just marked `status` back to pending (an approval
+        whose ACL write failed): the owner's link works again. True when it was reopened."""
+        rec = self.get(rid)
+        if rec is None or rec.get("status") != status:
+            return False
+        rec["status"], rec["updated"] = "pending", now
+        self.store.put_json(f"req/{rid}.json", rec)
+        return True
 
 
 # --------------------------------------------------------------------------------------------
@@ -1332,7 +1376,22 @@ class GateHandler(BaseHTTPRequestHandler):
         if action == "approve":
             ok, note = grant_access(MINIO, rec["artifact"], rec["requester"])
             if not ok:
-                LOG.error("approve %s: ACL write failed: %s", rec["id"], note)
+                # Never "approved" for a grant that did not happen: the requester is not told
+                # anything, the request goes back to pending (the same link can be used again)
+                # and the owner's page says what happened. The cause stays in the log.
+                try:
+                    reopened = REQUESTS.reopen(rec["id"], action, int(time.time()))
+                except ConnectionError:
+                    reopened = False
+                LOG.error("approve %s: ACL write failed: %s (requester=%s artifact=%s "
+                          "request reopened=%s, requester not notified)",
+                          rec["id"], note, rec["requester"], rec["artifact"], reopened)
+                return self._send(503, self._page("Access not granted", (
+                    f"<p><b>{html.escape(rec['requester'])}</b> was <b>not</b> given access to "
+                    f"<code>{art}</code>: the artifact's access list could not be updated. "
+                    f"Nothing was changed and they were not notified.</p>"
+                    + ("<p>The request is still open: the same link can be used again.</p>"
+                       if reopened else ""))))
         msg = (f"Your access request for `{rec['artifact']}` was "
                f"{'approved — the link works now.' if action == 'approve' else 'denied.'}")
         ok, detail = NOTIFIER.send(rec["requester"], msg)
@@ -1476,13 +1535,12 @@ def read_acl(minio, key, now, bypass_cache=False):
     return acl, err
 
 
-# Per-ACL-key locks serialising grant_access . The gate is a single
-# replica but ThreadingHTTPServer: two owners approving two requests for the SAME directory at
-# the same time used to read-modify-write concurrently and one grant could be silently lost
-# (MinIO has no CAS/If-Match support here). One lock per acl_key serialises the read-modify-write
-# inside the process. The dict grows one entry per artifact root with an approved grant — bounded
-# by the number of published artifacts; fine at PoC volume (no eviction by design: a lock with
-# waiters must not be dropped).
+# Per-ACL-key locks serialising grant_access inside the process (ThreadingHTTPServer: two owners
+# approving two requests for the same artifact at the same time). Writers outside the process
+# (a publisher re-publishing the ACL, another gate replica) are covered by the conditional PUT
+# (If-Match) in grant_access, not by this lock. The dict grows one entry per artifact root with
+# an approved grant — bounded by the number of published artifacts (no eviction by design: a
+# lock with waiters must not be dropped).
 _grant_locks = {}
 _grant_locks_guard = threading.Lock()
 
@@ -1495,13 +1553,47 @@ def _grant_lock(acl_key):
         return lock
 
 
+def read_acl_for_write(minio, acl_key):
+    """(acl, etag, err) of one ACL object, read uncached for a conditional write. err is None
+    only when the object exists, is a JSON object and came with an ETag (no ETag: no
+    conditional write is possible, so the caller must not write)."""
+    try:
+        status, body, etag = minio.get_with_etag(acl_key)
+    except ConnectionError as e:
+        return None, None, str(e)
+    if status == 404:
+        return None, None, "missing"
+    if status != 200:
+        return None, None, f"HTTP {status}"
+    try:
+        acl = json.loads(body)
+    except ValueError:
+        return None, None, "malformed JSON"
+    if not isinstance(acl, dict):
+        return None, None, "not a JSON object"
+    if not etag:
+        return None, None, "no ETag"
+    return acl, etag, None
+
+
+# A write that loses the race (412) is redone once on a fresh read; a second loss gives up.
+GRANT_ATTEMPTS = 2
+
+
 def grant_access(minio, artifact_path, requester):
     """Add `requester` to the ACL users of `artifact_path`. (ok, note).
 
     Writes only the ACL that governs the path (acl_key_for: the artifact root for u/ and g/,
     whatever the file's depth) and only when it already exists: an approval never creates an
-    ACL object. Serialised per ACL key (see _grant_lock): concurrent approvals of the same
-    artifact can no longer lose a grant."""
+    ACL object. The write is a read-modify-write that cannot lose another writer's change:
+      - serialised per ACL key inside the process (_grant_lock);
+      - conditional against every other writer: the ACL is read with its ETag and written with
+        If-Match, so the store refuses it (412) if the object changed in between; then it is
+        read again, the requester added again and written once more; a second 412 gives up
+        with (False, "put HTTP 412") and leaves the other writer's ACL as it is;
+      - everything else in the ACL (owner, groups, expires, unknown fields) is written back as
+        read, and the ACL keeps its tags (ttl, which drives its expiry): they are read before
+        the write and sent with it; if they cannot be read, nothing is written."""
     key = key_from_path(artifact_path)
     if key is None:
         return False, "bad artifact path"
@@ -1509,16 +1601,29 @@ def grant_access(minio, artifact_path, requester):
     if acl_key is None:
         return False, "no artifact root"
     with _grant_lock(acl_key):
-        acl, err = read_acl(minio, key, now=int(time.time()), bypass_cache=True)  # write path: no cache
-        if err or not isinstance(acl, dict):
-            return False, f"acl unreadable: {err or 'missing'}"
-        users = acl.get("users") or []
-        if requester.lower() not in [u.lower() for u in users if isinstance(u, str)]:
-            users.append(requester)
-        acl["users"] = users
-        status = minio.put(acl_key, json.dumps(acl, indent=2).encode(), "application/json")
-    if status not in (200, 204):
-        return False, f"put HTTP {status}"
+        for _attempt in range(GRANT_ATTEMPTS):
+            acl, etag, err = read_acl_for_write(minio, acl_key)    # write path: never the cache
+            if err:
+                return False, f"acl unreadable: {err}"
+            users = acl.get("users") or []
+            if not isinstance(users, list):
+                return False, "acl unreadable: users is not a list"
+            if requester.lower() in [u.lower() for u in users if isinstance(u, str)]:
+                return True, "already listed"
+            tags, terr = minio.get_tags_checked(acl_key)
+            if terr:
+                return False, f"acl tags unreadable: {terr}"
+            acl["users"] = users + [requester]
+            try:
+                status = minio.put(acl_key, json.dumps(acl, indent=2).encode(), "application/json",
+                                   if_match=etag,
+                                   tagging=urllib.parse.urlencode(sorted(tags.items())) or None)
+            except ConnectionError as e:
+                return False, f"put failed: {e}"
+            if status != 412:
+                break
+        if status not in (200, 204):
+            return False, f"put HTTP {status}"
     with _acl_lock:
         _acl_cache.pop(acl_key, None)
     return True, "added"

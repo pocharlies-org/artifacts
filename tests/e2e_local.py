@@ -11,6 +11,7 @@ Run:  python3 -I -m unittest discover -s tests -p 'e2e_*.py' -v
 
 import importlib.util
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -21,6 +22,7 @@ import threading
 import time
 import tracemalloc
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,10 +32,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ------------------------------------------------------------------ fake MinIO (path style) ----
+# S3 write semantics the gate relies on: every object version has an ETag (sent on GET and
+# HEAD), a PUT with If-Match answers 412 unless the object is still that version, and a PUT
+# replaces the object's tag set (x-amz-tagging; none sent: untagged).
 OBJECTS = {}
 TAGS = {}          # key -> {tag: value}, served on GET <key>?tagging (ILM ttl)
 OBJECTS_LOCK = threading.Lock()
 LAST_MODIFIED = "Wed, 21 Oct 2026 07:28:00 GMT"
+# key -> [callable, ...]: each GET of that key pops one and runs it after the answer's version
+# is taken and before it is sent, i.e. another writer changes the object between that read
+# and the reader's next request.
+AFTER_GET = {}
+PUTS = []          # (key, If-Match, x-amz-tagging, status) of every PUT
+
+
+def etag_of(body):
+    return '"%s"' % hashlib.md5(body).hexdigest()
 
 
 class MinioHandler(BaseHTTPRequestHandler):
@@ -57,32 +71,50 @@ class MinioHandler(BaseHTTPRequestHandler):
                              for k, v in (tags or {}).items())
                    + "</TagSet></Tagging>")
             return self._reply(200, xml.encode())
+        key = self._key()
         with OBJECTS_LOCK:
-            body = OBJECTS.get(self._key())
+            body = OBJECTS.get(key)
+            hooks = AFTER_GET.get(key)
+            hook = hooks.pop(0) if hooks else None
+        if hook is not None:
+            hook()
         if body is None:
             return self._reply(404, b"NoSuchKey")
-        self._reply(200, body)
+        self._reply(200, body, {"ETag": etag_of(body)})
 
     def do_HEAD(self):
         with OBJECTS_LOCK:
-            exists = self._key() in OBJECTS
-        self.send_response(200 if exists else 404)
-        if exists:
+            body = OBJECTS.get(self._key())
+        self.send_response(200 if body is not None else 404)
+        if body is not None:
             self.send_header("Last-Modified", LAST_MODIFIED)
+            self.send_header("ETag", etag_of(body))
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_PUT(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n)
+        key = self._key()
+        if_match, tagging = self.headers.get("If-Match"), self.headers.get("x-amz-tagging")
         with OBJECTS_LOCK:
-            OBJECTS[self._key()] = body
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+            current = OBJECTS.get(key)
+            if if_match is not None and (current is None or etag_of(current) != if_match):
+                status = 412
+            else:
+                status = 200
+                OBJECTS[key] = body
+                if tagging:
+                    TAGS[key] = dict(urllib.parse.parse_qsl(tagging))
+                else:
+                    TAGS.pop(key, None)
+            PUTS.append((key, if_match, tagging, status))
+        self._reply(status, b"" if status == 200 else b"PreconditionFailed")
 
-    def _reply(self, status, body):
+    def _reply(self, status, body, headers=None):
         self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -193,6 +225,9 @@ class E2ETest(unittest.TestCase):
         global OBJECTS
         with OBJECTS_LOCK:
             OBJECTS.clear()
+            TAGS.clear()
+            AFTER_GET.clear()
+            PUTS.clear()
         self.gate._acl_cache.clear()
         # pub artifact without ACL; private artifact with ACL (owner + bob's group); ACL for it
         OBJECTS["pub/free/index.html"] = b"<h1>free</h1>"
@@ -519,6 +554,109 @@ class E2ETest(unittest.TestCase):
             self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "approve")
             self.assertIn("grace@example.com",
                           json.loads(OBJECTS["u/secret/.acl.json"])["users"])
+
+    # -- the approval's ACL write: conditional (If-Match), keeps the ttl tag, never a false
+    #    "approved" -------------------------------------------------------------------
+    def record_notifications(self):
+        sent = []
+
+        class Recorder:
+            def send(self, email, text):
+                sent.append((email, text))
+                return True, "ok"
+        patch = mock.patch.object(self.gate, "NOTIFIER", Recorder())
+        patch.start()
+        self.addCleanup(patch.stop)
+        return sent
+
+    @staticmethod
+    def other_writer_adds(user):
+        def write():                          # runs under OBJECTS_LOCK: a plain overwrite
+            acl = json.loads(OBJECTS["u/secret/.acl.json"])
+            acl["users"].append(user)
+            OBJECTS["u/secret/.acl.json"] = json.dumps(acl).encode()
+        return write
+
+    def _approve(self, requester):
+        rid = self._pending_request(requester)
+        token = self.gate.make_action_token(rid, "approve", self.gate._KEY, int(time.time()))
+        return rid, token
+
+    def test_approval_race_first_put_412_retry_keeps_both_writers(self):
+        sent = self.record_notifications()
+        rid, token = self._approve("ivan@example.com")
+        with OBJECTS_LOCK:
+            AFTER_GET["u/secret/.acl.json"] = [self.other_writer_adds("other@example.com")]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        acl_puts = [(st_, bool(im)) for k, im, _t, st_ in PUTS if k == "u/secret/.acl.json"]
+        self.assertEqual(acl_puts, [(412, True), (200, True)])     # conditional both times
+        acl = json.loads(OBJECTS["u/secret/.acl.json"])
+        self.assertEqual(acl["users"], ["alice@example.com", "other@example.com", "ivan@example.com"])
+        self.assertEqual((acl["owner"], acl["groups"]),
+                         ("owner@example.com", ["11111111-2222-4333-8444-555555555555"]))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("approved", sent[0][1])
+
+    def test_approval_that_loses_twice_is_never_reported_approved(self):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        rid, token = self._approve("judy@example.com")
+        with OBJECTS_LOCK:
+            AFTER_GET["u/secret/.acl.json"] = [self.other_writer_adds("o1@example.com"),
+                                               self.other_writer_adds("o2@example.com")]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503)
+        self.assertIn("Access not granted", page)
+        self.assertNotIn("Request approved", page)
+        self.assertEqual(sent, [])                                # the requester is told nothing
+        self.assertIn("ACL write failed: put HTTP 412", log.getvalue())
+        acl = json.loads(OBJECTS["u/secret/.acl.json"])           # the other writer's ACL, as written
+        self.assertEqual(acl["users"], ["alice@example.com", "o1@example.com", "o2@example.com"])
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+        # re-decidable: the same link works once the write can go through
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertIn("judy@example.com", json.loads(OBJECTS["u/secret/.acl.json"])["users"])
+        self.assertEqual(len(sent), 1)
+        self.assertIn("approved", sent[0][1])
+
+    def test_approval_without_a_readable_acl_is_never_reported_approved(self):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        rid, token = self._approve("kim@example.com")
+        with OBJECTS_LOCK:
+            del OBJECTS["u/secret/.acl.json"]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503)
+        self.assertIn("Access not granted", page)
+        self.assertEqual(sent, [])
+        self.assertIn("ACL write failed: acl unreadable: missing", log.getvalue())
+        self.assertNotIn("u/secret/.acl.json", OBJECTS)            # never created
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+
+    def test_approval_keeps_the_acl_ttl_tag(self):
+        with OBJECTS_LOCK:
+            TAGS["u/secret/.acl.json"] = {"ttl": "7"}
+        rid, token = self._approve("lena@example.com")
+        st, _, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200)
+        self.assertIn("lena@example.com", json.loads(OBJECTS["u/secret/.acl.json"])["users"])
+        self.assertEqual(TAGS.get("u/secret/.acl.json"), {"ttl": "7"})
+        self.assertEqual([t for k, _im, t, _st in PUTS if k == "u/secret/.acl.json"], ["ttl=7"])
+
+    def test_deny_message_unchanged(self):
+        sent = self.record_notifications()
+        rid = self._pending_request("mike@example.com")
+        token = self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time()))
+        st, page, _ = self._post_action("deny", token)
+        self.assertEqual(st, 200)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("denied", sent[0][1])
+        self.assertNotIn("approved", sent[0][1])
+        self.assertEqual([k for k, *_x in PUTS if k.endswith(".acl.json")], [])
 
     def test_request_access_missing_artifact_uniform_response_no_state(self):
         USERS["frank"] = ("frank@example.com", "aaaa")

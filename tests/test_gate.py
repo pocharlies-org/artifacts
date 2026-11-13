@@ -6,6 +6,7 @@ CSRF, rate limit, request store, ACL write. Run:
 """
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 
 # gate.py reads env at import time (required vars); give it inert values first.
 os.environ.setdefault("MINIO_ACCESS_KEY", "test-ak")
@@ -91,10 +93,23 @@ class FakeStore:
 
 
 class FakeMinio:
-    def __init__(self, objects=None):
+    """In-memory store with S3 write semantics: an ETag per object version, a conditional PUT
+    (If-Match) answers 412 when the object is not that version, and a PUT replaces the tag set
+    (no x-amz-tagging: the object is left untagged)."""
+
+    def __init__(self, objects=None, tags=None):
         self.objects = dict(objects or {})   # key -> bytes
+        self.tags = {k: dict(v) for k, v in (tags or {}).items()}   # key -> {tag: value}
         self.puts = []
         self.gets = []
+        self.put_calls = []                  # (key, if_match, tagging, status)
+
+    @staticmethod
+    def etag_of(body):
+        return '"%s"' % hashlib.md5(body).hexdigest()
+
+    def etag(self, key):
+        return self.etag_of(self.objects[key])
 
     def get(self, key):
         self.gets.append(key)
@@ -102,12 +117,26 @@ class FakeMinio:
             return 200, self.objects[key]
         return 404, b""
 
+    def get_with_etag(self, key):
+        status, body = self.get(key)       # the ETag of the version this read returned
+        return status, body, (self.etag_of(body) if status == 200 else None)
+
+    def get_tags_checked(self, key):
+        if key not in self.objects:
+            return None, "HTTP 404"
+        return dict(self.tags.get(key, {})), None
+
     def head(self, key):
         return 200 if key in self.objects else 404
 
-    def put(self, key, data, ctype=None):
+    def put(self, key, data, ctype=None, if_match=None, tagging=None):
+        if if_match is not None and (key not in self.objects or self.etag(key) != if_match):
+            self.put_calls.append((key, if_match, tagging, 412))
+            return 412
         self.objects[key] = data
+        self.tags[key] = dict(urllib.parse.parse_qsl(tagging)) if tagging else {}
         self.puts.append(key)
+        self.put_calls.append((key, if_match, tagging, 200))
         return 200
 
 
@@ -362,6 +391,188 @@ class GrantAccessTest(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class ConditionalGrantTest(unittest.TestCase):
+    """grant_access is a conditional read-modify-write: read with the ETag, PUT with If-Match
+    under _grant_lock, one retry on 412, a second 412 gives up; owner, unknown fields and the
+    ACL's tags (ttl) are kept."""
+
+    ACL = {"owner": "own@x.com", "users": ["a@x.com"], "groups": ["g1"],
+           "expires": "2030-01-01", "x-note": {"kept": True}}
+    KEY = "u/r/.acl.json"
+    PATH = "/artifacts/u/r/sub/report.html"
+
+    class RacingMinio(FakeMinio):
+        """Another writer changes the ACL right after each of the gate's next reads of it,
+        i.e. between the gate's GET and its PUT."""
+
+        def __init__(self, *a, writers=(), **kw):
+            super().__init__(*a, **kw)
+            self.writers = list(writers)
+
+        def get(self, key):
+            out = super().get(key)
+            if key.endswith(".acl.json") and self.writers:
+                self.writers.pop(0)(self)
+            return out
+
+    @staticmethod
+    def other_writer_adds(user):
+        def write(m):
+            acl = json.loads(m.objects["u/r/.acl.json"])
+            acl["users"].append(user)
+            m.objects["u/r/.acl.json"] = json.dumps(acl).encode()   # plain PUT: a new version
+        return write
+
+    def setUp(self):
+        gate._acl_cache.clear()
+        self.addCleanup(gate._acl_cache.clear)
+
+    def test_read_returns_acl_and_etag(self):
+        m = FakeMinio({self.KEY: json.dumps(self.ACL).encode()})
+        acl, etag, err = gate.read_acl_for_write(m, self.KEY)
+        self.assertEqual((acl, etag, err), (self.ACL, m.etag(self.KEY), None))
+        self.assertEqual(gate.read_acl_for_write(FakeMinio(), self.KEY), (None, None, "missing"))
+        bad = FakeMinio({self.KEY: b"{not json"})
+        self.assertEqual(gate.read_acl_for_write(bad, self.KEY)[2], "malformed JSON")
+
+    def test_put_carries_if_match_of_the_read(self):
+        m = FakeMinio({self.KEY: json.dumps(self.ACL).encode()})
+        etag = m.etag(self.KEY)
+        self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"), (True, "added"))
+        self.assertEqual([(k, im, st) for k, im, _t, st in m.put_calls], [(self.KEY, etag, 200)])
+
+    def test_owner_and_unknown_fields_are_kept(self):
+        m = FakeMinio({self.KEY: json.dumps(self.ACL).encode()})
+        gate.grant_access(m, self.PATH, "new@x.com")
+        saved = json.loads(m.objects[self.KEY])
+        self.assertEqual(saved, dict(self.ACL, users=["a@x.com", "new@x.com"]))
+
+    def test_race_first_put_412_then_retry_keeps_both_writers(self):
+        m = self.RacingMinio({self.KEY: json.dumps(self.ACL).encode()},
+                             writers=[self.other_writer_adds("other@x.com")])
+        self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"), (True, "added"))
+        self.assertEqual([st for *_x, st in m.put_calls], [412, 200])
+        saved = json.loads(m.objects[self.KEY])
+        self.assertEqual(saved["users"], ["a@x.com", "other@x.com", "new@x.com"])
+        self.assertEqual(saved["owner"], "own@x.com")
+
+    def test_two_412_give_up_and_leave_the_other_writers_acl_untouched(self):
+        m = self.RacingMinio({self.KEY: json.dumps(self.ACL).encode()},
+                             writers=[self.other_writer_adds("o1@x.com"),
+                                      self.other_writer_adds("o2@x.com")])
+        self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"), (False, "put HTTP 412"))
+        self.assertEqual([st for *_x, st in m.put_calls], [412, 412])
+        self.assertEqual(json.loads(m.objects[self.KEY])["users"], ["a@x.com", "o1@x.com", "o2@x.com"])
+        self.assertEqual(m.puts, [])
+
+    def test_ttl_tag_is_sent_with_the_write(self):
+        m = FakeMinio({self.KEY: json.dumps(self.ACL).encode()}, tags={self.KEY: {"ttl": "7"}})
+        self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"), (True, "added"))
+        self.assertEqual([t for _k, _im, t, _st in m.put_calls], ["ttl=7"])
+        self.assertEqual(m.tags[self.KEY], {"ttl": "7"})
+        # an untagged ACL stays untagged (no header at all)
+        m = FakeMinio({self.KEY: json.dumps(self.ACL).encode()})
+        gate.grant_access(m, self.PATH, "new@x.com")
+        self.assertEqual([t for _k, _im, t, _st in m.put_calls], [None])
+
+    def test_unreadable_tags_fail_closed(self):
+        class NoTags(FakeMinio):
+            def get_tags_checked(self, key):
+                return None, "HTTP 403"
+        m = NoTags({self.KEY: json.dumps(self.ACL).encode()}, tags={self.KEY: {"ttl": "7"}})
+        self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"),
+                         (False, "acl tags unreadable: HTTP 403"))
+        self.assertEqual(m.put_calls, [])
+
+    def test_no_etag_means_no_write(self):
+        class NoEtag(FakeMinio):
+            def get_with_etag(self, key):
+                status, body, _ = super().get_with_etag(key)
+                return status, body, None
+        m = NoEtag({self.KEY: json.dumps(self.ACL).encode()})
+        self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"),
+                         (False, "acl unreadable: no ETag"))
+        self.assertEqual(m.put_calls, [])
+
+    def test_other_write_errors_are_not_retried(self):
+        class Refused(FakeMinio):
+            def put(self, key, data, ctype=None, if_match=None, tagging=None):
+                self.put_calls.append((key, if_match, tagging, 403))
+                return 403
+        m = Refused({self.KEY: json.dumps(self.ACL).encode()})
+        self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"), (False, "put HTTP 403"))
+        self.assertEqual(len(m.put_calls), 1)
+
+    def test_already_listed_writes_nothing(self):
+        m = FakeMinio({self.KEY: json.dumps(self.ACL).encode()})
+        self.assertEqual(gate.grant_access(m, self.PATH, "A@X.com"), (True, "already listed"))
+        self.assertEqual(m.put_calls, [])
+
+
+class MinioClientWriteTest(unittest.TestCase):
+    """The client half of the conditional write: _call returns the response headers (the GET's
+    ETag), and put() sends If-Match and x-amz-tagging as SigV4-signed headers."""
+
+    def _client_with(self, status=200, body=b"", headers=None):
+        seen = {}
+
+        class Resp:
+            def __init__(self):
+                self.status, self.headers = status, headers or {}
+
+            def read(self):
+                return body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=10):
+            seen["req"] = req
+            return Resp()
+
+        from unittest import mock
+        patch = mock.patch.object(gate.urllib.request, "urlopen", fake_urlopen)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return gate.MinioClient("http://minio:9000", "AK", "SK", "artifacts"), seen
+
+    def test_call_returns_response_headers_and_get_with_etag(self):
+        c, _ = self._client_with(200, b"{}", {"ETag": '"abc"', "Content-Length": "2"})
+        self.assertEqual(c._call("GET", "u/r/.acl.json"),
+                         (200, b"{}", {"etag": '"abc"', "content-length": "2"}))
+        self.assertEqual(c.get_with_etag("u/r/.acl.json"), (200, b"{}", '"abc"'))
+        self.assertEqual(c.get("u/r/.acl.json"), (200, b"{}"))
+
+    def test_put_signs_if_match_and_tagging(self):
+        c, seen = self._client_with(200)
+        self.assertEqual(c.put("u/r/.acl.json", b"{}", "application/json",
+                               if_match='"abc"', tagging="ttl=7"), 200)
+        req = seen["req"]
+        sent = {k.lower(): v for k, v in req.header_items()}
+        self.assertEqual((sent["if-match"], sent["x-amz-tagging"]), ('"abc"', "ttl=7"))
+        self.assertIn("SignedHeaders=content-type;host;if-match;x-amz-content-sha256;"
+                      "x-amz-date;x-amz-tagging,", sent["authorization"])
+        want = gate.sigv4_headers("PUT", "minio:9000", "/artifacts/u/r/.acl.json", [],
+                                  {"content-type": "application/json", "if-match": '"abc"',
+                                   "x-amz-tagging": "ttl=7"}, b"{}", "AK", "SK",
+                                  amzdate=sent["x-amz-date"])
+        self.assertEqual(sent["authorization"], want["Authorization"])
+
+    def test_plain_put_has_neither_header(self):
+        c, seen = self._client_with(200)
+        c.put("_gate/req/x.json", b"{}", "application/json")
+        sent = {k.lower() for k, _ in seen["req"].header_items()}
+        self.assertFalse({"if-match", "x-amz-tagging"} & sent, sent)
+
+    def test_tags_checked_fails_closed_where_get_tags_is_best_effort(self):
+        c, _ = self._client_with(403, b"<Error/>")
+        self.assertEqual(c.get_tags_checked("u/r/.acl.json"), (None, "HTTP 403"))
+        self.assertEqual(c.get_tags("u/r/.acl.json"), {})
+
+
 class SigV4Test(unittest.TestCase):
     def test_structure_and_determinism(self):
         h1 = gate.sigv4_headers("GET", "minio:9000", "/artifacts/pub/a b.txt",
@@ -400,6 +611,7 @@ class SigV4Test(unittest.TestCase):
 
         class Resp:
             status = 200
+            headers = {}
 
             def read(self):
                 return (b"<Tagging><TagSet><Tag><Key>ttl</Key><Value>7</Value></Tag>"
@@ -643,9 +855,9 @@ class GrantLockTest(unittest.TestCase):
         class SlowMinio(FakeMinio):
             # widen the read-modify-write window: without the per-key lock the two threads
             # would interleave get->put and one grant would be lost
-            def put(self, key, data, ctype=None):
+            def put(self, key, data, *args, **kwargs):
                 time.sleep(0.05)
-                return super().put(key, data, ctype)
+                return super().put(key, data, *args, **kwargs)
 
         m = SlowMinio({"u/x/.acl.json": json.dumps(acl).encode()})
         results = []
@@ -1042,7 +1254,9 @@ class AclRootTest(unittest.TestCase):
             self.assertEqual(m.puts, ["elsewhere/.acl.json"])     # the write follows the helper
             self.assertIn("elsewhere/.acl.json", gate._grant_locks)
             self.assertEqual(gate.decide("own@x.com", [], "anything", acl, NOW), (True, "owner"))
-        self.assertEqual(calls, ["u/r/a.js", "u/r/a/b.js", "u/r/a/b.js", "anything"])
+        # read_acl, grant_access (which reads and writes the key it derived), decide()
+        self.assertEqual(calls, ["u/r/a.js", "u/r/a/b.js", "anything"])
+        self.assertEqual(m.gets, ["elsewhere/.acl.json", "elsewhere/.acl.json"])
         with mock.patch.object(gate, "acl_key_for", lambda key, pub_prefixes=None: None):
             self.assertEqual(gate.decide("own@x.com", [], "u/r/a.js", acl, NOW),
                              (False, "no-artifact-root: deny"))
