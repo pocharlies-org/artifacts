@@ -44,10 +44,21 @@ artifactsGate:
   anonymousPubEnabled: false
 
 gate:
-  # The gate code itself is mounted from ConfigMap <sso>/artifact-gate-code, recreated
-  # from gate/gate.py on every deploy, e.g.:
-  #   kubectl -n sso create configmap artifact-gate-code --from-file=gate/gate.py \
-  #     --dry-run=client -o yaml | kubectl apply -f -
+  # How the gate code reaches the pod. Both modes run the same file as /app/gate.py.
+  #   bakedImage: false (default) — the stock Python image below (gate.image) with the code
+  #     mounted from ConfigMap <sso>/artifact-gate-code, which you recreate from gate/gate.py
+  #     on every deploy, e.g.:
+  #       kubectl -n sso create configmap artifact-gate-code --from-file=gate/gate.py \
+  #         --dry-run=client -o yaml | kubectl apply -f -
+  #   bakedImage: true — the gate image built from gate/Dockerfile (published by
+  #     .github/workflows/publish.yml, see README "Gate image") with the code inside: no
+  #     ConfigMap, no code volume, no mount. The image is referenced by digest only, as
+  #     <bakedImageRepository>@<bakedImageDigest>; a tag is never used. Point
+  #     bakedImageRepository at your own mirror if you copy the image.
+  bakedImage: false
+  bakedImageRepository: ghcr.io/pocharlies-org/artifacts-gate
+  bakedImageDigest: ""   # sha256:<64 hex>; required when bakedImage is true
+  # Base image of the ConfigMap mode (ignored when bakedImage is true).
   image: python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
   # forwardAuth decision listener: the gate serves /_gate/auth and /_gate/plugin/authz
   # ONLY on this port, which no public route points at. The public surface stays on 8080.

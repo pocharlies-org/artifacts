@@ -1,0 +1,87 @@
+name: publish
+# Publishes the gate image for every commit that lands on main, and nothing else:
+#   ghcr.io/<owner>/artifacts-gate:<40-hex commit>   (linux/amd64, gate/Dockerfile)
+# plus a signed SLSA build provenance attestation that binds the image digest to this workflow,
+# refs/heads/main and the commit. Reference the image by digest, never by tag; verify it with
+# (README, "Gate image"):
+#   gh attestation verify oci://ghcr.io/pocharlies-org/artifacts-gate@sha256:<digest> \
+#     -R pocharlies-org/artifacts \
+#     --signer-workflow pocharlies-org/artifacts/.github/workflows/publish.yml \
+#     --source-ref refs/heads/main --source-digest <40-hex commit> --deny-self-hosted-runners
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  gate-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write       # push the image and its attestation to GHCR (GITHUB_TOKEN)
+      id-token: write       # OIDC token for the Sigstore signing certificate
+      attestations: write   # store the attestation
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: image name
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/artifacts-gate" >> "$GITHUB_OUTPUT"
+      - name: build gate image (linux/amd64)
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+        run: |
+          docker build --platform linux/amd64 --provenance=false --sbom=false \
+            --build-arg REVISION="$GITHUB_SHA" \
+            --build-arg SOURCE="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            -f gate/Dockerfile -t "$IMAGE:$GITHUB_SHA" .
+      - name: smoke test the image
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+        run: tests/gate_image_smoke.sh "$IMAGE:$GITHUB_SHA" "$GITHUB_SHA"
+      - name: push to GHCR
+        id: push
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$GITHUB_SHA"
+          # The digest as the registry serves it (content address of the pushed manifest).
+          digest="$(docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" --format '{{json .Manifest}}' | jq -r .digest)"
+          raw="sha256:$(docker buildx imagetools inspect --raw "$IMAGE:$GITHUB_SHA" | sha256sum | cut -d' ' -f1)"
+          if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ || "$digest" != "$raw" ]]; then
+            echo "unexpected digest: '$digest' (raw manifest: '$raw')"; exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.name.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false   # would need artifact-metadata: write, not granted here
+      - name: summary
+        env:
+          IMAGE: ${{ steps.name.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### artifacts-gate"
+            echo
+            echo "- image: \`$IMAGE@$DIGEST\`"
+            echo "- tag: \`$IMAGE:$GITHUB_SHA\` (informational; reference the digest)"
+            echo "- commit: \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$IMAGE@$DIGEST"
+      - name: docker logout
+        if: always()
+        run: docker logout ghcr.io || true

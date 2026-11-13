@@ -126,9 +126,13 @@ Prerequisites and what the chart does:
 - An oauth2-proxy secret (`OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, `COOKIE_SECRET`) in
   the `.Values.secretName` secret, and MinIO root credentials in
   `.Values.bootstrap.adminSecretName`.
-- The gate code ships as a ConfigMap: create it from this repo
-  (`kubectl -n sso create configmap artifact-gate-code --from-file=gate/gate.py
-  --dry-run=client -o yaml | kubectl apply -f -`), same cadence as the chart.
+- The gate code ships in one of two ways (`gate.bakedImage`):
+  - **ConfigMap** (default): a stock Python image plus the code mounted from a ConfigMap
+    you create from this repo (`kubectl -n sso create configmap artifact-gate-code
+    --from-file=gate/gate.py --dry-run=client -o yaml | kubectl apply -f -`), same cadence
+    as the chart.
+  - **Gate image** (`--set gate.bakedImage=true --set gate.bakedImageDigest=sha256:…`): the
+    code is inside the image, referenced by digest; no ConfigMap. See [Gate image](#gate-image).
 - The bootstrap Job (helm hook) creates the bucket, the ILM rules, the anonymous `pub/`
   policy, and the least-privilege S3 users: `artifact-gate` (GetObject + GetObjectTagging
   on `artifacts/*`, PutObject only on `*/.acl.json` and `_gate/*`; ACL/state work),
@@ -141,6 +145,73 @@ Prerequisites and what the chart does:
   `secret-key`, two **different** users; optional `artifact-gate-slack`) are created out of
   band — nothing secret goes through git. The S3 ones are needed in the gate's namespace
   (`namespaces.sso`) and in the bootstrap Job's (`minio.namespace`).
+
+## Gate image
+
+`gate/Dockerfile` puts `gate/gate.py` on a digest-pinned `python:3.12-slim` and nothing else:
+stdlib only (no pip install, no added package, no tests; pending Debian updates are applied at
+build time, so re-running the publish job at the same commit picks up new base fixes), code at
+`/app/gate.py` (the same path and command as
+the ConfigMap mode), numeric non-root user `1000:1000`, `PYTHONDONTWRITEBYTECODE=1`, and no
+file written at runtime, so it runs with a read-only root filesystem. It carries the labels
+`org.opencontainers.image.source` and `org.opencontainers.image.revision` (the commit).
+
+Every commit on `main` is published by `.github/workflows/publish.yml` (and only there:
+branches and pull requests build and smoke-test the image in CI, never push it) as
+`ghcr.io/pocharlies-org/artifacts-gate:<40-hex commit>` for `linux/amd64`, with a signed
+build provenance attestation. The tag is only for finding the image; deploy and verify the
+**digest**:
+
+```bash
+sha=<40-hex commit on main>
+digest=$(docker buildx imagetools inspect "ghcr.io/pocharlies-org/artifacts-gate:$sha" \
+           --format '{{json .Manifest}}' | jq -r .digest)        # or: crane digest <image>:<sha>
+gh attestation verify "oci://ghcr.io/pocharlies-org/artifacts-gate@$digest" \
+  -R pocharlies-org/artifacts \
+  --signer-workflow pocharlies-org/artifacts/.github/workflows/publish.yml \
+  --source-ref refs/heads/main --source-digest "$sha" --deny-self-hosted-runners
+```
+
+`--source-digest` binds the attestation to that commit; without it any commit built by the
+workflow would pass.
+
+**Helm**: no ConfigMap to create. If you copy the image into your own registry, copy it by
+digest and point `gate.bakedImageRepository` at the copy (the digest stays the same).
+
+```bash
+helm upgrade --install artifacts ./helm/artifacts --namespace sso \
+  --set gate.bakedImage=true --set gate.bakedImageDigest="$digest"     # plus your other values
+# copied into your own registry? add: --set gate.bakedImageRepository=registry.example.com/mirror/artifacts-gate
+```
+
+The chart renders `<gate.bakedImageRepository>@<gate.bakedImageDigest>` and refuses a missing
+or malformed digest, a repository with a tag, and a non-boolean `gate.bakedImage`.
+
+**Docker** (same settings as the [gate configuration](#gate-gategatepy); the HMAC key file
+must be readable by uid 1000):
+
+```bash
+docker run --rm --read-only --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges \
+  -p 127.0.0.1:8080:8080 -p 127.0.0.1:8081:8081 \
+  -e MINIO_ENDPOINT=http://minio:9000 \
+  -e MINIO_ACCESS_KEY=… -e MINIO_SECRET_KEY=… \
+  -e GATE_READ_ACCESS_KEY=… -e GATE_READ_SECRET_KEY=… \
+  -e OAUTH2_AUTH_URL=http://oauth2-proxy:4180/oauth2/auth \
+  -v "$PWD/hmac-key:/secrets/hmac-key:ro" \
+  "ghcr.io/pocharlies-org/artifacts-gate@$digest"
+curl -s http://127.0.0.1:8080/_gate/healthz        # ok
+```
+
+**Build and check it yourself** (from the repository root; the root `.dockerignore` lets only
+`gate/gate.py` into the build context):
+
+```bash
+docker build -f gate/Dockerfile --build-arg REVISION="$(git rev-parse HEAD)" -t artifacts-gate:dev .
+tests/gate_image_smoke.sh artifacts-gate:dev "$(git rev-parse HEAD)"
+```
+
+The compose stack keeps the stock Python image with `gate/gate.py` mounted, so edits to the
+gate show up without a rebuild.
 
 ## Publishing
 
@@ -210,7 +281,10 @@ Everything is environment-driven; nothing is hardcoded.
 (must be `true` only for real public hosts), `artifactsGate.anonymousPubEnabled`
 (chart refuses `true` together with `publicExposure`), `minio.*`, `gate.*`,
 `bootstrap.*`, and `plugins: []` — see `docs/plugins.md`. `gate.s3SecretName` /
-`gate.readS3SecretName` name the gate user and the read-signing user secrets. Plugin
+`gate.readS3SecretName` name the gate user and the read-signing user secrets.
+`gate.bakedImage` (default `false`) switches from the ConfigMap mode (`gate.image` + ConfigMap
+`artifact-gate-code`) to the gate image `gate.bakedImageRepository@gate.bakedImageDigest`
+(see [Gate image](#gate-image)). Plugin
 names must be DNS-1123 labels (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`): the chart refuses
 anything else.
 
@@ -247,6 +321,8 @@ python3 -I -m unittest discover -s tests              # unit (gate + mcp lib)
 python3 -I -m unittest discover -s tests -p 'e2e_*.py' # e2e vs fake MinIO + fake proxy
 helm lint helm/artifacts && helm template t helm/artifacts -f helm/artifacts/values.yaml
 helm template t helm/artifacts -f helm/artifacts/values.yaml | python3 -I tests/check_oauth2_routes.py
+python3 -I tests/check_gate_modes.py                   # chart: ConfigMap mode vs gate image mode
+docker build -f gate/Dockerfile -t artifacts-gate:dev . && tests/gate_image_smoke.sh artifacts-gate:dev
 cd deploy/compose && docker compose up -d && docker compose up bootstrap && ./e2e.sh  # full stack (Docker required)
 ```
 
@@ -254,12 +330,14 @@ cd deploy/compose && docker compose up -d && docker compose up bootstrap && ./e2
 
 ```
 gate/gate.py          the gate (single stdlib-only file, two listeners)
+gate/Dockerfile       the gate image (digest-pinned base, non-root, read-only root filesystem)
 helm/artifacts/       chart: gate + oauth2-proxy + routes + plugin routes + bootstrap Job
 cli/                  publisher (publish.sh + render.py)
 mcp/                  MCP server (server.py + artifacts_lib.py)
 deploy/compose/       local dev stack (MinIO + Dex + oauth2-proxy + gate + Caddy) + e2e.sh
 tests/                unit + e2e suites
 docs/plugins.md       the plugin contract
+.github/workflows/    ci.yml (tests, chart checks, image smoke test), publish.yml (gate image, main only)
 ```
 
 ## License
