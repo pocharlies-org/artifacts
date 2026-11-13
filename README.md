@@ -417,7 +417,11 @@ their real types).
   `/_gate/approve`, `/_gate/deny`, `/_gate/plugin/authz`) read a body, and only with a
   `Content-Length` of at most 16 KiB. A chunked body (`411`), a larger one (`413`), a missing
   or invalid length, and a body on any other request are refused without being read, and the
-  connection is closed. A client that stops sending is cut off after 30 s.
+  connection is closed. Slow clients are cut off by total deadlines, not per-read timeouts,
+  so sending one byte at a time extends neither: a request line and its headers must
+  arrive within 30 s (on a kept-alive connection counted from the previous answer, so an
+  idle connection is also closed after 30 s; closed without an answer), and a POST body
+  within 10 s of its headers (`408`, then the connection is closed).
 - **Gate pages and logs**: the gate's own pages send `frame-ancestors 'none'` and
   `X-Frame-Options: DENY` (they cannot be framed) and no Python version in `Server`. The access
   log carries paths without query strings, so approve/deny tokens never reach a log line, and

@@ -101,6 +101,7 @@ import hashlib
 import hmac
 import html
 import http.client
+import io
 import json
 import logging
 import os
@@ -1121,16 +1122,82 @@ _LINGER_MAX = 64 * 1024
 _LINGER_SECONDS = 2
 # Approve/deny tokens never reach a log line (the request line of /_gate/approve?token=...).
 _TOKEN_IN_LOG_RE = re.compile(r"(token=)[^&\s\"']+")
+# Total deadlines, not per-read timeouts: a client that sends one byte at a time still holds a
+# thread (one per connection) for at most this long.
+#   REQUEST_HEAD_SECONDS: from the start of a request (on a kept-alive connection, from the end
+#     of the previous answer: the idle wait counts) to the end of its headers. Missed: the
+#     connection is closed without an answer, as for an idle connection.
+#   POST_BODY_SECONDS: from the end of the headers to the end of the body (at most
+#     POST_BODY_MAX bytes). Missed: 408 and the connection is closed.
+REQUEST_HEAD_SECONDS = 30
+POST_BODY_SECONDS = 10
+
+
+class _DeadlineReader(io.RawIOBase):
+    """The raw reads of one connection (GateHandler.rfile reads through it), each bounded by
+    the socket timeout and, while `deadline` (a time.monotonic() value) is set, by that
+    deadline too. A read at or after the deadline raises socket.timeout, which
+    BaseHTTPRequestHandler answers by closing the connection. A connection reset by the
+    client reads as its end (no traceback for a client that went away)."""
+
+    def __init__(self, sock, timeout):
+        super().__init__()
+        self._sock, self._timeout = sock, timeout
+        self.deadline = None
+
+    def readable(self):
+        return True
+
+    def readinto(self, buf):
+        if self.deadline is None:
+            return self._recv_into(buf)
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise socket.timeout("read deadline passed")     # = TimeoutError since 3.10
+        self._sock.settimeout(left if self._timeout is None else min(left, self._timeout))
+        try:
+            return self._recv_into(buf)
+        finally:
+            self._sock.settimeout(self._timeout)      # writes and later reads: the usual timeout
+
+    def _recv_into(self, buf):
+        try:
+            return self._sock.recv_into(buf)
+        except ConnectionResetError:
+            return 0
 
 
 class GateHandler(BaseHTTPRequestHandler):
     server_version = "artifact-gate/1.0"
     protocol_version = "HTTP/1.1"
-    # Socket timeout for every read and write of a connection (request line, headers, body,
-    # idle keep-alive): a client that stops sending holds a thread for at most this long.
+    # Socket timeout of every single read and write; the request line and headers, and a POST
+    # body, have total deadlines on top (REQUEST_HEAD_SECONDS, POST_BODY_SECONDS).
     timeout = 30
 
     # -- plumbing ------------------------------------------------------------------
+    def setup(self):
+        super().setup()
+        # every read of the request goes through the deadline reader (same buffering as the
+        # stock socket file it replaces)
+        stock, self._reader = self.rfile, _DeadlineReader(self.connection, self.timeout)
+        self.rfile = io.BufferedReader(self._reader)
+        stock.close()
+
+    def handle_one_request(self):
+        # the request line and headers (and the idle wait before them) must arrive in time:
+        # a miss raises socket.timeout in the read, and the connection is closed
+        self._reader.deadline = time.monotonic() + REQUEST_HEAD_SECONDS
+        try:
+            super().handle_one_request()
+        finally:
+            self._reader.deadline = None
+
+    def parse_request(self):
+        try:
+            return super().parse_request()      # reads the headers
+        finally:
+            self._reader.deadline = None        # the head is in: no deadline for the handler
+
     def version_string(self):
         return self.server_version          # no Python version in the Server header
 
@@ -1217,8 +1284,9 @@ class GateHandler(BaseHTTPRequestHandler):
 
     def _read_post_body(self, as_json=False):
         """The body of a POST endpoint, or None after a refusal (connection closed). Requires one
-        valid Content-Length of at most POST_BODY_MAX; reads exactly that many bytes (bounded by
-        the socket timeout). Keeps keep-alive in sync: an accepted body is read in full."""
+        valid Content-Length of at most POST_BODY_MAX; reads exactly that many bytes within
+        POST_BODY_SECONDS in total (a miss: 408). Keeps keep-alive in sync: an accepted body is
+        read in full."""
         kind, n = self._body_framing()
         if kind in ("transfer-encoding", "none"):
             return self._refuse(411, "Send the body with a Content-Length "
@@ -1227,7 +1295,14 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._refuse(400, "Invalid Content-Length.", as_json)
         if n > POST_BODY_MAX:
             return self._refuse(413, f"Request body larger than {POST_BODY_MAX} bytes.", as_json)
-        data = self.rfile.read(n) if n else b""
+        self._reader.deadline = time.monotonic() + POST_BODY_SECONDS
+        try:
+            data = self.rfile.read(n) if n else b""
+        except socket.timeout:
+            return self._refuse(408, f"The request body did not arrive within "
+                                     f"{POST_BODY_SECONDS} s.", as_json)
+        finally:
+            self._reader.deadline = None
         if len(data) != n:
             return self._refuse(400, "Request body shorter than its Content-Length.", as_json)
         return data

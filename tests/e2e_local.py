@@ -1744,7 +1744,8 @@ class E2ETest(unittest.TestCase):
         self.assertEqual((st, h.get("connection")), (405, None))   # no body: keep-alive
 
     def test_stalled_body_times_out(self):
-        # a client that stops sending holds the connection for GateHandler.timeout at most
+        # a client that stops sending holds the connection for GateHandler.timeout at most:
+        # then the body is late, so 408 and the connection is closed
         self.assertEqual(self.gate.GateHandler.timeout, 30)
 
         class Quick(self.gate.GateHandler):
@@ -1757,12 +1758,90 @@ class E2ETest(unittest.TestCase):
         self.addCleanup(sock.close)
         sock.sendall(b"POST /_gate/request HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\ncsrf=")
         t0 = time.monotonic()
+        got = b""
         try:
-            got = sock.recv(1024)
+            while True:
+                piece = sock.recv(4096)
+                if not piece:
+                    break
+                got += piece
         except socket.timeout:
-            got = None
-        self.assertEqual(got, b"", "the gate kept waiting for the rest of the body")
+            self.fail("the gate kept waiting for the rest of the body")
+        self.assertTrue(got.startswith(b"HTTP/1.1 408 "), got[:80])
+        self.assertIn(b"\r\nConnection: close\r\n", got)
         self.assertLess(time.monotonic() - t0, 4)
+
+    def _drip(self, port, head, drip, until):
+        """Send `head`, then one byte of `drip` every 0.25 s until the gate answers or closes,
+        or `until` seconds pass. (seconds to the first answer byte or the close, the bytes
+        received, whether the gate closed)."""
+        sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall(head)
+        t0 = time.monotonic()
+        got, closed, i, answered = b"", False, 0, None
+        while time.monotonic() - t0 < until:
+            try:
+                sock.sendall(drip[i % len(drip):i % len(drip) + 1])
+                i += 1
+            except OSError:
+                closed = True
+                break
+            sock.settimeout(0.25)
+            try:
+                piece = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                closed = True
+                break
+            if answered is None:
+                answered = time.monotonic() - t0
+            if not piece:
+                closed = True
+                break
+            got += piece
+        return (answered if answered is not None else time.monotonic() - t0), got, closed
+
+    def test_dripped_body_is_cut_at_the_deadline(self):
+        # one body byte every 0.25 s never trips the 30 s read timeout; the total body
+        # deadline (POST_BODY_SECONDS, 1.5 s here) does: 408, then the connection closes
+        for port, path in ((self.port_of(self.gate_public), "/_gate/request"),
+                           (self.port_of(self.gate_auth), "/_gate/plugin/authz")):
+            with mock.patch.object(self.gate, "POST_BODY_SECONDS", 1.5, create=True):
+                took, got, closed = self._drip(
+                    port, f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 16384\r\n\r\n".encode(),
+                    b"artifact=x&", until=8)
+            self.assertTrue(got.startswith(b"HTTP/1.1 408 "), (path, got[:80]))
+            self.assertTrue(closed, path)
+            self.assertLess(took, 1.5 + 1.5, path)            # the deadline plus a margin
+        self.assertEqual(self.gate.POST_BODY_SECONDS, 10)
+        self.assertEqual(self.gate.GateHandler.timeout, 30)
+
+    def test_dripped_request_head_is_cut_at_the_deadline(self):
+        # a request line and headers sent one byte every 0.25 s: closed at the head deadline
+        # (REQUEST_HEAD_SECONDS, 1.5 s here) without an answer, as for an idle connection
+        head = b"GET /_gate/healthz HTTP/1.1\r\nHost: x\r\n" + b"X-Pad: " + b"a" * 200
+        with mock.patch.object(self.gate, "REQUEST_HEAD_SECONDS", 1.5, create=True):
+            took, got, closed = self._drip(self.port_of(self.gate_public), b"", head, until=8)
+            self.assertEqual((got, closed), (b"", True))
+            self.assertLess(took, 1.5 + 1.5)
+            # an idle connection: the same deadline
+            sock = socket.create_connection(("127.0.0.1", self.port_of(self.gate_public)), timeout=5)
+            self.addCleanup(sock.close)
+            t0 = time.monotonic()
+            self.assertEqual(sock.recv(10), b"")
+            self.assertLess(time.monotonic() - t0, 1.5 + 1.5)
+            # a request that arrives in time is answered, and the next one on the same
+            # connection gets its own deadline
+            conn = http_client.HTTPConnection(self.base.split("//", 1)[1], timeout=5)
+            self.addCleanup(conn.close)
+            for _ in range(2):
+                conn.request("GET", "/_gate/healthz")
+                r = conn.getresponse()
+                self.assertEqual((r.status, r.read()), (200, b"ok"))
+                time.sleep(1.0)
+        self.assertEqual(self.gate.REQUEST_HEAD_SECONDS, 30)
 
     def test_forwarded_uri_read_two_ways_is_refused(self):
         # L1: "#frag" was decided as pub/free/index.html and signed as ".../index.html#frag";

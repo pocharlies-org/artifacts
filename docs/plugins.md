@@ -118,6 +118,7 @@ Always JSON. `200` with a decision, or an error status (§ table below).
 | `405` | Any method other than POST |
 | `411` | No `Content-Length`, or any `Transfer-Encoding` (chunked): the body is not read |
 | `413` | `Content-Length` above 16384: the body is not read |
+| `408` | The body did not arrive within 10 s of the headers; the connection is closed |
 | `500` | Identity backend (oauth2-proxy) error — fail closed, deny the visitor |
 | `404` | Request hit the public listener (the endpoint is not routed there) |
 
