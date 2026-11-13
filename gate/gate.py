@@ -32,6 +32,9 @@ X-Auth-Request-* headers), then decides against the ACL at the artifact's root (
   - Groups in the ACL but no `groups` claim from Entra (overage or user with no groups): deny + log.
   - Missing artifact and "not allowed" answer with the SAME 403 page (no existence leak) and the
     request-access POST silently does nothing when the artifact does not exist or has no owner.
+  - `pub/` takes no access requests and the gate never writes a `pub/` ACL: pub/ is
+    anonymous-readable by design, so there is nothing to ask for; its deny page offers no
+    request, the request POST is refused on the path alone and grant_access refuses it.
 
 The gate also serves the request-access flow (all state in MinIO under `_gate/`, written with the
 gate's own least-privilege S3 user):
@@ -1152,6 +1155,15 @@ class GateHandler(BaseHTTPRequestHandler):
             f"<p>This address is not inside a published artifact, so there is no owner to "
             f"ask for access.</p><p class=muted>artifact-gate</p>"))
 
+    def _pub_denied_page(self, path):
+        # a pub/ key a signed-in visitor may not open (missing, or a stray ACL that does not
+        # list them): the same page either way, and no request form, since pub/ takes no
+        # access requests (the gate never writes a pub/ ACL)
+        return self._page("Access required", (
+            f"<p>You do not have access to <code>{html.escape(path, quote=True)}</code>.</p>"
+            f"<p>This is a public (<code>pub/</code>) address: access to it cannot be "
+            f"requested.</p><p class=muted>artifact-gate</p>"))
+
     def _refused_page(self):
         # the same page for every key and endpoint: it depends on the identity only
         return self._page("Access refused", "<p>This account cannot open artifacts here.</p>"
@@ -1227,6 +1239,8 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._send(404, self._page("Not found", "<p>Nothing here.</p>"))
         if acl_key_for(key) is None:
             return self._send(403, self._no_artifact_page(split_forwarded_uri(uri)[0]))
+        if key.startswith(PUB_PREFIXES):
+            return self._send(403, self._pub_denied_page(split_forwarded_uri(uri)[0]))
         # deny AND missing artifact answer identically (no existence leak)
         return self._send(403, self._deny_page(split_forwarded_uri(uri)[0]))
 
@@ -1338,6 +1352,14 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._send(400, self._page("Bad request",
                                               "<p>This address is not inside a published "
                                               "artifact.</p>"))
+        if key.startswith(PUB_PREFIXES):
+            # pub/ is anonymous-readable by design: no access to request, no owner to ask, and
+            # the gate never writes a pub/ ACL (grant_access refuses it). Refused on the path
+            # alone, before any identity call or store read.
+            LOG.warning("request-access refused path=%s (pub/ takes no access requests)", path)
+            return self._send(400, self._page("Bad request",
+                                              "<p>This is a public (<code>pub/</code>) address: "
+                                              "access to it cannot be requested.</p>"))
         email, groups, status = self._authenticate()
         if status == 401:
             return self._send(401, self._page("Session expired",
@@ -1677,7 +1699,7 @@ def grant_access(minio, artifact_path, requester):
 
     Writes only the ACL that governs the path (acl_key_for: the artifact root for u/ and g/,
     whatever the file's depth) and only when it already exists: an approval never creates an
-    ACL object. The write is a read-modify-write that cannot lose another writer's change:
+    ACL object, and never writes one under pub/ (refused before any read). The write is a read-modify-write that cannot lose another writer's change:
       - serialised per ACL key inside the process (_grant_lock);
       - conditional against every other writer: the ACL is read with its ETag and written with
         If-Match, so the store refuses it (412) if the object changed in between; then it is
@@ -1691,6 +1713,10 @@ def grant_access(minio, artifact_path, requester):
         # a path the gate would never serve (dot segments, an ACL, gate state, a listing) never
         # gets an ACL written for it, whatever root acl_key_for would derive
         return False, "bad artifact path"
+    if key.startswith(PUB_PREFIXES):
+        # pub/ takes no access requests: the gate never writes a pub/ ACL (the S3 policy of its
+        # user refuses it too), whatever ACL may exist there
+        return False, "pub/ takes no access grants"
     acl_key = acl_key_for(key)
     if acl_key is None:
         return False, "no artifact root"

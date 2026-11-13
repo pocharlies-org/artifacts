@@ -376,20 +376,32 @@ class RequestStoreTest(unittest.TestCase):
 class GrantAccessTest(unittest.TestCase):
     def test_appends_requester_once(self):
         acl = {"owner": "own@x.com", "users": ["a@x.com"]}
-        m = FakeMinio({"pub/x/.acl.json": json.dumps(acl).encode()})
-        ok, note = gate.grant_access(m, "/artifacts/pub/x/report.html", "New@X.com")
+        m = FakeMinio({"u/x/.acl.json": json.dumps(acl).encode()})
+        ok, note = gate.grant_access(m, "/artifacts/u/x/report.html", "New@X.com")
         self.assertTrue(ok, note)
-        saved = json.loads(m.objects["pub/x/.acl.json"])
+        saved = json.loads(m.objects["u/x/.acl.json"])
         self.assertEqual(saved["users"], ["a@x.com", "New@X.com"])
         # idempotent: same requester (case-insensitive) not duplicated
-        ok, _ = gate.grant_access(m, "/artifacts/pub/x/report.html", "new@x.com")
+        ok, _ = gate.grant_access(m, "/artifacts/u/x/report.html", "new@x.com")
         self.assertTrue(ok)
-        self.assertEqual(json.loads(m.objects["pub/x/.acl.json"])["users"], ["a@x.com", "New@X.com"])
+        self.assertEqual(json.loads(m.objects["u/x/.acl.json"])["users"], ["a@x.com", "New@X.com"])
 
     def test_missing_acl_refuses(self):
         m = FakeMinio()
-        ok, _ = gate.grant_access(m, "/artifacts/pub/x/report.html", "n@x.com")
+        ok, _ = gate.grant_access(m, "/artifacts/u/x/report.html", "n@x.com")
         self.assertFalse(ok)
+
+    def test_pub_takes_no_grant_whatever_acl_exists(self):
+        # pub/ is anonymous-readable by design: an approval never writes there, not even into
+        # a stray ACL at a pub root, and nothing is read first
+        acl = json.dumps({"owner": "own@x.com", "users": ["a@x.com"]}).encode()
+        m = FakeMinio({"pub/x/.acl.json": acl, "pub/.acl.json": acl})
+        for path in ("/artifacts/pub/x/report.html", "/artifacts/pub/x/a/b.css",
+                     "/artifacts/pub/flat.html"):
+            self.assertEqual(gate.grant_access(m, path, "new@x.com"),
+                             (False, "pub/ takes no access grants"), path)
+        self.assertEqual((m.gets, m.puts), ([], []))
+        self.assertEqual(m.objects["pub/x/.acl.json"], acl)
 
 
 class ConditionalGrantTest(unittest.TestCase):

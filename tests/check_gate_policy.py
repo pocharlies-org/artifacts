@@ -6,7 +6,9 @@ create it: both documents are the same, and the gate may write an ACL only at an
     python3 -I tests/check_gate_policy.py   # HELM=/path/to/helm to pick another binary
 
 The gate writes only u/<run>/.acl.json and g/<slug>/<run>/.acl.json (gate/gate.py acl_key_for)
-and its own state under _gate/. A policy `*` matches any run of characters, `/` included, so an
+and its own state under _gate/. pub/ has artifact roots too (pub/<run>/, and pub/ itself for a
+single file), but pub/ takes no access requests and grant_access never writes there, so a pub/
+ACL is never writable by the gate, at its root or below it. A policy `*` matches any run of characters, `/` included, so an
 Allow on u/*/.acl.json alone also covers u/<run>/<dir>/.acl.json: the documents must take the
 deeper forms back with an explicit Deny. This evaluates both documents with the S3 rules (an
 explicit Deny wins, no matching Allow is a deny, `*` is any run of characters, `?` one
@@ -34,12 +36,15 @@ ROOT_ACLS = ["u/r/.acl.json", "g/s/r/.acl.json", "u/.acl.json/.acl.json", "g/s/.
 NESTED_ACLS = ["u/r/a/.acl.json", "u/r/a/b/.acl.json", "u/r/.acl.json/.acl.json",
                "g/s/r/a/.acl.json", "g/s/r/a/b/c/.acl.json"]
 ROOTLESS_ACLS = ["u/.acl.json", "g/s/.acl.json", "g/.acl.json", ".acl.json", "acl/.acl.json",
-                 "pub/.acl.json", "pub/x/.acl.json", "other/.acl.json", "other/x/y/.acl.json",
-                 "_mcp/x/.acl.json", "_plugins/c/.acl.json"]
+                 "other/.acl.json", "other/x/y/.acl.json", "_mcp/x/.acl.json",
+                 "_plugins/c/.acl.json"]
+# pub/ ACLs, at a pub root (pub/.acl.json, pub/<run>/.acl.json) or below one: never written by
+# the gate (pub/ takes no access grants).
+PUB_ACLS = ["pub/.acl.json", "pub/x/.acl.json", "pub/x/a/.acl.json"]
 OBJECTS = ["u/r/index.html", "g/s/r/a/b.css", "pub/x/index.html", "_plugins/c/x.bin",
            "_mcp/x.json", "top.html"]
 STATE = ["_gate/req/x.json", "_gate/rl/x.json"]
-EVERY_KEY = ROOT_ACLS + NESTED_ACLS + ROOTLESS_ACLS + OBJECTS + STATE
+EVERY_KEY = ROOT_ACLS + NESTED_ACLS + ROOTLESS_ACLS + PUB_ACLS + OBJECTS + STATE
 
 # action -> the keys it must be allowed on; every other key of EVERY_KEY must be denied.
 EXPECTED = {
@@ -103,7 +108,7 @@ def main():
                  if allowed(chart, action, k) != (k in want)]
         check(not wrong, "%s allowed on exactly %d of %d keys%s" % (
             action, len(want), len(EVERY_KEY), "" if not wrong else ": wrong %s" % wrong))
-    for k in NESTED_ACLS + ROOTLESS_ACLS:
+    for k in NESTED_ACLS + ROOTLESS_ACLS + PUB_ACLS:
         check(not allowed(chart, "s3:PutObject", k) and not allowed(chart, "s3:PutObjectTagging", k),
               "gate cannot write or tag %s" % k)
 

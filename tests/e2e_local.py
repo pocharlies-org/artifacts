@@ -840,6 +840,51 @@ class E2ETest(unittest.TestCase):
             self.assertEqual([k for k in OBJECTS if k.startswith("_gate/req/")], [])
         self.assertEqual(sent, [])
 
+    def test_pub_takes_no_access_request(self):
+        # pub/ is anonymous-readable by design: a signed-in visitor denied a pub/ key (missing,
+        # or a stray ACL that does not list them) gets the same page with no request form; the
+        # request POST is refused on its path, and an approval of an older pending pub/ request
+        # writes nothing
+        sent = self.record_notifications()
+        USERS["hank"] = ("hank@example.com", "aaaa")
+        acl = json.dumps({"owner": "owner@example.com", "users": ["alice@example.com"]}).encode()
+        with OBJECTS_LOCK:
+            OBJECTS["pub/closed/index.html"] = b"x"
+            OBJECTS["pub/closed/.acl.json"] = acl
+        pages = []
+        for uri in ("/artifacts/pub/closed/index.html", "/artifacts/pub/free/ghost.html"):
+            st, body, _ = self.auth(uri, "hank")
+            self.assertEqual(st, 403, uri)
+            self.assertIn("Access required", body, uri)
+            self.assertIn("cannot be requested", body, uri)
+            self.assertNotIn("Request access", body, uri)
+            self.assertNotIn("name=csrf", body, uri)
+            pages.append(body.replace(uri, "<uri>"))
+        self.assertEqual(pages[0], pages[1])                 # missing and closed: one page
+        for path in ("/artifacts/pub/closed/index.html", "/artifacts/pub/free/index.html"):
+            csrf = self.gate.make_csrf("hank@example.com", path, self.gate._KEY, int(time.time()))
+            st, body, _ = http(self.base + "/_gate/request", method="POST",
+                               data=urllib.parse.urlencode({"csrf": csrf, "artifact": path}),
+                               headers={"Content-Type": "application/x-www-form-urlencoded"},
+                               cookie="sid=hank")
+            self.assertEqual(st, 400, path)
+            self.assertIn("cannot be requested", body)
+        with OBJECTS_LOCK:
+            self.assertEqual([k for k in OBJECTS if k.startswith("_gate/req/")], [])
+        self.assertEqual(sent, [])
+        # a pub/ request recorded before this rule: the approval is refused, nothing written
+        rid = self.gate.REQUESTS.create("hank@example.com", "/artifacts/pub/closed/index.html",
+                                        "owner@example.com", 1_800_000_000)
+        token = self.gate.make_action_token(rid, "approve", self.gate._KEY, int(time.time()))
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("Access not granted", page)
+        self.assertIn("Nothing was changed", page)
+        with OBJECTS_LOCK:
+            self.assertEqual(OBJECTS["pub/closed/.acl.json"], acl)
+            self.assertEqual([k for k, *_x in PUTS if k.endswith(".acl.json")], [])
+        self.assertEqual(sent, [])
+
     def test_request_access_missing_artifact_uniform_response_no_state(self):
         USERS["frank"] = ("frank@example.com", "aaaa")
         st, page, _ = self.auth("/artifacts/u/secret/ghost.html", "frank")

@@ -63,6 +63,9 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   artifact root); a key with no artifact root offers no request (there is no owner to ask),
   and neither a request nor an approval is ever taken for a path the gate would not serve
   (dot segments, an `.acl.json`, `_gate/`, a listing) or one without an artifact root.
+  `pub/` takes no requests at all: it is anonymous-readable by design, so its deny page
+  offers none, a request for it is refused, and the gate never writes a `pub/` ACL (its S3
+  policy refuses that write too).
   The approval adds the requester to the root ACL with a conditional write: the gate reads
   the ACL with its ETag and writes it back with `If-Match`, so a change made by anyone else in
   between is never overwritten (the store answers `412`; the gate reads again and retries
