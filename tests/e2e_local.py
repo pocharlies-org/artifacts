@@ -11,6 +11,7 @@ Run:  python3 -I -m unittest discover -s tests -p 'e2e_*.py' -v
 
 import importlib.util
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -21,6 +22,7 @@ import threading
 import time
 import tracemalloc
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,10 +32,26 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ------------------------------------------------------------------ fake MinIO (path style) ----
+# S3 write semantics the gate relies on: every object version has an ETag (sent on GET and
+# HEAD), a PUT with If-Match answers 412 unless the object is still that version, and a PUT
+# replaces the object's tag set (x-amz-tagging; none sent: untagged).
 OBJECTS = {}
 TAGS = {}          # key -> {tag: value}, served on GET <key>?tagging (ILM ttl)
 OBJECTS_LOCK = threading.Lock()
 LAST_MODIFIED = "Wed, 21 Oct 2026 07:28:00 GMT"
+# key -> [callable, ...]: each GET of that key pops one and runs it after the answer's version
+# is taken and before it is sent, i.e. another writer changes the object between that read
+# and the reader's next request.
+AFTER_GET = {}
+PUTS = []          # (key, If-Match, x-amz-tagging, status) of every PUT
+# (method, key) -> n: the next n answers to that request are cut short (Content-Length promises
+# more than is sent, then the connection closes: the client gets http.client.IncompleteRead).
+# method is "GET", "GET?tagging" or "PUT"; a cut PUT is still applied, as a store may do.
+TRUNCATE = {}
+
+
+def etag_of(body):
+    return '"%s"' % hashlib.md5(body).hexdigest()
 
 
 class MinioHandler(BaseHTTPRequestHandler):
@@ -43,6 +61,22 @@ class MinioHandler(BaseHTTPRequestHandler):
     def _key(self):
         path = urllib.parse.urlsplit(self.path).path
         return urllib.parse.unquote(path[len("/artifacts/"):])
+
+    def _cut(self, method, key):
+        with OBJECTS_LOCK:
+            n = TRUNCATE.get((method, key), 0)
+            if n:
+                TRUNCATE[(method, key)] = n - 1
+        return bool(n)
+
+    def _reply_cut(self, status, body, headers=None):
+        self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body) + 16))
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
 
     def do_GET(self):
         if "tagging" in urllib.parse.urlsplit(self.path).query:
@@ -56,33 +90,57 @@ class MinioHandler(BaseHTTPRequestHandler):
                    + "".join(f"<Tag><Key>{k}</Key><Value>{v}</Value></Tag>"
                              for k, v in (tags or {}).items())
                    + "</TagSet></Tagging>")
+            if self._cut("GET?tagging", key):
+                return self._reply_cut(200, xml.encode())
             return self._reply(200, xml.encode())
+        key = self._key()
         with OBJECTS_LOCK:
-            body = OBJECTS.get(self._key())
+            body = OBJECTS.get(key)
+            hooks = AFTER_GET.get(key)
+            hook = hooks.pop(0) if hooks else None
+        if hook is not None:
+            hook()
         if body is None:
             return self._reply(404, b"NoSuchKey")
-        self._reply(200, body)
+        if self._cut("GET", key):
+            return self._reply_cut(200, body, {"ETag": etag_of(body)})
+        self._reply(200, body, {"ETag": etag_of(body)})
 
     def do_HEAD(self):
         with OBJECTS_LOCK:
-            exists = self._key() in OBJECTS
-        self.send_response(200 if exists else 404)
-        if exists:
+            body = OBJECTS.get(self._key())
+        self.send_response(200 if body is not None else 404)
+        if body is not None:
             self.send_header("Last-Modified", LAST_MODIFIED)
+            self.send_header("ETag", etag_of(body))
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_PUT(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n)
+        key = self._key()
+        if_match, tagging = self.headers.get("If-Match"), self.headers.get("x-amz-tagging")
         with OBJECTS_LOCK:
-            OBJECTS[self._key()] = body
-        self.send_response(200)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+            current = OBJECTS.get(key)
+            if if_match is not None and (current is None or etag_of(current) != if_match):
+                status = 412
+            else:
+                status = 200
+                OBJECTS[key] = body
+                if tagging:
+                    TAGS[key] = dict(urllib.parse.parse_qsl(tagging))
+                else:
+                    TAGS.pop(key, None)
+            PUTS.append((key, if_match, tagging, status))
+        if self._cut("PUT", key):
+            return self._reply_cut(status, b"")
+        self._reply(status, b"" if status == 200 else b"PreconditionFailed")
 
-    def _reply(self, status, body):
+    def _reply(self, status, body, headers=None):
         self.send_response(status)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -193,6 +251,10 @@ class E2ETest(unittest.TestCase):
         global OBJECTS
         with OBJECTS_LOCK:
             OBJECTS.clear()
+            TAGS.clear()
+            AFTER_GET.clear()
+            PUTS.clear()
+            TRUNCATE.clear()
         self.gate._acl_cache.clear()
         # pub artifact without ACL; private artifact with ACL (owner + bob's group); ACL for it
         OBJECTS["pub/free/index.html"] = b"<h1>free</h1>"
@@ -520,6 +582,264 @@ class E2ETest(unittest.TestCase):
             self.assertIn("grace@example.com",
                           json.loads(OBJECTS["u/secret/.acl.json"])["users"])
 
+    # -- the approval's ACL write: conditional (If-Match), keeps the ttl tag, never a false
+    #    "approved" -------------------------------------------------------------------
+    def record_notifications(self):
+        sent = []
+
+        class Recorder:
+            def send(self, email, text):
+                sent.append((email, text))
+                return True, "ok"
+        patch = mock.patch.object(self.gate, "NOTIFIER", Recorder())
+        patch.start()
+        self.addCleanup(patch.stop)
+        return sent
+
+    @staticmethod
+    def other_writer_adds(user):
+        def write():                          # runs under OBJECTS_LOCK: a plain overwrite
+            acl = json.loads(OBJECTS["u/secret/.acl.json"])
+            acl["users"].append(user)
+            OBJECTS["u/secret/.acl.json"] = json.dumps(acl).encode()
+        return write
+
+    def _approve(self, requester):
+        rid = self._pending_request(requester)
+        token = self.gate.make_action_token(rid, "approve", self.gate._KEY, int(time.time()))
+        return rid, token
+
+    def test_approval_race_first_put_412_retry_keeps_both_writers(self):
+        sent = self.record_notifications()
+        rid, token = self._approve("ivan@example.com")
+        with OBJECTS_LOCK:
+            AFTER_GET["u/secret/.acl.json"] = [self.other_writer_adds("other@example.com")]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        acl_puts = [(st_, bool(im)) for k, im, _t, st_ in PUTS if k == "u/secret/.acl.json"]
+        self.assertEqual(acl_puts, [(412, True), (200, True)])     # conditional both times
+        acl = json.loads(OBJECTS["u/secret/.acl.json"])
+        self.assertEqual(acl["users"], ["alice@example.com", "other@example.com", "ivan@example.com"])
+        self.assertEqual((acl["owner"], acl["groups"]),
+                         ("owner@example.com", ["11111111-2222-4333-8444-555555555555"]))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("approved", sent[0][1])
+
+    def test_approval_that_loses_twice_is_never_reported_approved(self):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        rid, token = self._approve("judy@example.com")
+        with OBJECTS_LOCK:
+            AFTER_GET["u/secret/.acl.json"] = [self.other_writer_adds("o1@example.com"),
+                                               self.other_writer_adds("o2@example.com")]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503)
+        self.assertIn("Access not granted", page)
+        self.assertNotIn("Request approved", page)
+        self.assertEqual(sent, [])                                # the requester is told nothing
+        self.assertIn("ACL write failed: put HTTP 412", log.getvalue())
+        acl = json.loads(OBJECTS["u/secret/.acl.json"])           # the other writer's ACL, as written
+        self.assertEqual(acl["users"], ["alice@example.com", "o1@example.com", "o2@example.com"])
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+        # re-decidable: the same link works once the write can go through
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertIn("judy@example.com", json.loads(OBJECTS["u/secret/.acl.json"])["users"])
+        self.assertEqual(len(sent), 1)
+        self.assertIn("approved", sent[0][1])
+
+    def test_approval_without_a_readable_acl_is_never_reported_approved(self):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        rid, token = self._approve("kim@example.com")
+        with OBJECTS_LOCK:
+            del OBJECTS["u/secret/.acl.json"]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503)
+        self.assertIn("Access not granted", page)
+        self.assertEqual(sent, [])
+        self.assertIn("ACL write failed: acl unreadable: missing", log.getvalue())
+        self.assertNotIn("u/secret/.acl.json", OBJECTS)            # never created
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+
+    def test_approval_keeps_the_acl_ttl_tag(self):
+        with OBJECTS_LOCK:
+            TAGS["u/secret/.acl.json"] = {"ttl": "7"}
+        rid, token = self._approve("lena@example.com")
+        st, _, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200)
+        self.assertIn("lena@example.com", json.loads(OBJECTS["u/secret/.acl.json"])["users"])
+        self.assertEqual(TAGS.get("u/secret/.acl.json"), {"ttl": "7"})
+        self.assertEqual([t for k, _im, t, _st in PUTS if k == "u/secret/.acl.json"], ["ttl=7"])
+
+    # a store reply cut short (http.client.IncompleteRead, not an OSError) on any request of the
+    # grant, or any other unexpected exception, is a failed grant like the others: 503, request
+    # back to pending, no message, one clean log line; the same link works once the store does
+    def _approval_with_a_cut_store_reply(self, method):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        acl_key = "u/secret/.acl.json"
+        with OBJECTS_LOCK:
+            TAGS[acl_key] = {"ttl": "7"}
+            TRUNCATE[(method, acl_key)] = 1
+        rid, token = self._approve("sam@example.com")
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("Access not granted", page)
+        self.assertEqual(sent, [])
+        with OBJECTS_LOCK:
+            self.assertEqual(TRUNCATE[(method, acl_key)], 0)        # the cut reply was sent
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+        lines = [ln for ln in log.getvalue().splitlines() if "ACL write failed" in ln]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn(": IncompleteRead (requester=sam@example.com", lines[0])
+        for leak in ("more expected", "bytes read", "alice@example.com", '"users"'):
+            self.assertNotIn(leak, lines[0])
+        st, page, _ = self._post_action("approve", token)      # the store answers in full again
+        self.assertEqual(st, 200, page)
+        acl = json.loads(OBJECTS[acl_key])
+        self.assertEqual(acl["users"].count("sam@example.com"), 1)
+        self.assertEqual(TAGS[acl_key], {"ttl": "7"})
+        self.assertEqual(len(sent), 1)
+        self.assertIn("approved", sent[0][1])
+        return lines[0]
+
+    def test_cut_reply_on_the_acl_read_is_a_failed_grant(self):
+        line = self._approval_with_a_cut_store_reply("GET")
+        self.assertIn("acl unreadable: minio GET u/secret/.acl.json: IncompleteRead", line)
+
+    def test_cut_reply_on_the_tag_read_is_a_failed_grant(self):
+        line = self._approval_with_a_cut_store_reply("GET?tagging")
+        self.assertIn("acl tags unreadable: minio GET u/secret/.acl.json: IncompleteRead", line)
+
+    def test_cut_reply_on_the_acl_write_is_a_failed_grant(self):
+        # the store applied the write but its reply was cut: the next click finds the requester
+        # listed and finishes the approval without writing again
+        line = self._approval_with_a_cut_store_reply("PUT")
+        self.assertIn("put failed: minio PUT u/secret/.acl.json: IncompleteRead", line)
+        self.assertEqual([st for k, _im, _t, st in PUTS if k == "u/secret/.acl.json"], [200])
+
+    def test_unexpected_exception_in_the_grant_is_a_failed_grant(self):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        rid, token = self._approve("tess@example.com")
+        secretish = "Authorization: AWS4-HMAC-SHA256 Credential=leak-marker"
+        with mock.patch.object(self.gate, "grant_access", side_effect=RuntimeError(secretish)):
+            st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("Access not granted", page)
+        self.assertEqual(sent, [])
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+        out = log.getvalue()
+        self.assertNotIn("leak-marker", out)
+        self.assertNotIn("Traceback", out)
+        lines = [ln for ln in out.splitlines() if "ACL write failed" in ln]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("ACL write failed: unexpected RuntimeError (requester=tess@example.com", lines[0])
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertIn("tess@example.com", json.loads(OBJECTS["u/secret/.acl.json"])["users"])
+        self.assertEqual(len(sent), 1)
+
+    def test_deny_message_unchanged(self):
+        sent = self.record_notifications()
+        rid = self._pending_request("mike@example.com")
+        token = self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time()))
+        st, page, _ = self._post_action("deny", token)
+        self.assertEqual(st, 200)
+        self.assertIn("<title>Request denied</title>", page)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("denied", sent[0][1])
+        self.assertNotIn("approved", sent[0][1])
+        self.assertEqual([k for k, *_x in PUTS if k.endswith(".acl.json")], [])
+
+    # -- an approval grants the whole artifact: every message says so --------------------
+    def test_owner_dm_names_the_whole_artifact(self):
+        sent = self.record_notifications()
+        USERS["nina"] = ("nina@example.com", "aaaa")
+        uri = "/artifacts/u/secret/assets/app.css"
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/assets/app.css"] = b"body{}"
+        st, page, _ = self.auth(uri, "nina")
+        csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
+        st, _, _ = http(self.base + "/_gate/request", method="POST",
+                        data=urllib.parse.urlencode({"csrf": csrf, "artifact": uri}),
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        cookie="sid=nina")
+        self.assertEqual(st, 200)
+        self.assertEqual([to for to, _ in sent], ["owner@example.com"])
+        text = sent[0][1]
+        self.assertIn("Requested file: `/artifacts/u/secret/assets/app.css`", text)
+        self.assertIn("Approving gives access to the whole artifact `/artifacts/u/secret/`", text)
+
+    def test_confirm_and_result_pages_name_the_whole_artifact(self):
+        sent = self.record_notifications()
+        rid = self.gate.REQUESTS.create("olga@example.com", "/artifacts/u/secret/assets/app.css",
+                                        "owner@example.com", int(time.time()))
+        approve = self.gate.make_action_token(rid, "approve", self.gate._KEY, int(time.time()))
+        st, page, _ = http(self.base + "/_gate/approve?token=" + urllib.parse.quote(approve, safe=""),
+                           cookie="sid=owner")
+        self.assertEqual(st, 200)
+        self.assertIn("asked for <code>/artifacts/u/secret/assets/app.css</code>", page)
+        self.assertIn("access to the whole artifact <code>/artifacts/u/secret/</code>", page)
+        deny = self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time()))
+        st, page, _ = http(self.base + "/_gate/deny?token=" + urllib.parse.quote(deny, safe=""),
+                           cookie="sid=owner")
+        self.assertEqual(st, 200)
+        self.assertNotIn("whole artifact", page)
+        st, page, _ = self._post_action("approve", approve)
+        self.assertEqual(st, 200)
+        self.assertIn("<title>Request approved</title>", page)
+        self.assertIn("can now open the whole artifact <code>/artifacts/u/secret/</code>", page)
+        self.assertEqual(sent, [("olga@example.com",
+                                 "Your access request for `/artifacts/u/secret/assets/app.css` was "
+                                 "approved: you can now open the whole artifact `/artifacts/u/secret/`.")])
+
+    def test_key_without_artifact_root_promises_no_owner(self):
+        acl = json.dumps({"owner": "alice@example.com", "users": []}).encode()
+        with OBJECTS_LOCK:
+            OBJECTS["u/.acl.json"] = acl
+            OBJECTS["u/loose.html"] = b"x"
+        USERS["pete"] = ("pete@example.com", "aaaa")
+        for uri in ("/artifacts/u/loose.html", "/artifacts/u/ghost.html", "/artifacts/acl/run.json"):
+            st, body, _ = self.auth(uri, "pete")
+            self.assertEqual(st, 403, uri)
+            self.assertIn("Access required", body)
+            self.assertIn("no owner to ask", body)
+            self.assertNotIn("Request access", body)
+            self.assertNotIn("name=csrf", body)
+        st, body, _ = self.auth("/artifacts/u/secret/report.html", "pete")   # a real artifact: the form
+        self.assertEqual(st, 403)
+        self.assertIn("Request access", body)
+
+    def test_request_access_refuses_paths_the_gate_never_serves(self):
+        # even with a valid CSRF token for that exact path (the gate never issues one: no deny
+        # page is rendered for these), nothing is recorded, nobody is notified
+        sent = self.record_notifications()
+        acl = json.dumps({"owner": "owner@example.com", "users": []}).encode()
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/../other/x.html"] = b"x"     # the literal key, as a store could hold it
+            OBJECTS["u/other/.acl.json"] = acl
+            OBJECTS["u/.acl.json"] = acl
+            OBJECTS["u/loose.html"] = b"x"
+        USERS["quin"] = ("quin@example.com", "aaaa")
+        for path in ("/artifacts/u/secret/../other/x.html", "/artifacts/u/secret/%2e%2e/other/x.html",
+                     "/artifacts/u/secret/.acl.json", "/artifacts/u/secret/",
+                     "/artifacts/u/loose.html", "/artifacts/acl/run.json"):
+            csrf = self.gate.make_csrf("quin@example.com", path, self.gate._KEY, int(time.time()))
+            st, body, _ = http(self.base + "/_gate/request", method="POST",
+                               data=urllib.parse.urlencode({"csrf": csrf, "artifact": path}),
+                               headers={"Content-Type": "application/x-www-form-urlencoded"},
+                               cookie="sid=quin")
+            self.assertEqual(st, 400, path)
+            self.assertIn("not inside a published artifact", body)
+        with OBJECTS_LOCK:
+            self.assertEqual([k for k in OBJECTS if k.startswith("_gate/req/")], [])
+        self.assertEqual(sent, [])
+
     def test_request_access_missing_artifact_uniform_response_no_state(self):
         USERS["frank"] = ("frank@example.com", "aaaa")
         st, page, _ = self.auth("/artifacts/u/secret/ghost.html", "frank")
@@ -693,6 +1013,38 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(len(lines), 3, lines)
         self.assertIn("reason=denied detail=no-acl: deny by default", lines[0])
         self.assertIn("reason=denied detail=not-listed", lines[1])
+
+    def test_malformed_acl_is_the_uniform_deny_for_a_stranger(self):
+        # an ACL file that is not JSON must not tell a stranger "this artifact has a broken ACL"
+        USERS["rita"] = ("rita@example.com", "99999999-2222-4333-8444-555555555555")
+        uri = "/artifacts/u/secret/report.html"
+        _, listed_not_me = self.plugin_authz(uri, sid="rita")
+        st, page_valid, _ = self.auth(uri, "rita")
+        self.assertEqual(st, 403)
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/.acl.json"] = b'{"owner": "owner@example.com", "users": [broken'
+        self.gate._acl_cache.clear()
+        log = self.capture_log()
+        st, broken = self.plugin_authz(uri, sid="rita")
+        self.assertEqual(st, 200)
+        self.assertEqual(broken, listed_not_me)
+        self.assertEqual((broken["allowed"], broken["reason"]), (False, "denied"))
+        self.assertIn("detail=acl-error (malformed JSON)", log.getvalue())
+        # nobody is let in by an ACL that cannot be read, the owner included: same answer shape
+        _, owner = self.plugin_authz(uri, sid="owner")
+        self.assertEqual((owner["allowed"], owner["reason"]), (False, "denied"))
+        # forwardAuth already answered it with the same deny page as any other refusal
+        st, page_broken, h = self.auth(uri, "rita")
+        self.assertEqual(st, 403)
+        self.assertNotIn("Authorization", h)
+        strip = lambda p: re.sub(r'name=csrf value="[^"]+"', "", p)
+        self.assertEqual(strip(page_broken), strip(page_valid))
+
+    def test_plugin_authz_store_outage_is_still_acl_error(self):
+        # unreadable store (the same for every key): reported as acl-error, fail closed
+        with mock.patch.object(self.gate.MINIO, "get", side_effect=ConnectionError("down")):
+            st, ans = self.plugin_authz("/artifacts/u/secret/report.html", sid="alice")
+        self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "acl-error"))
 
     def test_plugin_authz_deny_expired(self):
         OBJECTS["u/secret/.acl.json"] = json.dumps(
@@ -1005,16 +1357,21 @@ class E2ETest(unittest.TestCase):
         forged = "INFO action=approve id=deadbeef by=owner@example.com"
         self._auth_h("/artifacts/u/secret/x%0A" + urllib.parse.quote(forged), "alice")
         self._auth_h("/artifacts/u/secret/report.html?x=%0A" + urllib.parse.quote(forged), "alice")
-        # urlsplit drops \n from the form value; other line breaks of str.splitlines() remain
+        # urlsplit drops \n from the form value; other line breaks of str.splitlines() remain.
+        # Two log lines carry the form's path: the CSRF refusal (a path inside an artifact, u/x/)
+        # and the shape refusal before it (a path with no artifact root, u/x<sep>...)
         for sep in ("\x0b", "\x1e", "\x85", "\u2028"):
-            http(self.base + "/_gate/request", method="POST",
-                 data=urllib.parse.urlencode({"csrf": "bad", "artifact": "/artifacts/u/x" + sep + forged}),
-                 headers={"Content-Type": "application/x-www-form-urlencoded"}, cookie="sid=alice")
+            for prefix in ("/artifacts/u/x/", "/artifacts/u/x"):
+                http(self.base + "/_gate/request", method="POST",
+                     data=urllib.parse.urlencode({"csrf": "bad", "artifact": prefix + sep + forged}),
+                     headers={"Content-Type": "application/x-www-form-urlencoded"}, cookie="sid=alice")
         lines = log.getvalue().splitlines()
         self.assertFalse([ln for ln in lines if ln.startswith(forged)], lines)
         self.assertTrue([ln for ln in lines if "key=u/secret/x\\x0aINFO action" in ln], lines)
-        self.assertEqual(len([ln for ln in lines if "csrf rejected" in ln and "u/x\\" in ln]), 4,
+        self.assertEqual(len([ln for ln in lines if "csrf rejected" in ln and "u/x/\\" in ln]), 4,
                          lines)
+        self.assertEqual(len([ln for ln in lines
+                              if "request-access refused" in ln and "u/x\\" in ln]), 4, lines)
 
     def test_gate_pages_cannot_be_framed(self):
         USERS["fran"] = ("fran@example.com", "aaaa")

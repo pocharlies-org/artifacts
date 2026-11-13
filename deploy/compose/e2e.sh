@@ -242,6 +242,128 @@ done
 check "publisher probes left no object" 0 "$(mc_admin "mc find local/artifacts --name 'e2e-probe*' 2>/dev/null | wc -l" | tr -d ' ')"
 mc_admin "mc alias rm e2e-pub >/dev/null" || true
 
+# ---- the gate's own S3 user writes an ACL only at an artifact root --------------------
+# bootstrap.sh's gate policy, probed with the gate's own client (MinioClient in /app/gate.py,
+# the same signing and request shape as an approval): u/<run>/.acl.json, g/<slug>/<run>/.acl.json
+# and _gate/ state are writable; an .acl.json below a root, without a root, a non-ACL object
+# are refused by the store (a policy `*` crosses `/`: the explicit Deny is what refuses depth).
+# The root ACL write also carries its tags (x-amz-tagging) and is conditional (If-Match): the
+# store must answer 412 to a stale ETag, or a grant could not tell it lost a race. Last,
+# grant_access itself against this store with another writer slipped between its read and
+# its write (a wrapper around the client, the gate code unchanged): 412, re-read, merged; and
+# twice: it gives up and the other writer's ACL stays as written.
+PROBE="e2e-policy-$(date +%s)"
+gate_put_out=$(docker compose exec -T -e P="$PROBE" gate python3 - <<'PY'
+import importlib.util, json, os
+spec = importlib.util.spec_from_file_location("g", "/app/gate.py")
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+p = os.environ["P"]
+for key in ("u/P/.acl.json", "g/P/r/.acl.json", "_gate/P.json", "u/P/a/.acl.json",
+            "u/P/a/b/.acl.json", "g/P/r/a/.acl.json", "g/P/.acl.json", "pub/P/.acl.json",
+            "u/P/index.html"):
+    print(key, g.MINIO.put(key.replace("P", p), b"{}", "application/json"))
+for key in ("u/P/.acl.json", "g/P/r/.acl.json", "u/P/a/.acl.json"):
+    print("tagged:" + key, g.MINIO.put(key.replace("P", p), b'{"v":1}', "application/json",
+                                       tagging="ttl=1"))
+k = f"u/{p}/.acl.json"
+print("tags-read", g.MINIO.get_tags_checked(k)[0].get("ttl"))
+_, _, etag = g.MINIO.get_with_etag(k)
+print("if-match:wrong", g.MINIO.put(k, b'{"v":2}', "application/json", if_match='"0123456789abcdef0123456789abcdef"'))
+print("if-match:current", g.MINIO.put(k, b'{"v":2}', "application/json", if_match=etag))
+print("if-match:stale", g.MINIO.put(k, b'{"v":3}', "application/json", if_match=etag))
+print("plain", g.MINIO.put(k, b'{"v":3}', "application/json"))
+
+
+class Racer:
+    """The gate's client, with another writer's plain PUT right after each of the next n reads."""
+    def __init__(self, inner, n):
+        self.inner, self.n = inner, n
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def get_with_etag(self, key):
+        out = self.inner.get_with_etag(key)
+        if self.n:
+            self.n -= 1
+            acl = json.loads(out[1])
+            acl["users"].append(f"other{self.n}@example.com")
+            self.inner.put(key, json.dumps(acl).encode(), "application/json", tagging="ttl=1")
+        return out
+
+
+for case, n in (("race-once", 1), ("race-twice", 2)):
+    g.MINIO.put(k, json.dumps({"owner": "o@example.com", "users": []}).encode(),
+                "application/json", tagging="ttl=1")
+    res = g.grant_access(Racer(g.MINIO, n), f"/artifacts/u/{p}/x.html", "new@example.com")
+    print(case, json.dumps([res[0], res[1], sorted(json.loads(g.MINIO.get(k)[1])["users"]),
+                            g.MINIO.get_tags_checked(k)[0].get("ttl")], separators=(",", ":")))
+PY
+)
+gate_put() { echo "$gate_put_out" | awk -v k="$1" '$1==k{sub(/^[^ ]+ /, ""); print}'; }
+for k in u/P/.acl.json g/P/r/.acl.json _gate/P.json tagged:u/P/.acl.json tagged:g/P/r/.acl.json; do
+  check "gate S3 user may write $k" 200 "$(gate_put "$k")"
+done
+for k in u/P/a/.acl.json u/P/a/b/.acl.json g/P/r/a/.acl.json g/P/.acl.json pub/P/.acl.json u/P/index.html \
+         tagged:u/P/a/.acl.json; do
+  check "gate S3 user may not write $k" 403 "$(gate_put "$k")"
+done
+check "gate reads the root ACL's tags" 1 "$(gate_put tags-read)"
+check "conditional PUT, wrong ETag" 412 "$(gate_put if-match:wrong)"
+check "conditional PUT, current ETag" 200 "$(gate_put if-match:current)"
+check "conditional PUT, stale ETag" 412 "$(gate_put if-match:stale)"
+check "plain PUT" 200 "$(gate_put plain)"
+check "grant raced once on the store: 412, re-read, both writers kept, ttl kept" \
+  '[true,"added",["new@example.com","other0@example.com"],"1"]' "$(gate_put race-once)"
+check "grant raced twice on the store: gives up, other writer's ACL as written" \
+  '[false,"put HTTP 412",["other0@example.com","other1@example.com"],"1"]' "$(gate_put race-twice)"
+for d in u g pub; do mc_admin "mc rm --recursive --force local/artifacts/$d/$PROBE >/dev/null 2>&1" || true; done
+mc_admin "mc rm --force local/artifacts/_gate/$PROBE.json >/dev/null 2>&1" || true
+check "gate policy probes left no object" 0 "$(mc_admin "mc ls --recursive local/artifacts/u/$PROBE local/artifacts/g/$PROBE local/artifacts/pub/$PROBE local/artifacts/_gate/$PROBE.json 2>/dev/null | wc -l" | tr -d ' ')"
+
+# ---- an approval end to end on the real store --------------------------------------------
+# test2 is denied an artifact owned by test@example.com, requests access, the owner approves
+# (the approve token is minted in the gate container with the dev HMAC key, as the DM would
+# carry it): the ACL write goes through MinIO with If-Match and the ACL's ttl tag, the owner
+# and the other fields stay, the tag is the same after the write, and test2 reads.
+RUN3="e2e-grant-$(date +%s)"
+ARTIFACTS_OWNER=test@example.com ARTIFACTS_ACCESS_KEY=artifact-publisher \
+  ARTIFACTS_SECRET_KEY=artifact-publisher-dev-password ARTIFACTS_WRITE_BASE="$S3" ARTIFACTS_READ_BASE="$BASE" \
+  bash ../../cli/publish.sh -u test@example.com -r "$RUN3" -t 7 -a e2e -s compose /tmp/e2e-note.md >/dev/null \
+  || { echo "CLI publish for the approval flow failed"; exit 1; }
+GRANT_PATH="/artifacts/u/$RUN3/index.html"
+acl_tags() { mc_admin "mc tag list --json local/artifacts/u/$RUN3/.acl.json" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin).get("tagset"))'; }
+tags_before=$(acl_tags)
+check "approval flow: the published ACL carries ttl=7" "{'ttl': '7'}" "$tags_before"
+deny_page=$(curl -s -H "Authorization: Bearer $TOKEN2" "$BASE$GRANT_PATH")
+check "approval flow: test2 denied before" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN2" "$BASE$GRANT_PATH")"
+csrf=$(printf '%s' "$deny_page" | python3 -c 'import html,re,sys; m=re.search(r"name=csrf value=\"([^\"]+)\"", sys.stdin.read()); print(html.unescape(m.group(1)) if m else "")')
+check "approval flow: request-access recorded" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN2" \
+  --data-urlencode "csrf=$csrf" --data-urlencode "artifact=$GRANT_PATH" "$BASE/_gate/request")"
+rid=$(docker compose logs gate 2>/dev/null | grep -o "request-access id=[0-9a-f]* requester=test2@example.com artifact=$GRANT_PATH" | tail -1 | sed 's/^request-access id=\([0-9a-f]*\) .*/\1/')
+check "approval flow: request id from the gate log" yes "$([[ -n "$rid" ]] && echo yes || echo no)"
+approve_token=$(docker compose exec -T -e RID="$rid" gate python3 - <<'PY'
+import importlib.util, os, time
+spec = importlib.util.spec_from_file_location("g", "/app/gate.py")
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+print(g.make_action_token(os.environ["RID"], "approve", g._KEY, int(time.time())))
+PY
+)
+confirm_page=$(curl -s -H "Authorization: Bearer $TOKEN" --get --data-urlencode "token=$approve_token" "$BASE/_gate/approve")
+check "approval flow: the confirm page says the whole artifact is granted" 1 \
+  "$(printf '%s' "$confirm_page" | grep -c "access to the whole artifact <code>/artifacts/u/$RUN3/</code>")"
+approve_page=$(curl -s -H "Authorization: Bearer $TOKEN" --data-urlencode "token=$approve_token" "$BASE/_gate/approve")
+check "approval flow: owner's POST approves" 1 "$(printf '%s' "$approve_page" | grep -c '<title>Request approved</title>')"
+check "approval flow: the result page says the whole artifact" 1 \
+  "$(printf '%s' "$approve_page" | grep -c "can now open the whole artifact <code>/artifacts/u/$RUN3/</code>")"
+check "approval flow: test2 reads after approval" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN2" "$BASE$GRANT_PATH")"
+check "approval flow: the ACL keeps its ttl tag" "$tags_before" "$(acl_tags)"
+check "approval flow: owner, users and expiry kept, test2 added" "test@example.com ['test2@example.com', 'test@example.com'] True" \
+  "$(mc_admin "mc cat local/artifacts/u/$RUN3/.acl.json" | python3 -c 'import json,sys; a=json.load(sys.stdin); print(a["owner"], sorted(a["users"]), bool(a["expires"]))')"
+
 # ---- bootstrap-job regression: two-arg `mc admin user add` against real MinIO -----------
 # (helm/artifacts/templates/bootstrap-job.yaml uses the same command shape; the one-arg
 # form silently created a user with a wrong secret)

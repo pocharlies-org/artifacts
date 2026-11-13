@@ -107,6 +107,8 @@ jobs:
         run: python3 -I tests/check_gate_modes.py
       - name: helm template chart values (route annotations, forwardAuth trust, login proxy flags, headers, resources)
         run: python3 -I tests/check_chart_values.py
+      - name: gate S3 policy (chart = compose; ACL writes only at the artifact root)
+        run: python3 -I tests/check_gate_policy.py
       - name: helm template one namespace for every object (namespaces.sso == minio.namespace)
         run: |
           helm lint helm/artifacts -f helm/artifacts/values.yaml \
