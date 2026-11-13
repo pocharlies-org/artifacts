@@ -706,6 +706,17 @@ class ConditionalGrantTest(unittest.TestCase):
         self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"), (False, "put HTTP 403"))
         self.assertEqual(len(m.put_calls), 1)
 
+    def test_expired_acl_takes_no_grant(self):
+        acl = {"owner": "o@x.com", "users": [], "expires": "2020-01-01"}
+        m = FakeMinio({"u/x/.acl.json": json.dumps(acl).encode()})
+        self.assertEqual(gate.grant_access(m, "/artifacts/u/x/a.html", "n@x.com"),
+                         (False, "artifact expired"))
+        self.assertEqual(m.puts, [])
+        self.assertFalse(gate.grant_outcome_unknown("artifact expired"))
+        acl["expires"] = "2999-01-01"                       # not expired: granted
+        m = FakeMinio({"u/x/.acl.json": json.dumps(acl).encode()})
+        self.assertEqual(gate.grant_access(m, "/artifacts/u/x/a.html", "n@x.com"), (True, "added"))
+
     def test_already_listed_writes_nothing(self):
         m = FakeMinio({self.KEY: json.dumps(self.ACL).encode()})
         self.assertEqual(gate.grant_access(m, self.PATH, "A@X.com"), (True, "already listed"))

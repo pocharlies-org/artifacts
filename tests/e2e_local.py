@@ -1013,6 +1013,42 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(self._approval_state(rid, "gus@example.com"), ("deny", True))
         self.assertEqual(sent, [])
 
+    def test_result_page_says_notified_only_when_the_message_went_out(self):
+        # without a transport (the default LogNotifier) nobody is told: the pages say so
+        for action in ("approve", "deny"):
+            rid = self._pending_request(f"hal-{action}@example.com")
+            token = self.gate.make_action_token(rid, action, self.gate._KEY, int(time.time()))
+            st, page, _ = self._post_action(action, token)
+            self.assertEqual(st, 200, page)
+            self.assertNotIn("were notified", page, action)
+            self.assertNotIn("was notified", page, action)
+            self.assertIn("could not be notified", page, action)
+        # with a transport that delivers: "notified"
+        self.record_notifications()
+        rid, token = self._approve("ivy2@example.com")
+        st, page, _ = self._post_action("approve", token)
+        self.assertIn("They were notified.", page)
+        rid = self._pending_request("jon@example.com")
+        st, page, _ = self._post_action(
+            "deny", self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time())))
+        self.assertIn("jon@example.com was notified.", page)
+
+    def test_approval_on_an_expired_artifact_says_it_expired(self):
+        sent = self.record_notifications()
+        with OBJECTS_LOCK:
+            acl = json.loads(OBJECTS["u/secret/.acl.json"])
+            acl["expires"] = "2020-01-01"
+            OBJECTS["u/secret/.acl.json"] = json.dumps(acl).encode()
+        rid, token = self._approve("kai@example.com")
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 410, page)
+        self.assertIn("<title>Artifact expired</title>", page)
+        self.assertNotIn("approved", page)
+        self.assertEqual(self._approval_state(rid, "kai@example.com"), ("pending", False))
+        with OBJECTS_LOCK:
+            self.assertEqual([k for k, *_x in PUTS if k.endswith(".acl.json")], [])
+        self.assertEqual(sent, [])
+
     def test_deny_whose_record_cannot_be_written_says_so(self):
         sent = self.record_notifications()
         rid = self._pending_request("fay@example.com")
@@ -1536,6 +1572,22 @@ class E2ETest(unittest.TestCase):
         # a signed-in caller is decided as before (decide(), literal key)
         st, ans = self.plugin_authz("/artifacts/pub/a;b/x.html", sid="alice")
         self.assertEqual((st, ans["allowed"]), (200, True))
+
+    def test_plugin_authz_refuses_a_key_that_is_not_utf8(self):
+        # the edge reads a key decoded once and strictly; a key whose bytes are not UTF-8 is
+        # refused here too (400) instead of being decided with U+FFFD in place of the bytes
+        with OBJECTS_LOCK:
+            OBJECTS["pub/ok\ufffdx"] = b"x"
+        for sid in (None, "alice"):
+            for bad in ("/artifacts/pub/ok%efx", "/artifacts/pub/ok%ff", "/artifacts/u/secret/r%c3"):
+                st, ans = self.plugin_authz(bad, sid=sid, flag=True)
+                self.assertEqual(st, 400, (sid, bad, ans))
+                self.assertEqual(ans, {"error": "artifact path not allowed"}, (sid, bad))
+            # the valid spelling of that character is decided as before
+            st, ans = self.plugin_authz("/artifacts/pub/ok%EF%BF%BDx", sid=sid, flag=True)
+            self.assertEqual((st, ans["artifact"]["key"]), (200, "pub/ok\ufffdx"), sid)
+        st, ans = self.plugin_authz("/artifacts/pub/caf%C3%A9", sid="alice")
+        self.assertEqual((st, ans["artifact"]["key"]), (200, "pub/caf\u00e9"))
 
     def test_plugin_authz_pub_signed_in_allowed(self):
         st, ans = self.plugin_authz("/artifacts/pub/free/index.html", sid="alice")

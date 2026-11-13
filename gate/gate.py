@@ -607,15 +607,16 @@ def artifact_root_path(artifact_path):
     return BUCKET_PATH + acl_key[:-len(".acl.json")]
 
 
-def key_from_path(path):
+def key_from_path(path, errors="replace"):
     """Object key if `path` is under the bucket's public path, else None.
 
     Delivered links (CLI/MCP, docs/plugins.md §5) embed the configured bucket name
     (path-style), so the gate must accept `/<bucket>/<key>` — never a hardcoded
-    /artifacts/. With the default bucket this is /artifacts/<key>."""
+    /artifacts/. With the default bucket this is /artifacts/<key>. errors="strict" raises
+    UnicodeDecodeError for escapes that are not UTF-8, instead of reading them as U+FFFD."""
     if not path.startswith(BUCKET_PATH):
         return None
-    return urllib.parse.unquote(path[len(BUCKET_PATH):])
+    return urllib.parse.unquote(path[len(BUCKET_PATH):], errors=errors)
 
 
 def canonical_artifact_path(path):
@@ -1581,12 +1582,18 @@ class GateHandler(BaseHTTPRequestHandler):
             path = urllib.parse.urlsplit(artifact).path
         except ValueError:
             path = ""                     # client text urlsplit cannot read: not a bucket path
-        key = key_from_path(path)
+        try:
+            # decoded once and strictly, as the edge reads a key (pub_auth_decision): escapes
+            # that are not UTF-8 are refused, never decided as U+FFFD
+            key = key_from_path(path, errors="strict")
+            bad_bytes = False
+        except UnicodeDecodeError:
+            key, bad_bytes = "", True
         if key is None:
             return self._send(400, json.dumps(
                 {"error": f"artifact must be a {BUCKET_PATH.rstrip('/')}/ path"}),
                 "application/json")
-        if _bad_key(key):
+        if bad_bytes or _bad_key(key):
             return self._send(400, json.dumps({"error": "artifact path not allowed"}),
                               "application/json")
         email, groups, status = self._authenticate()
@@ -1834,6 +1841,15 @@ class GateHandler(BaseHTTPRequestHandler):
                 # same answer as below, never a dropped connection. The log gets the class
                 # name only (no text, no traceback: either could carry request or store data).
                 ok, note = False, f"unexpected {type(e).__name__}"
+            if not ok and note == GRANT_EXPIRED:
+                # the artifact expired: nobody can open it, so there is nothing to approve
+                LOG.warning("approve %s: the artifact has expired, nothing written (requester=%s "
+                            "artifact=%s, request still pending, requester not notified)",
+                            rec["id"], rec["requester"], rec["artifact"])
+                return self._send(410, self._page("Artifact expired", (
+                    f"<p>The artifact <code>{root_html}</code> has expired: nobody can open it "
+                    f"any more, so <b>{requester}</b> was not given access. Nothing was changed "
+                    f"and they were not notified.</p>")))
             if not ok:
                 # Never "approved" for a grant that did not happen: the requester is not told
                 # anything, the request is still pending (it was not marked, so the same link
@@ -1903,12 +1919,18 @@ class GateHandler(BaseHTTPRequestHandler):
         if action == "approve":
             msg = (f"Your access request for `{rec['artifact']}` was approved: you can now open "
                    f"the whole artifact `{root}`.")
-            done = (f"<p><b>{requester}</b> can now open the whole artifact "
-                    f"<code>{root_html}</code>. They were notified.</p>")
         else:
             msg = f"Your access request for `{rec['artifact']}` was denied."
-            done = f"<p>{requester} was notified.</p>"
         ok, detail = NOTIFIER.send(rec["requester"], msg)
+        # "notified" only when the message went out
+        if action == "approve":
+            done = (f"<p><b>{requester}</b> can now open the whole artifact "
+                    f"<code>{root_html}</code>. "
+                    + ("They were notified.</p>" if ok else
+                       "They could not be notified: tell them yourself.</p>"))
+        else:
+            done = (f"<p>{requester} was notified.</p>" if ok else
+                    f"<p>The request is denied. {requester} could not be notified.</p>")
         LOG.info("action=%s id=%s by=%s requester=%s artifact=%s acl_note=%s notify_ok=%s detail=%s",
                  action, rec["id"], email, rec["requester"], rec["artifact"], note, ok, detail)
         return self._send(200, self._page(
@@ -2153,7 +2175,12 @@ def _confirm_unknown_write(minio, acl_key, requester, failure, cause):
     return False, f"{failure}; not listed on a re-read"
 
 
-def grant_access(minio, artifact_path, requester):
+# grant_access's note when the ACL has expired: nobody can open the artifact, so nothing is
+# written (a known refusal, see grant_outcome_unknown).
+GRANT_EXPIRED = "artifact expired"
+
+
+def grant_access(minio, artifact_path, requester, now=None):
     """Add `requester` to the ACL users of `artifact_path`. (ok, note).
 
     Writes only the ACL that governs the path (acl_key_for: the artifact root for u/ and g/,
@@ -2170,7 +2197,9 @@ def grant_access(minio, artifact_path, requester):
       - a write whose reply is lost, or that the store answers with a 5xx (it may have applied
         it either way), is checked with one fresh read: the requester listed is a grant;
         anything else keeps the failure's note ("put failed: ..." or "put HTTP 5xx") and the
-        outcome stays unknown (grant_outcome_unknown)."""
+        outcome stays unknown (grant_outcome_unknown);
+      - an ACL whose `expires` has passed (at `now`, default the current time) is not
+        written: (False, GRANT_EXPIRED), since nobody can open the artifact any more."""
     key = key_from_path(artifact_path)
     if key is None or _bad_key(key):
         # a path the gate would never serve (dot segments, an ACL, gate state, a listing) never
@@ -2189,6 +2218,9 @@ def grant_access(minio, artifact_path, requester):
             acl, etag, err = read_acl_for_write(minio, acl_key)    # write path: never the cache
             if err:
                 return False, f"acl unreadable: {err}"
+            exp = _parse_expires(acl.get("expires"))
+            if exp is not None and (time.time() if now is None else now) > exp:
+                return False, GRANT_EXPIRED
             users = acl.get("users") or []
             if not isinstance(users, list):
                 return False, "acl unreadable: users is not a list"

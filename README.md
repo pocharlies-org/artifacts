@@ -89,7 +89,10 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   changed" is said only when that is known (a refusal before the write, or a 4xx). The
   approval writes the ACL first and records the decision second, so a failure between the
   two (a lost reply, a gate stopped in between) leaves the request open with the access
-  already granted, never recorded as approved without it; the same link then closes it. Your store must honour `If-Match` on `PutObject` (MinIO does; a store that ignores
+  already granted, never recorded as approved without it; the same link then closes it.
+  An approval of an artifact whose `expires` has passed writes nothing and tells the owner
+  the artifact has expired. The result pages say the requester was notified only when the
+  message went out. Your store must honour `If-Match` on `PutObject` (MinIO does; a store that ignores
   it brings back the lost-update race).
 - **Two listeners, one process**: `:8080` public (request-access pages, approve/deny
   links, health) and `:8081` internal (decision endpoints only: `/_gate/auth`,
