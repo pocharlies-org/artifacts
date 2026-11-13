@@ -35,9 +35,11 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   subfolders is one artifact); an `.acl.json` below the root is never read or served, and
   an approval only ever updates the root one. Denied whatever ACL objects exist: a key
   directly under `u/` or `g/<slug>/` (no artifact root), `acl/…`, and anything outside
-  `pub/`, `u/` and `g/`. `pub/`: no ACL → any signed-in user (an ACL there, which the
-  publishers never write, is the one in the key's own directory). The same function and
-  the same ACL lookup answer forwardAuth and the plugin authz API.
+  `pub/`, `u/` and `g/`. `pub/`: no ACL → any signed-in user. Its root is
+  `pub/<run>/` for a CLI run (`pub/<run>/.acl.json`, at any depth) and `pub/` itself for a
+  single file published directly under it by the MCP (`pub/.acl.json`); an ACL there,
+  which the publishers never write, is honoured at that root like any other. The same
+  function and the same ACL lookup answer forwardAuth and the plugin authz API.
 - **Guest identities**: an identity containing `#EXT#` (a directory guest's UPN) is refused
   on every gate endpoint, whatever the ACLs say. Defence in depth: the gate sees the login
   proxy's email claim, which for a guest is usually the guest's own address, so restrict
@@ -295,7 +297,7 @@ Everything is environment-driven; nothing is hardcoded.
 | `HMAC_KEY_B64` / `HMAC_KEY_FILE` | `/secrets/hmac-key` | signs approve/deny tokens |
 | `PUBLIC_HOST` | `artifacts.example.com` | host used in generated links |
 | `SLACK_BOT_TOKEN` | empty | optional DM notification on access requests |
-| `GATE_PUB_PREFIXES` | `pub/` | comma list treated as "any signed-in user" without ACL |
+| `GATE_PUB_PREFIXES` | `pub/` | comma list treated as "any signed-in user" without ACL; each entry ends in `/` (one that does not has no artifact root: denied) |
 | `GATE_ANONYMOUS_PUB_ENABLED` | `false` | anonymous reads of `pub/` (plugin authz); must stay false on public hosts |
 | `GATE_STATE_PREFIX` | `_gate` | gate state prefix (never served) |
 | `GATE_PLUGIN_PREFIX` | `_plugins` | plugin storage prefix (never served) |

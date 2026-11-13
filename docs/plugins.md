@@ -92,8 +92,9 @@ Always JSON. `200` with a decision, or an error status (§ table below).
   `u/<run>/.acl.json` and `g/<slug>/<run>/<path>` to `g/<slug>/<run>/.acl.json`, whatever the
   depth of `<path>`; an `.acl.json` below that root is never read. A key with no artifact
   root (directly under `u/` or `g/<slug>/`, `acl/…`, or outside `pub/`, `u/` and `g/`) is
-  `denied` for everyone. A `pub/` key keeps the ACL of its own directory (no ACL: any
-  signed-in user).
+  `denied` for everyone. A `pub/` key answers to its pub root, the same way:
+  `pub/<run>/<path>` to `pub/<run>/.acl.json` at any depth, and a single file directly
+  under `pub/` to `pub/.acl.json` (no ACL: any signed-in user).
 - **Refused identities**: a session whose identity contains `#EXT#` (a directory guest's
   UPN) gets `allowed: false`, `reason: "denied"`, `user.id` and `user.name` null, for every
   key; the gate's other endpoints refuse it with `403` too.

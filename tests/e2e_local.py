@@ -1439,6 +1439,28 @@ class E2ETest(unittest.TestCase):
             st, _ = self.plugin_authz("/artifacts/u/secret/sub/.acl.json", sid=sid)
             self.assertEqual(st, 400, sid)
 
+    def test_stray_pub_root_acl_closes_every_depth(self):
+        # a stray ACL at a pub root (no publisher writes one) narrows the whole run for signed-in
+        # visitors and closes it to anonymous ones, at every depth; a deeper one is never read
+        USERS["carol"] = ("carol@example.com", "aaaa")
+        with OBJECTS_LOCK:
+            OBJECTS["pub/free/sub/x.html"] = b"x"
+            OBJECTS["pub/free/.acl.json"] = json.dumps(
+                {"owner": "owner@example.com", "users": ["alice@example.com"]}).encode()
+            OBJECTS["pub/free/sub/.acl.json"] = json.dumps(
+                {"owner": "carol@example.com", "users": ["carol@example.com"]}).encode()
+        for uri in ("/artifacts/pub/free/index.html", "/artifacts/pub/free/sub/x.html"):
+            st, _, h = self._auth_h(uri, "carol")
+            self.assertEqual(st, 403, uri)
+            self.assertNotIn("Authorization", h, uri)
+            st, _, h = self._auth_h(uri, "alice")
+            self.assertEqual(st, 200, uri)
+            self.assertIn("Authorization", h, uri)
+            _, ans = self.plugin_authz(uri, flag=True)                      # anonymous
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), uri)
+            _, ans = self.plugin_authz(uri, sid="carol")
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), uri)
+
     def test_keys_without_artifact_root_denied(self):
         # an ACL where the old per-directory lookup would find one lets nobody in
         acl = json.dumps({"owner": "alice@example.com", "users": ["alice@example.com"]}).encode()

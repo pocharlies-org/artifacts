@@ -1216,8 +1216,8 @@ class AclCacheBoundTest(unittest.TestCase):
 class AclRootTest(unittest.TestCase):
     """The ACL of an artifact lives at its root (u/<run>/, g/<slug>/<run>/) and governs every
     file of it at any depth. One helper (acl_key_for) derives it for read_acl, grant_access and
-    decide(); a key with no artifact root is denied whatever ACL objects exist; pub/ keeps the
-    ACL of the key's own directory."""
+    decide(); a key with no artifact root is denied whatever ACL objects exist; a pub/ key
+    answers to its pub root (pub/<run>/, or pub/ itself for a single file)."""
 
     ROOT_ACL = {"owner": "own@x.com", "users": ["alice@x.com"]}
 
@@ -1243,13 +1243,51 @@ class AclRootTest(unittest.TestCase):
                     ".acl.json", "U/r/x.html", "public/x.html", ""):
             self.assertIsNone(gate.acl_key_for(key), key)
 
-    def test_pub_keeps_its_own_directory(self):
-        self.assertEqual(gate.acl_key_for("pub/x.html"), "pub/.acl.json")
-        self.assertEqual(gate.acl_key_for("pub/run/index.html"), "pub/run/.acl.json")
-        self.assertEqual(gate.acl_key_for("pub/run/a/b.css"), "pub/run/a/.acl.json")
+    def test_pub_root_follows_how_pub_is_published(self):
+        # the CLI publishes pub/<run>/<file> (a run directory, like u/<run>/), the MCP publishes
+        # pub/<name>-<id>.<ext> (one file directly under the prefix)
+        cases = {
+            "pub/x.html": "pub/.acl.json",
+            "pub/mcp-report-0123abcd.html": "pub/.acl.json",
+            "pub/run/index.html": "pub/run/.acl.json",
+            "pub/run/a/b.css": "pub/run/.acl.json",
+            "pub/run/a/b/c/d.js": "pub/run/.acl.json",
+        }
+        for key, want in cases.items():
+            self.assertEqual(gate.acl_key_for(key), want, key)
         for key in ("pub/x.html", "pub/run/index.html", "pub/run/a/b/c.css"):
-            self.assertEqual(gate.decide("a@x.com", [], key, None, NOW),
-                             (True, "pub: any signed-in tenant user"), key)
+            self.assertTrue(gate.decide("a@x.com", [], key, None, NOW)[0], key)
+
+    def test_pub_keys_without_a_pub_root(self):
+        # an empty <run> or an empty path below it has no root, like u/ and g/
+        for key in ("pub/", "pub//x.html", "pub//", "pub/run/"):
+            self.assertIsNone(gate.acl_key_for(key), key)
+        # every pub prefix ends in "/": one that does not has no root (fails closed)
+        self.assertIsNone(gate.acl_key_for("pub/run/x.html", pub_prefixes=("pub",)))
+        self.assertIsNone(gate.acl_key_for("pubx.html", pub_prefixes=("pub",)))
+        # another prefix, several segments deep: the same two shapes below it
+        deep = ("public/reports/",)
+        self.assertEqual(gate.acl_key_for("public/reports/r1/a/b.html", pub_prefixes=deep),
+                         "public/reports/r1/.acl.json")
+        self.assertEqual(gate.acl_key_for("public/reports/one.html", pub_prefixes=deep),
+                         "public/reports/.acl.json")
+        self.assertIsNone(gate.acl_key_for("public/other/x.html", pub_prefixes=deep))
+
+    def test_stray_pub_root_acl_governs_every_depth(self):
+        # a stray pub/<run>/.acl.json (no publisher writes one) closes its whole run, at any
+        # depth, not only the files next to it; a deeper one is never read
+        stray = {"owner": "own@x.com", "users": ["alice@x.com"]}
+        m = FakeMinio({"pub/open/.acl.json": json.dumps(stray).encode(),
+                       "pub/open/sub/.acl.json": json.dumps({"owner": "carol@x.com"}).encode()})
+        for key in ("pub/open/index.html", "pub/open/sub/x.html", "pub/open/sub/deeper/y.css"):
+            acl, err = gate.read_acl(m, key, NOW, bypass_cache=True)
+            self.assertEqual((acl, err), (stray, None), key)
+            self.assertFalse(gate.decide("carol@x.com", [], key, acl, NOW)[0], key)
+            self.assertFalse(gate.decide("", [], key, acl, NOW)[0], key)          # anonymous
+            self.assertEqual(gate.decide("alice@x.com", [], key, acl, NOW), (True, "user"), key)
+        self.assertEqual(set(m.gets), {"pub/open/.acl.json"})
+        # a single-file pub artifact answers to pub/.acl.json only, never to a run's ACL
+        self.assertEqual(gate.read_acl(m, "pub/flat.html", NOW, bypass_cache=True), (None, None))
 
     def test_decide_denies_a_key_without_root_whatever_the_acl(self):
         permissive = {"owner": "a@x.com", "users": ["a@x.com"], "groups": ["g1"]}
@@ -1341,7 +1379,7 @@ class AclRootTest(unittest.TestCase):
         for path, want in (("/artifacts/u/r/index.html", "/artifacts/u/r/"),
                            ("/artifacts/u/r/a/b/c.css", "/artifacts/u/r/"),
                            ("/artifacts/g/team/r/a/b.js", "/artifacts/g/team/r/"),
-                           ("/artifacts/pub/run/a/x.html", "/artifacts/pub/run/a/"),
+                           ("/artifacts/pub/run/a/x.html", "/artifacts/pub/run/"),
                            ("/artifacts/u/x.html", None), ("/artifacts/acl/r.json", None),
                            ("/elsewhere/u/r/x.html", None)):
             self.assertEqual(gate.artifact_root_path(path), want, path)

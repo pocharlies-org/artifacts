@@ -24,7 +24,8 @@ X-Auth-Request-* headers), then decides against the ACL at the artifact's root (
   - No artifact root (a key directly under `u/` or `g/<slug>/`, `acl/...`, anything outside the
     pub prefixes, `u/` and `g/`): deny, whatever ACL objects exist.
   - `pub/` objects WITHOUT an ACL: any signed-in user of the tenant. A `pub/` ACL, where one
-    exists, is still the `.acl.json` of the key's own directory (unchanged).
+    exists, is the one at the key's pub root: `pub/<run>/.acl.json` for `pub/<run>/...` at any
+    depth, `pub/.acl.json` for a single file directly under `pub/` (acl_key_for).
   - Anything else without an ACL: deny (the request-access button on the deny page goes nowhere).
   - An identity containing `#EXT#` (a directory guest's UPN) is refused on every endpoint.
   - `expires` in the past: deny (still requestable: the owner still exists).
@@ -160,8 +161,7 @@ CSRF_TTL = int(_env("GATE_CSRF_TTL_SECONDS", "3600"))
 # README said "30 s" — the docs now follow the code; keep them in sync if this ever changes).
 ACL_CACHE_TTL = int(_env("GATE_ACL_CACHE_SECONDS", "15"))
 # Upper bound of that cache (least recently used entries go first): one entry per ACL key
-# asked about (an artifact root, or a pub/ directory), so without a bound any signed-in
-# visitor could grow it without limit.
+# asked about (an artifact root), so without a bound any visitor could grow it without limit.
 ACL_CACHE_MAX = max(1, int(_env("GATE_ACL_CACHE_MAX_ENTRIES", "10000")))
 LISTEN_PORT = int(_env("GATE_PORT", "8080"))           # public surface (see module docstring)
 AUTH_LISTEN_PORT = int(_env("GATE_AUTH_PORT", "8081"))  # forwardAuth decision endpoint only
@@ -482,17 +482,34 @@ def acl_key_for(key, pub_prefixes=PUB_PREFIXES):
 
         u/<run>/<path>           -> u/<run>/.acl.json          (the artifact root)
         g/<slug>/<run>/<path>    -> g/<slug>/<run>/.acl.json   (the artifact root)
-        <pub prefix>...          -> the .acl.json of the key's own directory (pub/ unchanged)
+        pub/<run>/<path>         -> pub/<run>/.acl.json        (the artifact root)
+        pub/<file>               -> pub/.acl.json              (a single-file pub artifact)
         anything else            -> None
 
     <path> is one or more segments: every file of an artifact, at any depth, answers to the
     root ACL, and an .acl.json below the root is never read. None covers a key with no object
     below an artifact root (`u/x`, `g/<slug>/x`, an empty <run> or <slug>), `acl/...`, `_gate/...`
-    and every key outside the pub prefixes, `u/` and `g/`."""
+    and every key outside the pub prefixes, `u/` and `g/`.
+
+    The pub roots (shown for the default prefix `pub/`; every entry of GATE_PUB_PREFIXES ends
+    in "/", a prefix without one has no root) follow how pub/ is published: the CLI writes a
+    run directory, `pub/<run>/<file>`, the same shape as `u/<run>/`; the MCP writes one file
+    directly under the prefix, `pub/<name>-<id>.<ext>`, whose only directory is the prefix
+    itself. No publisher writes an ACL under pub/ (anonymous read by design, see decide()).
+    One that exists anyway is honoured at its root, at every depth below it, like `u/` and
+    `g/`: it closes its root to anonymous callers and narrows it for signed-in ones."""
     if not isinstance(key, str) or not key:
         return None
-    if key.startswith(pub_prefixes):
-        return key.rsplit("/", 1)[0] + "/.acl.json" if "/" in key else ".acl.json"
+    for prefix in pub_prefixes:
+        if key.startswith(prefix):
+            if not prefix.endswith("/"):
+                return None
+            rest = key[len(prefix):].split("/")
+            if len(rest) == 1:
+                return prefix + ".acl.json" if rest[0] else None
+            if not rest[0] or not "/".join(rest[1:]):
+                return None
+            return prefix + rest[0] + "/.acl.json"
     parts = key.split("/")
     n = _ROOT_SEGMENTS.get(parts[0])
     if n is None or len(parts) <= n or not all(parts[:n]) or not "/".join(parts[n:]):
