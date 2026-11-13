@@ -19,7 +19,14 @@
                         or stylesheet out of another type) and Referrer-Policy: no-referrer (links
                         and subresources of an artifact never carry its URL to another site).
        artifacts-strip  drops the (large) session cookies and X-Auth-Request-* headers before MinIO:
-                        MinIO rejects requests whose headers total > 8 KB with 400 MetadataTooLarge. */ -}}
+                        MinIO rejects requests whose headers total > 8 KB with 400 MetadataTooLarge.
+       gate-pub-auth    forwardAuth to the gate's ANONYMOUS pub/ decision (/_gate/pub-auth on the same
+                        decision listener): no login, allows only an existing pub/ object whose pub
+                        root has no .acl.json and signs that read; one 404 page for everything else.
+                        Rendered whenever artifactsGate.anonymousPubEnabled is true; attached only to
+                        the pub/ rule, and only when artifactsGate.anonymousPubThroughGate is true
+                        (artifacts-routes.yaml rule 2). trustForwardHeader is always false here: on a
+                        path with no login, the URI the gate decides must be the one Traefik received. */ -}}
 {{- $sso := .Values.namespaces.sso }}
 {{- $trustFwd := .Values.gate.trustForwardHeader | default false }}
 {{- if not (kindIs "bool" $trustFwd) }}
@@ -44,6 +51,25 @@ spec:
     # bucket has no anonymous read policy outside pub/. Traefik copies these onto the request,
     # replacing anything the visitor sent.
     authResponseHeaders: ["Authorization", "X-Amz-Date", "X-Amz-Content-Sha256"]
+{{- if .Values.artifactsGate.anonymousPubEnabled }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: gate-pub-auth
+  namespace: {{ $sso }}
+  labels:
+    app.kubernetes.io/part-of: artifacts
+spec:
+  forwardAuth:
+    # the anonymous pub/ decision: no identity is asked, so no session is needed
+    address: http://artifact-gate.{{ $sso }}.svc.cluster.local:{{ .Values.gate.authPort }}/_gate/pub-auth
+    # always false (not gate.trustForwardHeader): Traefik sets X-Forwarded-Method/-Uri/-Host
+    # from the request it received, whatever the client sent
+    trustForwardHeader: false
+    # on allow, the same signed upstream read as gate-auth
+    authResponseHeaders: ["Authorization", "X-Amz-Date", "X-Amz-Content-Sha256"]
+{{- end }}
 ---
 apiVersion: traefik.io/v1alpha1
 kind: Middleware

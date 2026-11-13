@@ -1,10 +1,14 @@
 # Caddyfile — replicates the Traefik IngressRoute rules of the Helm chart for the local
 # stack (see helm/artifacts/templates/artifacts-routes.yaml). Host is 127.0.0.1.
 #   1. writes (non-GET/HEAD)       -> gate (405 before any login)
-#   2. anonymous pub/ GET/HEAD     -> MinIO (no .acl.json, no trailing-slash listings)
+#   2. anonymous pub/ GET/HEAD     -> ARTIFACTS_PUB_MODE (the chart's
+#                                     artifactsGate.anonymousPubThroughGate):
+#        direct (default)          -> MinIO (no .acl.json, no trailing-slash listings)
+#        gate                      -> forward_auth to the gate's anonymous decision
+#                                     (/_gate/pub-auth), then MinIO with its SigV4 headers
 #   3. artifact GET/HEAD           -> forwardAuth to the gate's decision listener, then MinIO
 #                                     with the gate's SigV4 headers (no anonymous read off pub/)
-#   4. /_gate/* except auth, healthz and plugin/ -> gate (those three answer 404 here)
+#   4. /_gate/* except auth, pub-auth, healthz and plugin/ -> gate (those answer 404 here)
 #   5. /oauth2/ browser endpoints  -> oauth2-proxy, ALLOW-LIST only: sign_in, start, callback,
 #                                     sign_out, static/<file>; any other /oauth2 path -> 404
 #   6. plugin routes               -> plugin services (env ARTIFACTS_CADDY_PLUGINS, see below)
@@ -18,6 +22,58 @@
 (plugin) {
 	handle {args[0]}* {
 		reverse_proxy {args[1]} {
+			header_up -X-Auth-Request-User
+			header_up -X-Auth-Request-Email
+			header_up -X-Auth-Request-Preferred-Username
+			header_up -X-Auth-Request-Groups
+		}
+	}
+}
+
+# Rule 2, anonymous pub/, two ways (the caddy service's ARTIFACTS_PUB_MODE picks one; any
+# other value fails to start: no such snippet).
+# pub-direct: straight to MinIO under its anonymous pub/* policy (the chart's default).
+(pub-direct) {
+	@pub path /artifacts/pub/*
+	handle @pub {
+		# backticks: in a Caddyfile single quotes are literal characters, so a '...' regex
+		# never matched and pub/<run>/.acl.json was served anonymously.
+		@pubbad path_regexp bad `\.acl\.json$|/$`
+		respond @pubbad 404
+		header Content-Security-Policy "sandbox allow-scripts"
+		# `>` sets the header once the upstream has answered, replacing its value: MinIO sends
+		# its own X-Content-Type-Options, which would otherwise appear twice (Traefik's
+		# customResponseHeaders replace it the same way)
+		header >X-Content-Type-Options "nosniff"
+		header >Referrer-Policy "no-referrer"
+		reverse_proxy minio:9000 {
+			header_up -Authorization
+			header_up -Cookie
+			header_up -X-Auth-Request-User
+			header_up -X-Auth-Request-Email
+			header_up -X-Auth-Request-Preferred-Username
+			header_up -X-Auth-Request-Groups
+		}
+	}
+}
+
+# pub-gate: the gate's anonymous decision first (the chart's anonymousPubThroughGate: true).
+# No login and no exclusions: every pub/ shape reaches the gate, which allows only an existing
+# object whose pub root has no .acl.json and signs that read, and answers everything else with
+# one 404 page. The headers are set with `>` (replace, like Traefik's customResponseHeaders),
+# so the gate's own 404 carries the sandbox CSP too, as with artifacts-csp first in the chart.
+(pub-gate) {
+	@pub path /artifacts/pub/*
+	handle @pub {
+		header >Content-Security-Policy "sandbox allow-scripts"
+		header >X-Content-Type-Options "nosniff"
+		header >Referrer-Policy "no-referrer"
+		forward_auth gate:8081 {
+			uri /_gate/pub-auth
+			copy_headers Authorization X-Amz-Date X-Amz-Content-Sha256
+		}
+		reverse_proxy minio:9000 {
+			header_up -Cookie
 			header_up -X-Auth-Request-User
 			header_up -X-Auth-Request-Email
 			header_up -X-Auth-Request-Preferred-Username
@@ -41,27 +97,8 @@
 		reverse_proxy gate:8080
 	}
 
-	@pub path /artifacts/pub/*
-	handle @pub {
-		# backticks: in a Caddyfile single quotes are literal characters, so a '...' regex
-		# never matched and pub/<run>/.acl.json was served anonymously.
-		@pubbad path_regexp bad `\.acl\.json$|/$`
-		respond @pubbad 404
-		header Content-Security-Policy "sandbox allow-scripts"
-		# `>` sets the header once the upstream has answered, replacing its value: MinIO sends
-		# its own X-Content-Type-Options, which would otherwise appear twice (Traefik's
-		# customResponseHeaders replace it the same way)
-		header >X-Content-Type-Options "nosniff"
-		header >Referrer-Policy "no-referrer"
-		reverse_proxy minio:9000 {
-			header_up -Authorization
-			header_up -Cookie
-			header_up -X-Auth-Request-User
-			header_up -X-Auth-Request-Email
-			header_up -X-Auth-Request-Preferred-Username
-			header_up -X-Auth-Request-Groups
-		}
-	}
+	# rule 2: ARTIFACTS_PUB_MODE is `direct` (default) or `gate`
+	import pub-{$ARTIFACTS_PUB_MODE:direct}
 
 	@gated path /artifacts/*
 	handle @gated {
@@ -93,6 +130,7 @@
 	@gateapi {
 		path /_gate/*
 		not path /_gate/auth /_gate/healthz /_gate/plugin/*
+		not path /_gate/pub-auth
 	}
 	handle @gateapi {
 		reverse_proxy gate:8080

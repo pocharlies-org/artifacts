@@ -74,9 +74,21 @@ minio:
 
 # ---- artifact-gate --------------------------------------------------------------------
 artifactsGate:
-  # Serve <bucket>/pub/ anonymously (straight from MinIO, no login). Safe ONLY while the
-  # host is not publicly reachable. Keep false for any public host. See README.
+  # Serve <bucket>/pub/ anonymously (no login). Safe ONLY while the host is not publicly
+  # reachable. Keep false for any public host. See README.
   anonymousPubEnabled: false
+  # Where the anonymous pub/ read is decided (only with anonymousPubEnabled: true; the chart
+  # refuses true without it).
+  #   false (default): rule 2 serves pub/ straight from MinIO (its anonymous pub/* policy);
+  #     .acl.json and listings are kept off it by the rule. A missing key answers with
+  #     MinIO's own error.
+  #   true: rule 2 asks the gate first (forwardAuth middleware gate-pub-auth, the gate's
+  #     /_gate/pub-auth on gate.authPort): the gate allows only an existing object whose pub
+  #     root has no .acl.json, signs that read, and answers everything else (missing key,
+  #     ACL'd key, listing, .acl.json, traversal shapes) with one 404 page of its own.
+  # The gate-pub-auth middleware itself is rendered whenever anonymousPubEnabled is true, so
+  # turning this on changes routes only.
+  anonymousPubThroughGate: false
 
 gate:
   # How the gate code reaches the pod. Both modes run the same file as /app/gate.py.

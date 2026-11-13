@@ -29,7 +29,7 @@ VALUES = os.path.join(CHART, "values.yaml")
 HELM = os.environ.get("HELM", "helm")
 NS = "artifacts"
 OPTIONS = {
-    "artifactsGate": {"anonymousPubEnabled": True},
+    "artifactsGate": {"anonymousPubEnabled": True, "anonymousPubThroughGate": True},
     "artifactsExtraHosts": ["b.example.com"],
     "plugins": [{"name": "canvas", "pathPrefix": "/_canvas/", "service": "artifact-canvas", "port": 8080}],
     "gate": {"bakedImage": True, "bakedImageDigest": "sha256:" + "0123456789abcdef" * 4},
@@ -44,6 +44,7 @@ EXPECTED = {
     ("Deployment", "oauth2-proxy-artifacts"), ("Service", "oauth2-proxy-artifacts"),
     ("Middleware", "gate-auth"), ("Middleware", "artifacts-errors"),
     ("Middleware", "artifacts-csp"), ("Middleware", "artifacts-strip-to-minio"),
+    ("Middleware", "gate-pub-auth"),
     ("IngressRoute", "artifacts-routes"), ("IngressRoute", "artifacts-plugin-canvas"),
     ("Job", "artifacts-bootstrap"),
 }

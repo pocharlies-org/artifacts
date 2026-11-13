@@ -3,7 +3,10 @@
 # (pub/), read gated (302 without login, 200 with a Dex id_token as Bearer, 200 after a
 # browser login through sign_in/Dex/callback), and the
 # negative checks (no .acl.json, no _plugins/, no listing, no writes, no query strings, no
-# client S3 headers, the gate never signs with MinIO root).
+# client S3 headers, the gate never signs with MinIO root). The anonymous pub/ route follows
+# the caddy service's ARTIFACTS_PUB_MODE (direct by default, or gate: the gate's anonymous
+# decision first); the gate-mode checks run when the stack was started with
+# ARTIFACTS_PUB_MODE=gate.
 # Requires: docker compose, curl, python3. The publisher renders .md inputs with the
 # python 'markdown' package (.html inputs need nothing); if it is not importable this
 # script creates a local .venv (gitignored) and installs it there.
@@ -80,6 +83,98 @@ check "anonymous pub .acl.json not served" 404 "$(curl -s -o /dev/null -w '%{htt
 check "anonymous pub .acl.json body leaks nothing" 0 "$(curl -s "$BASE/artifacts/pub/$RUN/.acl.json" | grep -c 'seeded@example.com')"
 check "anonymous pub dir not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/artifacts/pub/$RUN/")"
 check "anonymous pub dir is no MinIO XML" 0 "$(curl -s "$BASE/artifacts/pub/$RUN/" | grep -c '<Error>')"
+
+# ---- anonymous pub/: the traversal probe list never returns an object (both modes) ------
+# Canaries in u/, g/, acl/ and _gate/ (no ACL, so a mis-decided key would be readable); each
+# probe spelling is sent as is (--path-as-is), with no session.
+CAN="e2e-canary-$(date +%s)"
+CANARIES=("u/$CAN/c.html" "g/team/$CAN/c.html" "acl/$CAN.html" "_gate/$CAN.json")
+for k in "${CANARIES[@]}"; do
+  echo "CANARY-$CAN" | mc_admin "mc pipe local/artifacts/$k >/dev/null" \
+    || { echo "FAIL: could not seed canary $k"; fail=1; }
+done
+canary_hits=0; probes=0
+for k in "${CANARIES[@]}"; do
+  for s in "pub/../$k" "pub/%2e%2e/$k" "pub/%252e%252e/$k" "pub//../$k" "pub/x;/../$k" \
+           "pub/$RUN/..%2f..%2f$k" "pub/%5c..%5c$k"; do
+    probes=$((probes + 1))
+    canary_hits=$((canary_hits + $(curl -s --path-as-is "$BASE/artifacts/$s" | grep -c "CANARY-$CAN")))
+  done
+done
+check "anonymous pub/ traversal probes return no canary ($probes probes)" 0 "$canary_hits"
+
+# ---- anonymous pub/ through the gate (ARTIFACTS_PUB_MODE=gate) ---------------------------
+# The caddy service says which rule 2 runs: direct (default, straight to MinIO) or gate (the
+# gate's anonymous decision, /_gate/pub-auth). In gate mode: a missing key, a key whose pub
+# root has an ACL, an .acl.json and a listing all get the gate's one 404 page (same status,
+# headers and body, GET and HEAD), with the sandbox CSP and nothing from MinIO; a forwarded
+# URI the client sends is ignored; /_gate/auth stays the signed-in decision.
+PUB_MODE=$(docker compose exec -T caddy printenv ARTIFACTS_PUB_MODE 2>/dev/null | tr -d '\r')
+PUB_MODE=${PUB_MODE:-direct}
+echo "INFO: anonymous pub/ route mode: $PUB_MODE"
+check "/_gate/pub-auth not routed to the gate" "404 0" \
+  "$(curl -s -o /dev/null -w '%{http_code} %{size_download}' "$BASE/_gate/pub-auth")"
+if [[ "$PUB_MODE" == gate ]]; then
+  # pub/$RUN carries the stray .acl.json seeded above. Seeded here, before any read (no cached
+  # answer helps): an open run (no ACL) and a closed one (a stray ACL at its pub root).
+  OPEN="e2e-open-$CAN"; CLOSED="e2e-closed-$CAN"
+  echo "OPEN-$CAN" | mc_admin "mc pipe local/artifacts/pub/$OPEN/index.html >/dev/null" \
+    && echo '<h1>closed</h1>' | mc_admin "mc pipe local/artifacts/pub/$CLOSED/sub/index.html >/dev/null" \
+    && echo '{"owner":"test@example.com","users":["test@example.com"]}' \
+       | mc_admin "mc pipe local/artifacts/pub/$CLOSED/.acl.json >/dev/null" \
+    || { echo "FAIL: could not seed the open and closed pub/ runs"; fail=1; }
+  answer() { # <GET|HEAD> <url>: status line, headers without Date, body
+    if [[ "$1" == HEAD ]]; then curl -s -I --path-as-is "$2"; else curl -s -D - --path-as-is "$2"; fi \
+      | tr -d '\r' | grep -viE '^date:'
+  }
+  check "gate mode: an open pub/ object is served anonymously" 1 \
+    "$(curl -s "$BASE/artifacts/pub/$OPEN/index.html" | grep -c "OPEN-$CAN")"
+  MISSING="$BASE/artifacts/pub/e2e-none-$CAN/missing.html"
+  ref_get=$(answer GET "$MISSING")
+  ref_head=$(answer HEAD "$MISSING")
+  check "gate mode: a missing pub/ key answers 404" 1 "$(printf '%s\n' "$ref_get" | head -1 | grep -c ' 404')"
+  check "gate mode: the 404 is the gate's page (text/html)" 1 "$(printf '%s\n' "$ref_get" | grep -ci '^content-type: text/html')"
+  check "gate mode: the 404 carries the sandbox CSP" 1 "$(printf '%s\n' "$ref_get" | grep -ci '^content-security-policy: sandbox allow-scripts$')"
+  check "gate mode: nothing from MinIO (NoSuchKey, XML, server: MinIO)" 0 "$(printf '%s\n' "$ref_get" | grep -ciE 'NoSuchKey|<\?xml|^server: minio')"
+  check "gate mode: no login redirect" 0 "$(printf '%s\n' "$ref_get" | grep -ci '^location:')"
+  # (not pub/$RUN/index.html: it was read before its stray ACL was seeded, and the gate's ACL
+  # cache, GATE_ACL_CACHE_SECONDS, may still hold "no ACL" for it; $CLOSED is that case)
+  for u in "pub/$CLOSED/sub/index.html" "pub/$CLOSED/.acl.json" \
+           "pub/$RUN/.acl.json" "pub/$RUN/" "pub/$OPEN/" "pub/$OPEN/a%3bb.html" "pub/$OPEN/a..b.html" \
+           "pub/$OPEN/index.html%2500"; do
+    check "gate mode: $u answers like a missing key (GET)" same \
+      "$([[ "$(answer GET "$BASE/artifacts/$u")" == "$ref_get" ]] && echo same || echo different)"
+    check "gate mode: $u answers like a missing key (HEAD)" same \
+      "$([[ "$(answer HEAD "$BASE/artifacts/$u")" == "$ref_head" ]] && echo same || echo different)"
+  done
+  check "gate mode: the stray ACL leaks nothing" 0 "$(curl -s "$BASE/artifacts/pub/$CLOSED/.acl.json" | grep -c 'test@example.com')"
+  # the client cannot pick what the gate decides: Caddy sets X-Forwarded-Uri itself
+  check "gate mode: a client X-Forwarded-Uri is ignored (the pub/ object is served)" 1 \
+    "$(curl -s -H "X-Forwarded-Uri: /artifacts/u/$CAN/c.html" "$BASE/artifacts/pub/$OPEN/index.html" | grep -c "OPEN-$CAN")"
+  check "gate mode: a client X-Forwarded-Uri never reads the canary" 0 \
+    "$(curl -s -H "X-Forwarded-Uri: /artifacts/u/$CAN/c.html" "$BASE/artifacts/pub/$RUN/missing.html" | grep -c "CANARY-$CAN")"
+  # the decision listener itself (never routed): a forwarded target aimed at u/ or g/ gets the
+  # uniform answer; /_gate/auth without a session never answers 200 for a pub/ key
+  pubauth() { # <x-forwarded-uri> [path]
+    docker compose exec -T -e U="$1" -e P="${2:-/_gate/pub-auth}" gate python3 -c '
+import os, urllib.error, urllib.request
+req = urllib.request.Request("http://127.0.0.1:8081" + os.environ["P"], headers={
+    "X-Forwarded-Method": "GET", "X-Forwarded-Uri": os.environ["U"], "X-Forwarded-Host": "127.0.0.1:8080"})
+try:
+    r = urllib.request.urlopen(req); print(r.status, "Authorization" in r.headers)
+except urllib.error.HTTPError as e:
+    print(e.code, "Authorization" in e.headers)'
+  }
+  check "gate mode: pub-auth allows the open pub/ key, signed" "200 True" "$(pubauth "/artifacts/pub/$OPEN/index.html")"
+  check "gate mode: pub-auth aimed at u/ gets the uniform answer" "404 False" "$(pubauth "/artifacts/u/$CAN/c.html")"
+  check "gate mode: pub-auth aimed at g/ gets the uniform answer" "404 False" "$(pubauth "/artifacts/g/team/$CAN/c.html")"
+  check "gate mode: /_gate/auth without a session is never 200 on pub/" "401 False" \
+    "$(pubauth "/artifacts/pub/$OPEN/index.html" /_gate/auth)"
+  mc_admin "mc rm --recursive --force local/artifacts/pub/$OPEN local/artifacts/pub/$CLOSED >/dev/null 2>&1" || true
+else
+  echo "INFO: pub/ is served straight from MinIO in this mode; the gate-mode checks need ARTIFACTS_PUB_MODE=gate"
+fi
+for k in "${CANARIES[@]}"; do mc_admin "mc rm local/artifacts/$k >/dev/null 2>&1" || true; done
 
 # ---- gated read: 302 without login -------------------------------------------------------
 RUN2="e2e-priv-$(date +%s)"

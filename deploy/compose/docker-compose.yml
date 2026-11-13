@@ -12,6 +12,8 @@
 #   ARTIFACTS_PLUGIN_USERS   `<name>:<secret>[,<name>:<secret>...]` -> S3 user plugin-<name>
 #                            scoped to _plugins/<name>/ (bootstrap.sh)
 #   GATE_ACL_CACHE_SECONDS   gate ACL cache (default 15; plugins testing revocation lower it)
+#   ARTIFACTS_PUB_MODE       anonymous pub/ route: direct (default, straight to MinIO) or gate
+#                            (the gate's anonymous decision first; e2e.sh checks either)
 name: artifacts
 services:
   minio:
@@ -135,6 +137,9 @@ services:
       - "127.0.0.1:8080:80"
     environment:
       ARTIFACTS_CADDY_PLUGINS: ${ARTIFACTS_CADDY_PLUGINS:-}
+      # rule 2, anonymous pub/: `direct` (straight to MinIO) or `gate` (the gate's anonymous
+      # decision first), the chart's artifactsGate.anonymousPubThroughGate false / true
+      ARTIFACTS_PUB_MODE: ${ARTIFACTS_PUB_MODE:-direct}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on: [gate, oauth2-proxy]

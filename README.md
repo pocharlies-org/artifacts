@@ -107,7 +107,10 @@ docker compose up bootstrap   # bucket, ILM rules, anonymous pub/ policy, gate S
 ```
 
 Then open <http://127.0.0.1:8080/artifacts/pub/<run>/index.html> — anonymous `pub/`
-reads work; gated reads (`/artifacts/u/...`) redirect to Dex login. Dex has three static
+reads work; gated reads (`/artifacts/u/...`) redirect to Dex login. `pub/` is served straight
+from MinIO by default; `ARTIFACTS_PUB_MODE=gate docker compose up -d` sends every `pub/` read
+to the gate's anonymous decision first (the chart's `artifactsGate.anonymousPubThroughGate`),
+and `./e2e.sh` then also checks that path. Dex has three static
 dev users: `test@example.com` / `test-password`, `test2@example.com` / `test2-password` and
 `test3@example.com` / `test3-password` (the extra two let plugins test sharing and refusals),
 with the display names *Test One*, *Test Two* and *Test Three* (the id_token `name` claim that
@@ -355,6 +358,7 @@ refuses anything else.
 |---|---|---|
 | `ingressRouteAnnotations` | `{}` | annotations on every IngressRoute (artifacts host and plugin routes), e.g. `kubernetes.io/ingress.class: traefik-internal` |
 | `gate.trustForwardHeader` | `false` | `trustForwardHeader` of the `gate-auth` forwardAuth middleware; `false` makes Traefik set the `X-Forwarded-*` headers the gate decides on from the request itself |
+| `artifactsGate.anonymousPubThroughGate` | `false` | with `artifactsGate.anonymousPubEnabled`: `false` serves `pub/` straight from MinIO (rule 2, `.acl.json` and listings kept off it); `true` makes rule 2 ask the gate's anonymous decision first (middleware `gate-pub-auth`, `/_gate/pub-auth`, `trustForwardHeader` always `false`), so a missing key, a key with an ACL, a listing and an `.acl.json` get the gate's one `404` page and never MinIO's error. `gate-pub-auth` is rendered whenever anonymous `pub/` is on, so turning this on changes routes only; the chart refuses `true` without anonymous `pub/` |
 | `oauth2Proxy.emailDomains` | `[]` | one `--email-domain` per entry; empty renders `--email-domain=*`; an entry `*` is refused |
 | `oauth2Proxy.trustedProxyIPs` | `[]` | one `--trusted-proxy-ip` per IP or CIDR (proxies allowed to set `X-Forwarded-*`); the flag exists from oauth2-proxy v7.15.2 (v7.15.5 or newer recommended; the example `image` is v7.15.6), so keep `image` at such a release |
 | `oauth2Proxy.extraArgs` | `[]` | only `--allowed-group=<id>` (non-empty id, one entry per group), appended last; any other flag is refused (`--email-domain` and `--trusted-proxy-ip` have their own values) |
@@ -380,9 +384,13 @@ their real types).
   - the read-signing user can only `GetObject` outside `_gate/`, `_plugins/` and the
     ACLs, so a replayed signature reads at most the artifact it was issued for.
 - **Edge before MinIO**: query strings and client `x-amz-*` / `x-minio-*` headers never
-  reach MinIO on a gated read (see "How it works"). The anonymous `pub/` rule serves
-  straight from MinIO without the gate: there the anonymous bucket policy is the only
-  authority, and `.acl.json` / trailing-slash paths are refused at the proxy.
+  reach MinIO on a gated read (see "How it works"). By default the anonymous `pub/` rule
+  serves straight from MinIO without the gate: there the anonymous bucket policy is the only
+  authority, `.acl.json` / trailing-slash paths are refused at the proxy, and a missing key
+  answers with MinIO's own `NoSuchKey`, which tells a prober which keys exist. With
+  `artifactsGate.anonymousPubThroughGate: true` every `pub/` read is decided and signed by
+  the gate, with the same edge rules as a gated read and one answer for everything it
+  refuses.
 - **Never MinIO root at runtime**: the gate uses two least-privilege users; root is
   only for the bootstrap.
 - **Request bodies before login**: only the gate's four POST endpoints (`/_gate/request`,

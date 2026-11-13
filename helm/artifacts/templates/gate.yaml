@@ -9,9 +9,9 @@
 
        Two listeners, one process: the public surface (request-access: /_gate/request|approve|deny,
        405 on writes) is served on 8080 = the port the public IngressRoute points at; the decision
-       endpoints /_gate/auth and /_gate/plugin/authz exist ONLY on values.gate.authPort (8081),
-       which no public route references. The gate itself 404s both on the public listener, so even
-       a misrouted route cannot drive a decision.
+       endpoints /_gate/auth, /_gate/pub-auth (the anonymous pub/ decision) and /_gate/plugin/authz
+       exist ONLY on values.gate.authPort (8081), which no public route references. The gate
+       itself 404s them on the public listener, so even a misrouted route cannot drive a decision.
 
        Secrets (all created outside git, see README):
          <sso>/artifact-gate-s3     access-key/secret-key: least-privilege S3 user (GetObject on

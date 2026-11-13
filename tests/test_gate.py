@@ -1557,6 +1557,34 @@ class PubAuthDecisionTest(unittest.TestCase):
         self.assertEqual(gate.pub_auth_decision("GET", uri, m, NOW, enabled=True)[0::2],
                          (False, "acl unreadable (malformed JSON)"))
 
+    def test_what_traefik_forwards_is_what_is_decided(self):
+        # the Traefik model of tests/check_oauth2_routes.py gives the path a pub/ read is
+        # forwarded with (X-Forwarded-Uri, trustForwardHeader false) and the path MinIO then
+        # receives: they are one path, so the gate decides the key the store serves. Probe
+        # spellings that Traefik keeps under pub/ are refused or decided as that same key.
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import check_oauth2_routes as routing
+        served = {"/artifacts/pub/run/index.html": "pub/run/index.html",
+                  "/artifacts/pub/%72un/index.html": "pub/run/index.html",
+                  "/artifacts/pub/run/./index.html": "pub/run/index.html",
+                  "/artifacts/pub/x/../run/index.html": "pub/run/index.html"}
+        refused = ["/artifacts/pub/%252e%252e/u/canary/c.html", "/artifacts/pub/x;/../u/canary/c.html",
+                   "/artifacts/pub/x%2f..%2f..%2fu/canary/c.html", "/artifacts/pub/%5c..%5cu/canary/c.html",
+                   "/artifacts/pub/run/index.html%00", "/artifacts/pub/run/index.html%3b",
+                   "/artifacts/pub/run/index.html%23", "/artifacts/pub/run/index.html%3F"]
+        for target, key in served.items():
+            rpath, upstream = routing.traefik(target)
+            self.assertTrue(rpath.startswith("/artifacts/pub/"), target)
+            self.assertEqual(self.d(upstream), (True, key, "pub: anonymous, no ACL"), target)
+        for target in refused:
+            res = routing.traefik(target)
+            if res is None:
+                continue                                  # Traefik answers 400 itself
+            rpath, upstream = res
+            if not rpath.startswith("/artifacts/pub/"):
+                continue                                  # not on the anonymous rule
+            self.assertFalse(self.d(upstream)[0], (target, upstream))
+
     def test_pub_key_refused_characters(self):
         for key in ("pub/a..b", "pub/a//b", "pub/a\\b", "pub/a;b", "pub/a%b", "pub/a#b",
                     "pub/a?b", "pub/a\x00b", "pub/a\x1fb", "pub/a\x7fb", "pub/a\x85b",
