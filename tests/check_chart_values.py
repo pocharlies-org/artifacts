@@ -12,7 +12,9 @@ oauth2Proxy.trustedProxyIPs and oauth2Proxy.extraArgs (login proxy flags; no
 container resources of the gate, the login proxy and the bootstrap Job (ephemeral-storage
 from values), the route that keeps /_gate/plugin/ off the public gate listener, and the
 example login-proxy image (digest-pinned, v7.15.5 or newer, the same image the compose stack
-runs). Every refusal the chart makes for these values is exercised too. Stdlib only.
+runs), and the names written into Traefik rules: artifactsHost, artifactsExtraHosts and
+plugins[].pathPrefix (a safe charset only, so a backtick can never rewrite a rule). Every
+refusal the chart makes for these values is exercised too. Stdlib only.
 """
 import json
 import os
@@ -234,6 +236,19 @@ check(resources(docs[("Job", "artifacts-bootstrap")]) == with_eph(JOB_RES),
 check(ok_render({"oauth2Proxy": {"emailDomains": [".example.com"]}}).count("- --email-domain=.example.com") == 1,
       "set: a leading-dot subdomain entry is accepted")
 
+# ---- names written into Traefik rules: hosts and plugin prefixes ------------------------
+names = ok_render({"artifactsHost": "a1.example-2.org", "artifactsExtraHosts": ["b.example.com", "192.0.2.10"],
+                   "plugins": [dict(PLUGIN[0], pathPrefix="/_canvas/v2/"),
+                               {"name": "x-1", "pathPrefix": "/_x-1_y/", "service": "s", "port": 80}]})
+rules = [m for _p, m, _s in routing.routes(names)]
+host_match = "(Host(`a1.example-2.org`) || Host(`b.example.com`) || Host(`192.0.2.10`))"
+check(rules and all(m.startswith(host_match + " && ") for m in rules),
+      "set: every rule starts with the host matcher of artifactsHost + artifactsExtraHosts")
+check(host_match + " && PathPrefix(`/_canvas/v2/`)" in rules
+      and host_match + " && PathPrefix(`/_x-1_y/`)" in rules,
+      "set: nested plugin prefixes and '_' / '-' in a segment are accepted")
+check(all(m.count("`") % 2 == 0 for m in rules), "set: every rule has balanced backticks")
+
 # ---- refusals ----------------------------------------------------------------------------
 OP = "oauth2Proxy"
 refusals = [
@@ -276,6 +291,27 @@ refusals = [
     # an allowed entry does not let a later one through
     ({OP: {"extraArgs": ["--allowed-group=00000000-0000-0000-0000-000000000001",
                          "--skip-auth-regex=.*"]}}, "only --allowed-group=<id> is accepted"),
+] + [
+    # plugin prefixes: written into PathPrefix(`...`), so only [a-z0-9_-] segments
+    ({"plugins": [dict(PLUGIN[0], pathPrefix=p)]}, "may only hold lowercase letters")
+    for p in ("/_x/`) || PathPrefix(`/", "/_canvas/`) || Host(`evil.example`) && PathPrefix(`/",
+              "/_Canvas/", "/_can vas/", "/_canvas/../", "/_canvas/./", "/_canvas//", "/_can.vas/",
+              "/_can\nvas/", "/_canvas/%2e/", "/_can\\vas/")
+] + [
+    # host names: written into Host(`...`), so a lowercase DNS name only
+    ({key: val}, "is not a host name")
+    for key, vals in (("artifactsExtraHosts", (["b.example.com`) || PathPrefix(`/"],
+                                               ["b.example.com`) || Host(`evil.example"],
+                                               ["B.example.com"], ["b.example.com:443"],
+                                               ["*.example.com"], ["b example.com"], ["-b.example.com"],
+                                               ["b-.example.com"], ["b..example.com"], ["b.example.com."],
+                                               [""], [5], ["a" * 64 + ".example.com"],
+                                               ["b.example.com", "c.example.com\n"])),
+                      ("artifactsHost", ("artifacts.example.com`) || Host(`evil.example", "",
+                                         "Artifacts.example.com", "artifacts.example.com/x")))
+    for val in vals
+] + [
+    ({"artifactsExtraHosts": "b.example.com"}, "artifactsExtraHosts must be a list"),
 ]
 for values, needle in refusals:
     rc, _, err = render(values)

@@ -11,10 +11,15 @@ Run:  python3 -I -m unittest discover -s tests -p 'e2e_*.py' -v
 
 import importlib.util
 import base64
+import io
 import json
+import logging
 import os
 import re
+import socket
 import threading
+import time
+import tracemalloc
 import unittest
 import urllib.error
 import urllib.parse
@@ -593,14 +598,17 @@ class E2ETest(unittest.TestCase):
         # Regression (found live): the gate's 405 path answered without reading the
         # request body. Traefik reuses backend keep-alive connections and BaseHTTPRequestHandler
         # does not drain bodies, so the leftover body byte became the first byte of the NEXT
-        # request line on that connection (in the cluster: method 'xPOST' -> 501). Two requests
-        # on ONE connection must both get their real 405, never a 501 from a corrupted request line.
+        # request line on that connection (in the cluster: method 'xPOST' -> 501). A body the
+        # gate does not read now closes the connection after the answer (Connection: close), so
+        # the next request starts on a fresh connection and still gets its real 405, never a 501
+        # from a corrupted request line.
         hostport = self.base.split("//", 1)[1]
         conn = http_client.HTTPConnection(hostport, timeout=10)
         self.addCleanup(conn.close)
         conn.request("PUT", "/artifacts/x.txt", body="x")
         r = conn.getresponse()
         self.assertEqual(r.status, 405)
+        self.assertEqual(r.getheader("Connection"), "close")
         r.read()
         conn.request("POST", "/artifacts/x.txt", body="y")
         r = conn.getresponse()
@@ -648,7 +656,7 @@ class E2ETest(unittest.TestCase):
         self.gate._acl_cache.clear()
         # bob is in no listed group: same answer as for a live artifact he is not on
         st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="bob")
-        self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "not-listed"))
+        self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "denied"))
         self.assertEqual((ans["artifact"]["expires"], ans["artifact"]["ttl"]), (None, None))
 
     def test_plugin_authz_allow_group_member(self):
@@ -667,7 +675,24 @@ class E2ETest(unittest.TestCase):
         st, ans = self.plugin_authz("/artifacts/team/noteam/x.html", sid="alice")
         self.assertEqual(st, 200)
         self.assertFalse(ans["allowed"])
-        self.assertIn("no-acl", ans["reason"])
+        self.assertEqual(ans["reason"], "denied")
+
+    def test_plugin_authz_stranger_cannot_tell_acl_from_no_acl(self):
+        # a stranger gets one answer for a directory without an ACL and for an ACL that does not
+        # list them; the gate's log keeps the detailed reason
+        USERS["stranger"] = ("stranger@example.com", "99999999-2222-4333-8444-555555555555")
+        OBJECTS["team/noacl/report.html"] = b"x"
+        log = self.capture_log()
+        _, no_acl = self.plugin_authz("/artifacts/team/noacl/report.html", sid="stranger")
+        _, listed_not_me = self.plugin_authz("/artifacts/team/secret/report.html", sid="stranger")
+        _, missing = self.plugin_authz("/artifacts/team/secret/ghost.html", sid="stranger")
+        for ans in (no_acl, listed_not_me, missing):
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), ans)
+            self.assertEqual((ans["artifact"]["expires"], ans["artifact"]["ttl"]), (None, None))
+        lines = [ln for ln in log.getvalue().splitlines() if "plugin-authz user=stranger@" in ln]
+        self.assertEqual(len(lines), 3, lines)
+        self.assertIn("reason=denied detail=no-acl: deny by default", lines[0])
+        self.assertIn("reason=denied detail=not-listed", lines[1])
 
     def test_plugin_authz_deny_expired(self):
         OBJECTS["team/secret/.acl.json"] = json.dumps(
@@ -756,8 +781,12 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 404)
 
     def test_plugin_authz_get_not_allowed(self):
-        st, _ = self.plugin_authz("/artifacts/team/secret/report.html", sid="alice", method="GET")
+        st, body, _ = http(self.auth_base + "/_gate/plugin/authz", cookie="sid=alice")
         self.assertEqual(st, 405)
+        self.assertEqual(json.loads(body), {"error": "POST required"})
+        # a GET carrying a body is refused before routing (a GET takes no body)
+        st, _ = self.plugin_authz("/artifacts/team/secret/report.html", sid="alice", method="GET")
+        self.assertEqual(st, 400)
 
     def test_plugin_authz_proxy_error_fails_closed(self):
         st, _ = self.plugin_authz("/artifacts/pub/free/index.html", sid="prefonly", flag=True)
@@ -767,6 +796,240 @@ class E2ETest(unittest.TestCase):
         st, ans = self.plugin_authz("/artifacts/team/secret/ghost.html", sid="alice")
         self.assertEqual((st, ans["allowed"]), (200, False))
         self.assertEqual(ans["reason"], "object-missing")
+
+    # -- hardening: request bodies, forwarded URI, logs, page headers -----------------
+    def capture_log(self):
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        lg = logging.getLogger("artifact-gate")
+        lg.addHandler(handler)
+        self.addCleanup(lg.removeHandler, handler)
+        self.addCleanup(lg.setLevel, lg.level)
+        lg.setLevel(logging.INFO)
+        return buf
+
+    @staticmethod
+    def raw(port, data, timeout=5.0):
+        """Send raw bytes; return (status, {header: value}, socket). status None = no answer."""
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        sock.sendall(data)
+        buf = b""
+        try:
+            while b"\r\n\r\n" not in buf:
+                got = sock.recv(65536)
+                if not got:
+                    break
+                buf += got
+        except OSError:
+            pass
+        if not buf.startswith(b"HTTP/1.1 "):
+            return None, {}, sock
+        head = buf.split(b"\r\n\r\n", 1)[0].decode("latin-1").split("\r\n")
+        hdrs = {k.lower(): v for k, _, v in (ln.partition(": ") for ln in head[1:])}
+        return int(head[0].split()[1]), hdrs, sock
+
+    def port_of(self, server):
+        return server.server_address[1]
+
+    def test_post_endpoint_refuses_chunked_body(self):
+        pub, dec = self.port_of(self.gate_public), self.port_of(self.gate_auth)
+        for port, path in ((pub, "/_gate/request"), (pub, "/_gate/approve"), (pub, "/_gate/deny"),
+                           (dec, "/_gate/plugin/authz")):
+            for te in ("chunked", "gzip, chunked", "identity"):
+                st, h, sock = self.raw(port, (
+                    f"POST {path} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: {te}\r\n"
+                    "Content-Type: application/x-www-form-urlencoded\r\n\r\n"
+                    "5\r\ncsrf=\r\n0\r\n\r\n").encode())
+                sock.close()
+                self.assertEqual((st, h.get("connection")), (411, "close"), (path, te))
+        # Content-Length together with Transfer-Encoding: refused the same way, never guessed
+        st, h, sock = self.raw(pub, b"POST /_gate/request HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n"
+                                    b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+        sock.close()
+        self.assertEqual(st, 411)
+
+    def test_chunked_body_is_never_read_into_memory(self):
+        # F1: a chunk-size line of -1 used to read the connection to its end into memory
+        # (7d00000: 125 MB claimed and allocated). The refusal comes before any body byte is read.
+        for size_line in (b"-1", b"7d00000"):
+            tracemalloc.start()
+            try:
+                tracemalloc.reset_peak()
+                base = tracemalloc.get_traced_memory()[0]
+                st, h, sock = self.raw(self.port_of(self.gate_public),
+                                       b"POST /_gate/request HTTP/1.1\r\nHost: x\r\n"
+                                       b"Transfer-Encoding: chunked\r\n\r\n" + size_line + b"\r\n",
+                                       timeout=3)
+                piece, sent = b"\0" * 65536, 0
+                try:
+                    for _ in range(128):             # 8 MiB more, if the gate still reads
+                        sock.sendall(piece)
+                        sent += len(piece)
+                    sock.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass                              # the gate closed the connection: refused
+                time.sleep(0.3)
+                peak = tracemalloc.get_traced_memory()[1] - base
+            finally:
+                tracemalloc.stop()
+                sock.close()
+            self.assertLess(peak, 2 * 1024 * 1024, (size_line, peak, sent))
+            self.assertEqual(st, 411, size_line)
+
+    def test_post_endpoint_refuses_missing_bad_or_large_length(self):
+        pub, dec = self.port_of(self.gate_public), self.port_of(self.gate_auth)
+        cases = [
+            (b"", 411),                                              # no length at all
+            (b"Content-Length: -1\r\n", 400),
+            (b"Content-Length: +5\r\n", 400),
+            (b"Content-Length: 5x\r\n", 400),
+            (b"Content-Length: 1, 1\r\n", 400),
+            (b"Content-Length: 1\r\nContent-Length: 1\r\n", 400),
+            (b"Content-Length: 99999999999\r\n", 400),
+            (b"Content-Length: 16385\r\n", 413),                     # POST_BODY_MAX + 1
+            (b"Content-Length: 314572800\r\n", 413),                 # 300 MB declared, 0 sent
+        ]
+        for port, path in ((pub, "/_gate/request"), (dec, "/_gate/plugin/authz")):
+            for hdr, want in cases:
+                st, h, sock = self.raw(port, b"POST " + path.encode() + b" HTTP/1.1\r\nHost: x\r\n"
+                                       + hdr + b"\r\n", timeout=3)
+                sock.close()
+                self.assertEqual((st, h.get("connection")), (want, "close"), (path, hdr))
+                if path.endswith("authz"):
+                    self.assertEqual(h.get("content-type"), "application/json")
+        self.assertEqual(self.gate.POST_BODY_MAX, 16 * 1024)
+
+    def test_post_endpoint_body_read_exactly_and_connection_reused(self):
+        # an accepted body (at the limit) is read in full: the next request on the same
+        # connection is parsed from the right byte
+        hostport = self.base.split("//", 1)[1]
+        conn = http_client.HTTPConnection(hostport, timeout=10)
+        self.addCleanup(conn.close)
+        prefix = "artifact=/artifacts/team/secret/report.html&csrf="
+        body = prefix + "x" * (16 * 1024 - len(prefix))     # exactly POST_BODY_MAX bytes
+        conn.request("POST", "/_gate/request", body=body,
+                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        r = conn.getresponse()
+        r.read()
+        self.assertEqual(r.status, 401)                     # read, parsed, no session
+        sock = conn.sock
+        conn.request("GET", "/_gate/healthz")
+        r = conn.getresponse()
+        self.assertEqual((r.status, r.read()), (200, b"ok"))
+        self.assertIs(conn.sock, sock, "the connection was not reused")
+
+    def test_body_on_a_method_that_takes_none_is_refused(self):
+        pub, dec = self.port_of(self.gate_public), self.port_of(self.gate_auth)
+        fwd = (b"X-Forwarded-Method: GET\r\nX-Forwarded-Uri: /artifacts/pub/free/index.html\r\n"
+               b"Cookie: sid=alice\r\n")
+        for method in (b"GET", b"HEAD"):
+            for body in (b"Content-Length: 5\r\n\r\nhello", b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"):
+                st, h, sock = self.raw(dec, method + b" /_gate/auth HTTP/1.1\r\nHost: x\r\n" + fwd + body)
+                sock.close()
+                self.assertEqual((st, h.get("connection")), (400, "close"), (method, body))
+                self.assertNotIn("authorization", h)
+        # Content-Length: 0 is no body: the same forwardAuth is answered as usual
+        st, h, sock = self.raw(dec, b"GET /_gate/auth HTTP/1.1\r\nHost: x\r\n" + fwd
+                               + b"Content-Length: 0\r\n\r\n")
+        sock.close()
+        self.assertEqual(st, 200)
+        # writes are never served: 405 as before, and with a body the connection closes unread
+        for method in (b"PUT", b"DELETE", b"PATCH", b"OPTIONS", b"POST"):
+            st, h, sock = self.raw(pub, method + b" /artifacts/x.txt HTTP/1.1\r\nHost: x\r\n"
+                                   b"Transfer-Encoding: chunked\r\n\r\n-1\r\n")
+            sock.close()
+            self.assertEqual((st, h.get("connection")), (405, "close"), method)
+            st, h, sock = self.raw(pub, method + b" /artifacts/x.txt HTTP/1.1\r\nHost: x\r\n"
+                                   b"Content-Length: 314572800\r\n\r\n")
+            sock.close()
+            self.assertEqual((st, h.get("connection")), (405, "close"), method)
+        st, h, sock = self.raw(pub, b"PUT /artifacts/x.txt HTTP/1.1\r\nHost: x\r\n\r\n")
+        sock.close()
+        self.assertEqual((st, h.get("connection")), (405, None))   # no body: keep-alive
+
+    def test_stalled_body_times_out(self):
+        # a client that stops sending holds the connection for GateHandler.timeout at most
+        self.assertEqual(self.gate.GateHandler.timeout, 30)
+
+        class Quick(self.gate.GateHandler):
+            timeout = 1
+
+        srv = serve(Quick, "public")
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        sock = socket.create_connection(("127.0.0.1", srv.server_address[1]), timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall(b"POST /_gate/request HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\ncsrf=")
+        t0 = time.monotonic()
+        try:
+            got = sock.recv(1024)
+        except socket.timeout:
+            got = None
+        self.assertEqual(got, b"", "the gate kept waiting for the rest of the body")
+        self.assertLess(time.monotonic() - t0, 4)
+
+    def test_forwarded_uri_read_two_ways_is_refused(self):
+        # L1: "#frag" was decided as pub/free/index.html and signed as ".../index.html#frag";
+        # "//host/..." and "http://host/..." put a host into one reading of the path
+        for uri in ("/artifacts/pub/free/index.html#frag", "/artifacts/team/secret/report.html#x",
+                    "//evil.example/artifacts/pub/free/index.html",
+                    "http://evil.example/artifacts/pub/free/index.html",
+                    "/artifacts/pub/free/in dex.html", "/artifacts/pub/free/index.html\x7f"):
+            st, body, h = self._auth_h(uri, "alice")
+            self.assertEqual(st, 404, uri)
+            self.assertIn("Nothing here", body, uri)
+            self.assertNotIn("Authorization", h, uri)
+        st, _, h = self._auth_h("/artifacts/pub/free/index.html", "alice")
+        self.assertEqual(st, 200)
+        self.assertIn("Authorization", h)
+
+    def test_action_token_never_in_the_log(self):
+        log = self.capture_log()
+        token = self.gate.make_action_token("ab" * 16, "approve", self.gate._KEY, int(time.time()))
+        st, _, _ = http(self.base + "/_gate/approve?token=" + urllib.parse.quote(token, safe=""),
+                        cookie="sid=owner")
+        self.assertEqual(st, 410)                            # no such request: still logged
+        st, _, sock = self.raw(self.port_of(self.gate_public),
+                               f"GET /_gate/deny?token={token} extra HTTP/1.1\r\n\r\n".encode())
+        sock.close()
+        self.assertEqual(st, 400)          # "Bad request syntax (<request line>)", logged too
+        out = log.getvalue()
+        self.assertIn('"GET /_gate/approve?<redacted> HTTP/1.1" 410', out)
+        self.assertIn("token=<redacted>", out)
+        self.assertNotIn(token, out)
+        self.assertNotIn(token.split(".")[1], out)
+
+    def test_client_values_cannot_forge_log_lines(self):
+        log = self.capture_log()
+        forged = "INFO action=approve id=deadbeef by=owner@example.com"
+        self._auth_h("/artifacts/team/secret/x%0A" + urllib.parse.quote(forged), "alice")
+        self._auth_h("/artifacts/team/secret/report.html?x=%0A" + urllib.parse.quote(forged), "alice")
+        # urlsplit drops \n from the form value; other line breaks of str.splitlines() remain
+        for sep in ("\x0b", "\x1e", "\x85", "\u2028"):
+            http(self.base + "/_gate/request", method="POST",
+                 data=urllib.parse.urlencode({"csrf": "bad", "artifact": "/artifacts/u/x" + sep + forged}),
+                 headers={"Content-Type": "application/x-www-form-urlencoded"}, cookie="sid=alice")
+        lines = log.getvalue().splitlines()
+        self.assertFalse([ln for ln in lines if ln.startswith(forged)], lines)
+        self.assertTrue([ln for ln in lines if "key=team/secret/x\\x0aINFO action" in ln], lines)
+        self.assertEqual(len([ln for ln in lines if "csrf rejected" in ln and "u/x\\" in ln]), 4,
+                         lines)
+
+    def test_gate_pages_cannot_be_framed(self):
+        USERS["fran"] = ("fran@example.com", "aaaa")
+        answers = [self.auth("/artifacts/team/secret/report.html", "fran"),          # 403 deny page
+                   self.auth("/artifacts/team/secret/.acl.json", "fran"),            # 404
+                   http(self.base + "/artifacts/x", method="DELETE"),                # 405
+                   http(self.base + "/_gate/approve?token=x"),                       # 410
+                   http(self.base + "/_gate/healthz")]                               # 200
+        st, _ = self.plugin_authz("/artifacts/team/secret/report.html", sid="fran")
+        self.assertEqual(st, 200)
+        for st, _, h in answers:
+            self.assertIn("frame-ancestors 'none'", h.get("Content-Security-Policy", ""), st)
+            self.assertIn("default-src 'none'", h.get("Content-Security-Policy", ""), st)
+            self.assertEqual(h.get("X-Frame-Options"), "DENY", st)
+            self.assertEqual(h.get("Server"), "artifact-gate/1.0", st)  # no Python version
 
 
 if __name__ == "__main__":

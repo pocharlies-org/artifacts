@@ -6,7 +6,9 @@ CSRF, rate limit, request store, ACL write. Run:
 """
 
 import base64
+import io
 import json
+import logging
 import os
 from datetime import datetime, timezone
 import sys
@@ -700,7 +702,31 @@ class PluginAuthzDecisionTest(unittest.TestCase):
     def test_deny_no_acl_outside_pub(self):
         ans = self.d("x@example.com", "team/x/r.html", None)
         self.assertFalse(ans["allowed"])
-        self.assertIn("no-acl", ans["reason"])
+        self.assertEqual(ans["reason"], "denied")
+        _, detail = gate.plugin_authz_decision_detail("x@example.com", [], "team/x/r.html", None,
+                                                      NOW, 200)
+        self.assertIn("no-acl", detail)                  # the detail is for the gate's log
+
+    def test_stranger_gets_one_reason_whatever_the_acl(self):
+        # a denied visitor must not tell "directory without an ACL" from "ACL that does not list
+        # me" (or a broken ACL, or a group ACL): one reason; the detail stays in the log
+        cases = {
+            "no-acl: deny by default (no owner to ask)": None,
+            "not-listed": {"owner": "o@example.com", "users": ["a@example.com"]},
+            "bad-acl": ["not", "a", "dict"],
+            "groups-claim-empty (possible Entra overage)": {"owner": "o@example.com",
+                                                            "groups": ["g-1"]},
+        }
+        for want_detail, acl in cases.items():
+            for head in (200, 404):
+                ans, detail = gate.plugin_authz_decision_detail("x@example.com", [], "team/x/r.html",
+                                                                acl, NOW, head, {"ttl": "7"}, NOW)
+                self.assertEqual(ans, {"allowed": False, "reason": "denied",
+                                       "user": {"id": "x@example.com", "name": "x@example.com",
+                                                "anonymous": False},
+                                       "artifact": {"key": "team/x/r.html", "expires": None,
+                                                    "ttl": None}}, (want_detail, head))
+                self.assertEqual(detail, want_detail)
 
     def test_deny_expired_even_owner(self):
         ans = self.d("owner@example.com", "team/x/r.html",
@@ -719,11 +745,11 @@ class PluginAuthzDecisionTest(unittest.TestCase):
         live = self.d("mallory@example.com", "team/x/r.html", users_only, tags={"ttl": "7"}, lm=NOW)
         dead = self.d("mallory@example.com", "team/x/r.html", dict(users_only, expires="2020-01-01"),
                       tags={"ttl": "7"}, lm=NOW)
-        self.assertEqual((dead["allowed"], dead["reason"]), (False, "not-listed"))
+        self.assertEqual((dead["allowed"], dead["reason"]), (False, "denied"))
         self.assertEqual(dead, live)
         self.assertEqual(dead["artifact"], {"key": "team/x/r.html", "expires": None, "ttl": None})
         anon = self.d("", "team/x/r.html", dict(users_only, expires="2020-01-01"))
-        self.assertEqual((anon["allowed"], anon["reason"]), (False, "not-listed"))
+        self.assertEqual((anon["allowed"], anon["reason"]), (False, "denied"))
         self.assertIsNone(anon["artifact"]["expires"])
         # group ACL: a member is told `expired`, a visitor in no listed group gets the live deny
         member = gate.plugin_authz_decision("carol@example.com", ["11111111-2222-4333-8444-555555555555"],
@@ -731,14 +757,16 @@ class PluginAuthzDecisionTest(unittest.TestCase):
         self.assertEqual(member["reason"], "expired")
         other = gate.plugin_authz_decision("carol@example.com", ["99999999-2222-4333-8444-555555555555"],
                                            "team/x/r.html", acl, NOW, 200)
-        self.assertEqual((other["reason"], other["artifact"]["expires"]), ("not-listed", None))
-        empty = gate.plugin_authz_decision("carol@example.com", [], "team/x/r.html", acl, NOW, 200)
-        self.assertIn("groups-claim-empty", empty["reason"])
+        self.assertEqual((other["reason"], other["artifact"]["expires"]), ("denied", None))
+        empty, detail = gate.plugin_authz_decision_detail("carol@example.com", [], "team/x/r.html",
+                                                          acl, NOW, 200)
+        self.assertEqual(empty["reason"], "denied")
+        self.assertIn("groups-claim-empty", detail)
 
     def test_object_missing_told_only_to_who_would_be_allowed(self):
         users_only = {k: v for k, v in self.ACL.items() if k != "groups"}
         stranger = self.d("mallory@example.com", "team/x/r.html", users_only, head=404)
-        self.assertEqual((stranger["allowed"], stranger["reason"]), (False, "not-listed"))
+        self.assertEqual((stranger["allowed"], stranger["reason"]), (False, "denied"))
         listed = self.d("alice@example.com", "team/x/r.html", self.ACL, head=404)
         self.assertEqual(listed["reason"], "object-missing")
 
@@ -821,3 +849,103 @@ class DisplayNameTest(unittest.TestCase):
         ]
         for h in cases:
             self.assertEqual(self.name(h), "test@example.com", h)
+
+
+class ForwardedUriTest(unittest.TestCase):
+    """The decision and the signature read the forwarded URI through one parse
+    (split_forwarded_uri); a target they could read differently is refused outright."""
+
+    def test_refused_targets(self):
+        for uri in ("/artifacts/pub/x#frag", "/artifacts/pub/x?a#b", "/artifacts/pub/x#",
+                    "//evil.example/artifacts/pub/x", "http://evil.example/artifacts/pub/x",
+                    "artifacts/pub/x", "", "/artifacts/pub/a b", "/artifacts/pub/x\t",
+                    "/artifacts/pub/x\r\nX: y", "/artifacts/pub/\x00x", "/artifacts/pub/x\x7f",
+                    "/artifacts/pub/caf\u00e9", " /artifacts/pub/x", "\t/artifacts/pub/x"):
+            self.assertIsNone(gate.split_forwarded_uri(uri), repr(uri))
+            self.assertIsNone(gate.upstream_auth_headers("GET", "h", uri, "AK", "SK"), repr(uri))
+
+    def test_accepted_targets(self):
+        self.assertEqual(gate.split_forwarded_uri("/artifacts/pub/x"), ("/artifacts/pub/x", None))
+        self.assertEqual(gate.split_forwarded_uri("/artifacts/pub/x?"), ("/artifacts/pub/x", ""))
+        self.assertEqual(gate.split_forwarded_uri("/artifacts/pub/a%23b?v=1"),
+                         ("/artifacts/pub/a%23b", "v=1"))
+
+    def test_decision_and_signature_read_the_same_key(self):
+        amz = "20260101T000000Z"
+        for uri in ("/artifacts/pub/x", "/artifacts/pub/a%23b", "/artifacts/u/r/f%2Fg",
+                    "/artifacts/u/r/%ff", "/artifacts/u/r//f", "/artifacts/pub/x%20y",
+                    "/artifacts/u/r/%3Fq", "/artifacts/u/r/a%0Ab"):
+            path, query = gate.split_forwarded_uri(uri)
+            self.assertIsNone(query)
+            decided = gate.key_from_path(path)
+            signed = gate.upstream_auth_headers("GET", "h", uri, "AK", "SK", amzdate=amz)
+            want = gate.sigv4_headers("GET", "h", gate.BUCKET_PATH + decided, [], None, b"",
+                                      "AK", "SK", amzdate=amz)
+            self.assertEqual(signed["Authorization"], want["Authorization"], uri)
+
+
+class OneLineLogTest(unittest.TestCase):
+    """No client-chosen value can start a log line of its own: control characters and line
+    separators in a message are written as escapes, at the logger, for every call site."""
+
+    def test_control_characters_escaped(self):
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        gate.LOG.addHandler(handler)
+        old = gate.LOG.level
+        gate.LOG.setLevel(logging.INFO)
+        try:
+            gate.LOG.info("authz user=%s key=%s", "a@example.com",
+                          "u/x\nINFO action=approve id=deadbeef by=bob@example.com"
+                          "\r\x1b[2J\u2028\u2029\x85\x00end")
+            gate.LOG.warning("no args\nWARNING forged")
+        finally:
+            gate.LOG.removeHandler(handler)
+            gate.LOG.setLevel(old)
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[0].startswith("INFO authz user=a@example.com key=u/x\\x0aINFO "),
+                        lines[0])
+        self.assertTrue(lines[0].endswith("\\x0d\\x1b[2J\\u2028\\u2029\\x85\\x00end"), lines[0])
+        self.assertEqual(lines[1], "WARNING no args\\x0aWARNING forged")
+
+
+class AclCacheBoundTest(unittest.TestCase):
+    """_acl_cache is bounded: LRU with ACL_CACHE_MAX entries, and an entry older than
+    ACL_CACHE_TTL is neither served nor kept."""
+
+    def setUp(self):
+        gate._acl_cache.clear()
+        self.addCleanup(gate._acl_cache.clear)
+        self.addCleanup(setattr, gate, "ACL_CACHE_MAX", gate.ACL_CACHE_MAX)
+
+    def test_default_bound(self):
+        self.assertEqual(gate.ACL_CACHE_MAX, 10000)
+        m = FakeMinio()
+        for i in range(10050):
+            gate.read_acl(m, f"u/{i:06d}/index.html", NOW)
+        self.assertEqual(len(gate._acl_cache), 10000)
+        self.assertNotIn("u/000049/.acl.json", gate._acl_cache)
+        self.assertIn("u/000050/.acl.json", gate._acl_cache)
+
+    def test_least_recently_used_goes_first(self):
+        gate.ACL_CACHE_MAX = 3
+        m = FakeMinio()
+        for d in "abcd":
+            gate.read_acl(m, f"u/{d}/f", NOW)
+        self.assertEqual(list(gate._acl_cache), ["u/b/.acl.json", "u/c/.acl.json", "u/d/.acl.json"])
+        gate.read_acl(m, "u/b/f", NOW + 1)      # a hit makes b the most recent
+        gate.read_acl(m, "u/e/f", NOW + 1)      # evicts c, the least recently used
+        self.assertEqual(list(gate._acl_cache), ["u/d/.acl.json", "u/b/.acl.json", "u/e/.acl.json"])
+
+    def test_stale_entries_dropped_and_reread(self):
+        m = FakeMinio()
+        gate.read_acl(m, "u/a/f", NOW)
+        gate.read_acl(m, "u/b/f", NOW)
+        gate.read_acl(m, "u/c/f", NOW + gate.ACL_CACHE_TTL)   # a and b are stale now
+        self.assertEqual(list(gate._acl_cache), ["u/c/.acl.json"])
+        m.objects["u/c/.acl.json"] = b'{"owner": "o@example.com"}'
+        self.assertEqual(gate.read_acl(m, "u/c/f", NOW + gate.ACL_CACHE_TTL + 1), (None, None))
+        self.assertEqual(gate.read_acl(m, "u/c/f", NOW + 2 * gate.ACL_CACHE_TTL),
+                         ({"owner": "o@example.com"}, None))

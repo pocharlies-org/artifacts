@@ -85,6 +85,13 @@ jobs:
           if grep -qE '^[[:space:]]*handle /oauth2' deploy/compose/Caddyfile; then
             echo "Caddyfile routes an /oauth2 prefix wholesale"; exit 1
           fi
+      - name: compose Caddyfile keeps /_gate/healthz, /_gate/auth and /_gate/plugin/ off the gate route (rule 4)
+        run: |
+          grep -qE '^[[:space:]]*not path /_gate/auth /_gate/healthz /_gate/plugin/\*$' deploy/compose/Caddyfile
+          # inside a `path` matcher an entry such as `!/_gate/auth` is a literal path, not a negation
+          if grep -qE '^[[:space:]]*@[A-Za-z0-9_-]+[[:space:]]+path[[:space:]][^#]*[[:space:]]!' deploy/compose/Caddyfile; then
+            echo "Caddyfile: a '!' entry inside a path matcher (literal path, not a negation)"; exit 1
+          fi
       - name: oauth2 probe script parses
         run: python3 -I -m py_compile tests/oauth2_probe.py tests/check_oauth2_routes.py
       - name: helm template wires the read-signing user (gate env + bootstrap Job)

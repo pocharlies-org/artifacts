@@ -2,12 +2,9 @@
        host. The core never proxies plugin traffic itself — traefik sends matching requests
        straight to the plugin service. A plugin's pathPrefix must start with `/_` so it can
        never shadow an artifact path (`/<bucket>/...`), the gate surface (`/_gate/`) or the
-       login surface (`/oauth2-artifacts/`). */ -}}
+       login surface (`/oauth2-artifacts/`). Host names: see artifacts.hostMatch. */ -}}
 {{- $m := .Values.minio }}
-{{- $hosts := prepend (default (list) .Values.artifactsExtraHosts) .Values.artifactsHost }}
-{{- $hm := list }}
-{{- range $h := $hosts }}{{ $hm = append $hm (printf "Host(`%s`)" $h) }}{{ end }}
-{{- $hostMatch := printf "(%s)" (join " || " $hm) }}
+{{- $hostMatch := include "artifacts.hostMatch" . }}
 {{- range $p := .Values.plugins }}
 {{- $name := required "each plugin needs a name" $p.name | toString }}
 {{- /* DNS-1123 label: the name becomes part of the IngressRoute name, so no leading or
@@ -21,6 +18,12 @@
 {{- end }}
 {{- if not (hasSuffix "/" $prefix) }}
   {{- fail (printf "plugin %s: pathPrefix must end with / (got %s): Traefik PathPrefix is a string prefix" $name $prefix) }}
+{{- end }}
+{{- /* The prefix is written verbatim into a Traefik rule: a safe charset only, so a backtick, a
+       space or a dot segment can never rewrite the rule (`/_x/`) || PathPrefix(`/` would route
+       the whole host to the plugin). */ -}}
+{{- if not (and (kindIs "string" $prefix) (regexMatch "^/_[a-z0-9_-]+(/[a-z0-9_-]+)*/$" $prefix)) }}
+  {{- fail (printf "plugin %s: pathPrefix %q may only hold lowercase letters, digits, '_' and '-' in '/'-separated segments (^/_[a-z0-9_-]+(/[a-z0-9_-]+)*/$)" $name (toString $prefix)) }}
 {{- end }}
 {{- /* Reserved core paths. Traefik PathPrefix is a plain string prefix, so a plugin collides
        both when its prefix sits UNDER a reserved path (/_gate/x/) and when it COVERS one

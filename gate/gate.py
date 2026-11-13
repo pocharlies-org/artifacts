@@ -68,18 +68,40 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
+import socket
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = logging.getLogger("artifact-gate")
+
+# Every log line is one line: control characters (C0, DEL, C1) and the Unicode line and
+# paragraph separators in a message are written as escapes, so a client-chosen value (a key,
+# a form field, a request line) can never start a forged line of its own.
+_LOG_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), *range(0x7f, 0xa0))}
+_LOG_ESCAPES.update({0x2028: "\\u2028", 0x2029: "\\u2029"})
+
+
+class _OneLineLogFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        safe = msg.translate(_LOG_ESCAPES)
+        if safe != msg or record.args:
+            record.msg, record.args = safe, None
+        return True
+
+
+LOG.addFilter(_OneLineLogFilter())
 
 # --------------------------------------------------------------------------------------------
 # CONFIG (env only; the Deployment wires k8s secrets into these)
@@ -125,6 +147,9 @@ CSRF_TTL = int(_env("GATE_CSRF_TTL_SECONDS", "3600"))
 # Negative/positive ACL cache TTL. This 15 s is the REAL default (the
 # README said "30 s" — the docs now follow the code; keep them in sync if this ever changes).
 ACL_CACHE_TTL = int(_env("GATE_ACL_CACHE_SECONDS", "15"))
+# Upper bound of that cache (least recently used entries go first): one entry per directory
+# asked about, so without a bound any signed-in visitor could grow it without limit.
+ACL_CACHE_MAX = max(1, int(_env("GATE_ACL_CACHE_MAX_ENTRIES", "10000")))
 LISTEN_PORT = int(_env("GATE_PORT", "8080"))           # public surface (see module docstring)
 AUTH_LISTEN_PORT = int(_env("GATE_AUTH_PORT", "8081"))  # forwardAuth decision endpoint only
 
@@ -478,6 +503,25 @@ def _allowed_query_pairs(raw_query):
     return pairs
 
 
+def split_forwarded_uri(uri):
+    """(path, query) of a forwarded request target (X-Forwarded-Uri), or None when it is refused.
+
+    The decision (_authz_for) and the signature (upstream_auth_headers) both take the path from
+    this one function, so they always read the same key. Accepted: origin-form only, i.e. one
+    leading "/" and nothing but printable ASCII without "#". Everything else could be read two
+    ways and is refused before any identity call: a fragment ("/pub/x#y" was decided as pub/x and
+    signed as pub/x#y), a scheme or an authority ("http://h/..." and "//h/..." put the host
+    into the path one parser sees), spaces, control characters (urlsplit drops tab, CR and LF;
+    a plain split keeps them) and non-ASCII bytes (a proxy sends them percent-encoded).
+    `query` is None when there is no "?", else the raw text after it ("" for a bare "?")."""
+    if not isinstance(uri, str) or not uri.startswith("/") or uri.startswith("//"):
+        return None
+    if "#" in uri or any(not "!" <= ch <= "~" for ch in uri):
+        return None
+    path, qmark, query = uri.partition("?")
+    return path, (query if qmark else None)
+
+
 def upstream_auth_headers(method, host, uri, access_key, secret_key, amzdate=None):
     """SigV4 headers for the proxy's upstream request to MinIO, returned on a forwardAuth ALLOW.
 
@@ -487,12 +531,15 @@ def upstream_auth_headers(method, host, uri, access_key, secret_key, amzdate=Non
     `forward_auth copy_headers`). They are signed with the dedicated read-signing S3 user
     (GATE_READ_ACCESS_KEY) and bind the method, the Host MinIO will see (the proxy passes the
     visitor's Host through), the exact path and the exact query sent; they never reach the
-    visitor. Returns None (the read is refused) when the URI carries any query that is not on
-    the allow-list (_ALLOWED_QUERY_KEYS, empty today: any "?" is refused)."""
-    path, qmark, raw_query = uri.partition("?")
-    raw_query = raw_query.split("#", 1)[0]
+    visitor. Returns None (the read is refused) when split_forwarded_uri refuses the URI or it
+    carries any query that is not on the allow-list (_ALLOWED_QUERY_KEYS, empty today: any "?"
+    is refused)."""
+    target = split_forwarded_uri(uri)
+    if target is None:
+        return None
+    path, raw_query = target
     pairs = []
-    if qmark:
+    if raw_query is not None:
         pairs = _allowed_query_pairs(raw_query)
         if pairs is None:
             return None
@@ -514,9 +561,23 @@ def refused_client_headers(headers):
                    if k.lower().startswith(_REFUSED_HEADER_PREFIXES)})
 
 
+# The one `reason` a denied visitor is told (docs/plugins.md §1), whatever decide() said:
+# `not-listed`, `no-acl: ...`, `bad-acl` and `groups-claim-empty ...` would tell a stranger
+# whether a directory has an ACL and what kind. The detailed reason stays in the gate's log.
+DENIED_REASON = "denied"
+
+
 def plugin_authz_decision(email, groups, key, acl, now, head_status, tags=None, last_modified=None,
                           name=None):
-    """Build the /_gate/plugin/authz answer (docs/plugins.md §1) from the SAME decide() the
+    """The /_gate/plugin/authz answer; see plugin_authz_decision_detail."""
+    return plugin_authz_decision_detail(email, groups, key, acl, now, head_status, tags,
+                                        last_modified, name)[0]
+
+
+def plugin_authz_decision_detail(email, groups, key, acl, now, head_status, tags=None,
+                                 last_modified=None, name=None):
+    """(answer, detail): the /_gate/plugin/authz answer (docs/plugins.md §1) and the reason
+    decide() gave, for the log. Built from the SAME decide() the
     forwardAuth path uses — plugins must never re-implement the decision. `email` empty means
     anonymous (the caller has already checked pub/ + GATE_ANONYMOUS_PUB_ENABLED). `tags` is the
     object's tag set (ttl) and `last_modified` a unix timestamp: together they give the ILM
@@ -524,22 +585,28 @@ def plugin_authz_decision(email, groups, key, acl, now, head_status, tags=None, 
     `name` is the visitor's display name (display only; falls back to the email).
 
     No existence leak: `expired` and `object-missing` (and the artifact's expiry/ttl) are told
-    ONLY to a visitor who would otherwise be allowed. Anyone else gets exactly the deny they
-    would get for a live artifact (e.g. `not-listed`) — a plugin answering 410 vs 403 on that
-    reason must not reveal to a stranger that an artifact exists or has expired.
+    ONLY to a visitor who would otherwise be allowed. Anyone else gets DENIED_REASON, the same
+    answer for a live artifact, an expired one, a missing one and a directory with or without
+    an ACL — a plugin answering 410 vs 403 on that reason must not reveal to a stranger that an
+    artifact exists or has expired.
     """
     anonymous = not email
     allowed, reason = decide(email, groups, key, acl, now)
+    detail = reason
     if not allowed and reason == "expired":
         live_acl = {k: v for k, v in acl.items() if k != "expires"}
         would, live_reason = decide(email, groups, key, live_acl, now)
         if not would:
             reason = live_reason
+            detail = f"expired ({live_reason})"
     if allowed and head_status != 200:
         # same no-existence-leak rule as forwardAuth: "allowed but not there" answers as denied
         allowed, reason = False, "object-missing"
+        detail = reason
     if allowed and anonymous:
         reason = "pub: anonymous (anonymous-pub enabled)"
+    if not allowed and reason not in ("expired", "object-missing"):
+        reason = DENIED_REASON
     expires = None
     if isinstance(acl, dict) and acl.get("expires"):
         exp_ts = _parse_expires(acl.get("expires"))
@@ -556,10 +623,10 @@ def plugin_authz_decision(email, groups, key, acl, now, head_status, tags=None, 
     if not allowed and reason not in ("expired", "object-missing"):
         # a denied stranger learns nothing about the artifact's life either
         expires, ttl = None, None
-    return {"allowed": allowed, "reason": reason,
-            "user": {"id": email or None, "name": (name or email) if email else "anonymous",
-                     "anonymous": anonymous},
-            "artifact": {"key": key, "expires": expires, "ttl": ttl}}
+    return ({"allowed": allowed, "reason": reason,
+             "user": {"id": email or None, "name": (name or email) if email else "anonymous",
+                      "anonymous": anonymous},
+             "artifact": {"key": key, "expires": expires, "ttl": ttl}}, detail)
 
 
 _NAME_MAX = 128
@@ -656,7 +723,7 @@ class RequestStore:
 # Notifier: small interface so email (Workspace) can replace Slack DMs later.
 # --------------------------------------------------------------------------------------------
 class SlackNotifier:
-    """DM the artifact owner / requester through the DevopsAI bot. `send` never raises and never
+    """DM the artifact owner / requester through a Slack bot. `send` never raises and never
     logs the token: it returns (ok, detail) where detail is the Slack API error or status."""
 
     def __init__(self, bot_token):
@@ -713,16 +780,51 @@ PAGE_CSS = ("body{font-family:system-ui,sans-serif;max-width:640px;margin:4rem a
             "button{font:inherit;padding:.5rem 1rem;border-radius:6px;border:1px solid #444;"
             "background:#1a73e8;color:#fff;cursor:pointer;margin-right:.5rem}"
             ".muted{color:#666;font-size:.9rem}")
-PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'"
+# frame-ancestors (not covered by default-src) and X-Frame-Options: no gate page, the
+# "Request access" and "Confirm" forms included, can be framed by another site.
+PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+
+# Request bodies, read before any authentication. Only the POST endpoints below take one, and
+# only with a Content-Length of at most POST_BODY_MAX bytes (their forms and JSON are a few
+# hundred bytes). Everything else is refused before a byte of the body is read: any
+# Transfer-Encoding (chunked), a missing, repeated or malformed Content-Length, a larger
+# length, and a body on a method that takes none. A refused body is never read into memory.
+POST_BODY_MAX = 16 * 1024
+_POST_PATHS = {"public": ("/_gate/request", "/_gate/approve", "/_gate/deny"),
+               "auth": ("/_gate/plugin/authz",)}
+_CONTENT_LENGTH_RE = re.compile(r"[0-9]{1,10}")
+# After a refusal that leaves request bytes unsent or unread, the gate closes the connection
+# and first discards at most this much, for at most this long, so the client (or the proxy in
+# front) reads the answer instead of a TCP reset.
+_LINGER_MAX = 64 * 1024
+_LINGER_SECONDS = 2
+# Approve/deny tokens never reach a log line (the request line of /_gate/approve?token=...).
+_TOKEN_IN_LOG_RE = re.compile(r"(token=)[^&\s\"']+")
 
 
 class GateHandler(BaseHTTPRequestHandler):
     server_version = "artifact-gate/1.0"
     protocol_version = "HTTP/1.1"
+    # Socket timeout for every read and write of a connection (request line, headers, body,
+    # idle keep-alive): a client that stops sending holds a thread for at most this long.
+    timeout = 30
 
     # -- plumbing ------------------------------------------------------------------
+    def version_string(self):
+        return self.server_version          # no Python version in the Server header
+
     def log_message(self, fmt, *args):  # route access logs through logging
-        LOG.info("%s %s", self.address_string(), fmt % args)
+        LOG.info("%s %s", self.address_string(), _TOKEN_IN_LOG_RE.sub(r"\1<redacted>", fmt % args))
+
+    def log_request(self, code="-", size="-"):
+        """Access log line with the path only: a query string (the approve/deny token) is
+        replaced by `?<redacted>`."""
+        if isinstance(code, HTTPStatus):
+            code = code.value
+        parts = self.requestline.split(" ")
+        if len(parts) >= 2 and "?" in parts[1]:
+            parts[1] = parts[1].split("?", 1)[0] + "?<redacted>"
+        self.log_message('"%s" %s %s', " ".join(parts), str(code), str(size))
 
     def _send(self, status, body=b"", ctype="text/html; charset=utf-8", extra=None):
         if isinstance(body, str):
@@ -732,60 +834,84 @@ class GateHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Security-Policy", PAGE_CSP)
+        self.send_header("X-Frame-Options", "DENY")
         for k, v in (extra or {}).items():
             self.send_header(k, v)
+        drop = getattr(self, "_drop_body", False)
+        if drop:
+            self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+        if drop:
+            self._linger()
 
-    BODY_CAP = 64 * 1024
-
-    def _read_body(self):
-        """Read the request body fully so the keep-alive connection stays in sync: Traefik
-        reuses backend connections and BaseHTTPRequestHandler does not drain bodies, so a
-        byte left unread becomes the first byte of the NEXT request line on that connection
-        (observed live as method 'xPOST' -> 501). Only the first BODY_CAP bytes are kept;
-        the rest is read and discarded. Sets _body_truncated when the body was larger."""
-        self._body_truncated = False
-        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
-            out = b""
-            while True:
-                line = self.rfile.readline(65536)
-                try:
-                    n = int(line.split(b";", 1)[0], 16)
-                except ValueError:
-                    break
-                if n == 0:
-                    self.rfile.readline(65536)          # final CRLF
-                    break
-                chunk = self.rfile.read(n)
-                self.rfile.readline(65536)               # CRLF after each chunk
-                if len(out) < self.BODY_CAP:
-                    out += chunk[: self.BODY_CAP - len(out)]
-                    if len(out) >= self.BODY_CAP:
-                        self._body_truncated = True
-            return out
+    def _linger(self):
+        """Close after a refusal without reading the request body: send FIN after the answer,
+        then discard what is still arriving (at most _LINGER_MAX bytes, at most _LINGER_SECONDS,
+        nothing kept) so the answer is read before the close (RFC 9112 §9.6)."""
+        sock = self.connection
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            return b""
-        if length < 0:
-            return b""
-        self._body_truncated = length > self.BODY_CAP
-        data = b""
-        remaining = length
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 65536))
-            if not chunk:
-                break
-            remaining -= len(chunk)
-            if len(data) < self.BODY_CAP:
-                data += chunk[: self.BODY_CAP - len(data)]
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            return
+        deadline = time.monotonic() + _LINGER_SECONDS
+        left = _LINGER_MAX
+        try:
+            while left > 0:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    break
+                sock.settimeout(wait)
+                got = sock.recv(min(left, 16384))
+                if not got:
+                    break
+                left -= len(got)
+        except OSError:
+            pass
+
+    def _refuse(self, status, text, as_json=False):
+        """Answer `status` and close the connection without reading the request body."""
+        self._drop_body = True
+        if as_json:
+            return self._send(status, json.dumps({"error": text}), "application/json")
+        return self._send(status, self._page(HTTPStatus(status).phrase,
+                                             f"<p>{html.escape(text)}</p>"))
+
+    def _body_framing(self):
+        """How the request delimits its body: ("transfer-encoding", None) for any
+        Transfer-Encoding, ("none", 0) without Content-Length, ("invalid", None) for a repeated
+        or malformed one, else ("length", n)."""
+        if self.headers.get_all("Transfer-Encoding"):
+            return "transfer-encoding", None
+        values = self.headers.get_all("Content-Length")
+        if not values:
+            return "none", 0
+        if len(values) != 1 or not _CONTENT_LENGTH_RE.fullmatch(values[0].strip()):
+            return "invalid", None
+        return "length", int(values[0].strip())
+
+    def _has_body(self):
+        return self._body_framing() not in (("none", 0), ("length", 0))
+
+    def _read_post_body(self, as_json=False):
+        """The body of a POST endpoint, or None after a refusal (connection closed). Requires one
+        valid Content-Length of at most POST_BODY_MAX; reads exactly that many bytes (bounded by
+        the socket timeout). Keeps keep-alive in sync: an accepted body is read in full."""
+        kind, n = self._body_framing()
+        if kind in ("transfer-encoding", "none"):
+            return self._refuse(411, "Send the body with a Content-Length "
+                                     "(a chunked or other Transfer-Encoding is refused).", as_json)
+        if kind == "invalid":
+            return self._refuse(400, "Invalid Content-Length.", as_json)
+        if n > POST_BODY_MAX:
+            return self._refuse(413, f"Request body larger than {POST_BODY_MAX} bytes.", as_json)
+        data = self.rfile.read(n) if n else b""
+        if len(data) != n:
+            return self._refuse(400, "Request body shorter than its Content-Length.", as_json)
         return data
 
     def _form(self):
-        if getattr(self, "_body_truncated", False):
-            return {}
         return {k: v[0] for k, v in urllib.parse.parse_qs(self._body.decode("utf-8", "replace")).items()}
 
     # -- identity ------------------------------------------------------------------
@@ -880,7 +1006,11 @@ class GateHandler(BaseHTTPRequestHandler):
     def _authz_for(self, uri):
         """Shared by /_gate/auth and the request flow. Returns (verdict, artifact_key, acl).
         verdict: allow | deny | not_found | bad_path | unauth_401 | unauth_500"""
-        path = urllib.parse.urlsplit(uri).path
+        target = split_forwarded_uri(uri)
+        if target is None:
+            # a URI the decision and the signature could read differently: never served
+            return "bad_path", uri, None
+        path = target[0]
         key = key_from_path(path)
         if key is None:
             return "bad_path", path, None
@@ -937,7 +1067,7 @@ class GateHandler(BaseHTTPRequestHandler):
         if verdict == "bad_path":
             return self._send(404, self._page("Not found", "<p>Nothing here.</p>"))
         # deny AND missing artifact answer identically (no existence leak)
-        return self._send(403, self._deny_page(urllib.parse.urlsplit(uri).path))
+        return self._send(403, self._deny_page(split_forwarded_uri(uri)[0]))
 
     # -- plugin authorization API (docs/plugins.md) ------------------------------------
     def _handle_plugin_authz(self, method):
@@ -1003,11 +1133,11 @@ class GateHandler(BaseHTTPRequestHandler):
                 last_modified = parsedate_to_datetime(hdrs["Last-Modified"]).timestamp()
             except (TypeError, ValueError):
                 last_modified = None
-        ans = plugin_authz_decision(email, groups, key, acl, int(time.time()),
-                                    head_status, tags, last_modified,
-                                    name=getattr(self, "_display_name", None) if email else None)
-        LOG.info("plugin-authz user=%s key=%s allowed=%s reason=%s",
-                 email or "-", key, ans["allowed"], ans["reason"])
+        ans, detail = plugin_authz_decision_detail(
+            email, groups, key, acl, int(time.time()), head_status, tags, last_modified,
+            name=getattr(self, "_display_name", None) if email else None)
+        LOG.info("plugin-authz user=%s key=%s allowed=%s reason=%s detail=%s",
+                 email or "-", key, ans["allowed"], ans["reason"], detail)
         return self._send(200, json.dumps(ans), "application/json")
 
     # -- request access --------------------------------------------------------------
@@ -1138,7 +1268,9 @@ class GateHandler(BaseHTTPRequestHandler):
         self._route("POST")
 
     def do_PUT(self):  # noqa: N802
-        self._read_body()   # drain: Traefik reuses the connection (see _read_body)
+        # Never served, so the body is never read: with one, the connection closes after the 405
+        # (an unread byte would otherwise start the next request line on a reused connection).
+        self._body, self._drop_body = b"", self._has_body()
         self._send(405, self._page("Method not allowed", "<p>Writes go through the publisher path.</p>"))
 
     do_DELETE = do_PUT
@@ -1146,11 +1278,22 @@ class GateHandler(BaseHTTPRequestHandler):
     do_OPTIONS = do_PUT
 
     def _route(self, method):
-        self._body = self._read_body()   # always drain the body (keep-alive sync, see _read_body)
+        self._body, self._drop_body = b"", False
         path = urllib.parse.urlsplit(self.path).path
         # Which listener this request arrived on (see module docstring). A server without an
         # explicit gate_mode is treated as PUBLIC: fail-closed for the decision endpoint.
         mode = getattr(self.server, "gate_mode", "public")
+        # Request body (see POST_BODY_MAX): read only for a POST endpoint of this listener.
+        if method == "POST" and path in _POST_PATHS.get(mode, ()):
+            body = self._read_post_body(as_json=(path == "/_gate/plugin/authz"))
+            if body is None:
+                return None
+            self._body = body
+        elif self._has_body():
+            if method in ("GET", "HEAD"):
+                return self._refuse(400, "A request body is not accepted here.")
+            # a POST anywhere else: answered below (404/405) without reading the body, then closed
+            self._drop_body = True
         if path == "/_gate/healthz":
             return self._send(200, b"ok", "text/plain")   # kubelet probes; answers on both listeners
         if path == "/_gate/auth":
@@ -1189,18 +1332,44 @@ class GateHandler(BaseHTTPRequestHandler):
 # --------------------------------------------------------------------------------------------
 # ACL access with a short cache (MinIO read is on every artifact request)
 # --------------------------------------------------------------------------------------------
-_acl_cache = {}
+# acl_key -> (fetched_at, acl, err), least recently used first. Bounded: an entry lives at most
+# ACL_CACHE_TTL seconds and the cache holds at most ACL_CACHE_MAX entries (oldest use evicted).
+_acl_cache = OrderedDict()
 _acl_lock = threading.Lock()
+
+
+def _acl_cache_get(acl_key, now):
+    with _acl_lock:
+        hit = _acl_cache.get(acl_key)
+        if hit is None:
+            return None
+        if now - hit[0] < ACL_CACHE_TTL:
+            _acl_cache.move_to_end(acl_key)
+            return hit
+        del _acl_cache[acl_key]          # stale: never served again
+        return None
+
+
+def _acl_cache_put(acl_key, entry, now):
+    with _acl_lock:
+        _acl_cache[acl_key] = entry
+        _acl_cache.move_to_end(acl_key)
+        while _acl_cache:                # stale entries at the old end go first
+            first = next(iter(_acl_cache.values()))
+            if now - first[0] < ACL_CACHE_TTL:
+                break
+            _acl_cache.popitem(last=False)
+        while len(_acl_cache) > ACL_CACHE_MAX:
+            _acl_cache.popitem(last=False)
 
 
 def read_acl(minio, key, now, bypass_cache=False):
     """Return (acl|None, error|None). acl=None means the .acl.json does not exist."""
     acl_key = key.rsplit("/", 1)[0] + "/.acl.json" if "/" in key else ".acl.json"
     if not bypass_cache:
-        with _acl_lock:
-            hit = _acl_cache.get(acl_key)
-            if hit and now - hit[0] < ACL_CACHE_TTL:
-                return hit[1], hit[2]
+        hit = _acl_cache_get(acl_key, now)
+        if hit is not None:
+            return hit[1], hit[2]
     err = None
     acl = None
     try:
@@ -1215,8 +1384,7 @@ def read_acl(minio, key, now, bypass_cache=False):
     except ConnectionError as e:
         err = str(e)
     if not bypass_cache:
-        with _acl_lock:
-            _acl_cache[acl_key] = (now, acl, err)
+        _acl_cache_put(acl_key, (now, acl, err), now)
     return acl, err
 
 
