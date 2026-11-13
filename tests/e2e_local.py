@@ -1253,6 +1253,36 @@ class E2ETest(unittest.TestCase):
             self.assertEqual([k for k, *_x in PUTS if k.endswith(".acl.json")], [])
         self.assertEqual(sent, [])
 
+    def test_request_pages_promise_no_message(self):
+        # a held or unrecorded request is never sent, so neither the form nor the answer to it
+        # promises that the owner is told or that a message will come
+        USERS["nia"] = ("nia@example.com", "aaaa")
+        st, form, _ = self.auth("/artifacts/u/secret/report.html", "nia")
+        self.assertEqual(st, 403)
+        self.assertIn("you can ask the artifact's owner for access", form)
+        # one answer whether the request was sent, held at the owner's cap, could not be sent,
+        # or was not recorded (missing artifact): the same status and body
+        answers = []
+        with mock.patch.object(self.gate.REQUESTS, "max_pending", 1):
+            # no transport yet (LogNotifier): recorded, could not be sent
+            answers.append(self._request_access("nia", "/artifacts/u/secret/report.html"))
+            sent = self.record_notifications()
+            USERS["noa"] = ("noa@example.com", "aaaa")
+            answers.append(self._request_access("noa", "/artifacts/u/secret/report.html"))  # sent
+            USERS["nel"] = ("nel@example.com", "aaaa")
+            answers.append(self._request_access("nel", "/artifacts/u/secret/report.html"))  # held
+            answers.append(self._request_access("nel", "/artifacts/u/secret/ghost.html"))   # missing
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(len({a for a in answers}), 1, answers)
+        st, page = answers[0]
+        self.assertEqual(st, 200)
+        self.assertIn("<p>Your request has been received. If you do not hear back, ask the "
+                      "owner directly.</p>", page)
+        for text in (form, page):
+            for promise in ("will get a message", "is notified", "has been notified",
+                            "when the owner decides", "with one click"):
+                self.assertNotIn(promise, text)
+
     def test_request_access_missing_artifact_uniform_response_no_state(self):
         USERS["frank"] = ("frank@example.com", "aaaa")
         st, page, _ = self.auth("/artifacts/u/secret/ghost.html", "frank")

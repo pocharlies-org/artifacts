@@ -1436,8 +1436,7 @@ class GateHandler(BaseHTTPRequestHandler):
         csrf = make_csrf(self._email, artifact, _KEY, int(time.time()))
         return self._page("Access required", (
             f"<p>You do not have access to <code>{art}</code>.</p>"
-            f"<p>If you need it, ask the owner. The request is recorded and the owner is notified "
-            f"and can approve or deny it with one click.</p>"
+            f"<p>If you need it, you can ask the artifact's owner for access.</p>"
             f"<form method=POST action=https://{PUBLIC_HOST}/_gate/request>"
             f"<input type=hidden name=csrf value=\"{html.escape(csrf, quote=True)}\">"
             f"<input type=hidden name=artifact value=\"{art}\">"
@@ -1778,9 +1777,10 @@ class GateHandler(BaseHTTPRequestHandler):
     def _request_sent(self):
         # one answer for a request that was sent, held at the owner's cap, or not recorded
         # (missing artifact or owner): telling them apart would leak what exists
+        # The text promises nothing: a held or unrecorded request is never sent.
         return self._send(200, self._page("Request sent",
-                                          "<p>Your request has been received. You will get a "
-                                          "message when the owner decides.</p>"))
+                                          "<p>Your request has been received. If you do not "
+                                          "hear back, ask the owner directly.</p>"))
 
     # -- approve / deny ----------------------------------------------------------------
     def _handle_action(self, action, via_post):

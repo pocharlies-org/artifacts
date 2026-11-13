@@ -127,8 +127,8 @@ gate:
     # (GATE_REQUESTER_RATE_LIMIT_MAX)
     perRequester: 20
     # open requests an owner is sent at a time; above it a request is recorded and logged
-    # but no message is sent, until the owner decides one or its links expire
-    # (GATE_OWNER_PENDING_MAX)
+    # but the owner is never messaged about it (the requester can ask again once the owner
+    # has decided one or its links have expired) (GATE_OWNER_PENDING_MAX)
     ownerPending: 10
   # Container resources. To bound local disk, add ephemeral-storage to both, e.g.
   #   requests: {ephemeral-storage: 16Mi}   limits: {ephemeral-storage: 64Mi}

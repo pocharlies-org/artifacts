@@ -67,14 +67,15 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   `pub/` takes no requests at all: it is anonymous-readable by design, so its deny page
   offers none, a request for it is refused, and the gate never writes a `pub/` ACL (its S3
   policy refuses that write too).
-  Requests are capped, and the answer is the same whether or not the artifact exists: per
+  Requests are capped, and the page is the same whether or not the artifact exists: per
   requester and object key (`GATE_RATE_LIMIT_MAX`, 5 a day), counted on the decoded key, so
   `…/index.html` and `…/%69ndex.html` are one artifact (the request record and the owner's
   message carry that one name too); per requester across all artifacts
   (`GATE_REQUESTER_RATE_LIMIT_MAX`, 20 a day); and per owner, at most
-  `GATE_OWNER_PENDING_MAX` (10) open requests sent at a time: above it a request is still
-  recorded and logged, but the owner gets no message until they decide one or its links
-  expire. A message that cannot be sent holds no place.
+  `GATE_OWNER_PENDING_MAX` (10) open requests sent at a time: above it a request is recorded
+  and logged, but the owner is not messaged about it, then or later; the requester sees the
+  same page and can ask again later, once the owner has decided an open request or its links
+  have expired (7 days). A message that cannot be sent holds no place.
   The approval adds the requester to the root ACL with a conditional write: the gate reads
   the ACL with its ETag and writes it back with `If-Match`, so a change made by anyone else in
   between is never overwritten (the store answers `412`; the gate reads again and retries
@@ -340,7 +341,7 @@ Everything is environment-driven; nothing is hardcoded.
 | `GATE_PLUGIN_PREFIX` | `_plugins` | plugin storage prefix (never served) |
 | `GATE_RATE_LIMIT_MAX` / `GATE_RATE_LIMIT_WINDOW_SECONDS` | `5` / `86400` | access requests per requester and object key (decoded: every spelling of one key counts once), per window |
 | `GATE_REQUESTER_RATE_LIMIT_MAX` | `20` | access requests per requester across all artifacts, per the same window; a whole number from 1 to 999999 (the gate refuses to start otherwise) |
-| `GATE_OWNER_PENDING_MAX` | `10` | open requests an owner is sent at a time; above it a request is recorded and logged but no message is sent, until the owner decides one or its links expire; a whole number from 1 to 999999 |
+| `GATE_OWNER_PENDING_MAX` | `10` | open requests an owner is sent at a time; above it a request is recorded and logged but the owner is never messaged about it (the requester can ask again once the owner has decided one or its links have expired); a whole number from 1 to 999999 |
 | `GATE_TOKEN_TTL_SECONDS` / `GATE_CSRF_TTL_SECONDS` | `604800` / `3600` | approve/deny link, CSRF |
 | `GATE_ACL_CACHE_SECONDS` | `15` | ACL cache: how long an entry is used |
 | `GATE_ACL_CACHE_MAX_ENTRIES` | `10000` | ACL cache: most entries kept (least recently used evicted first) |
