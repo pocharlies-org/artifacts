@@ -26,11 +26,19 @@ check() { # <desc> <expected> <actual>
 }
 
 # ---- wait for the stack ---------------------------------------------------------------
+# The gate's health check is not routed through Caddy (rule 4 keeps /_gate/healthz,
+# /_gate/auth and /_gate/plugin/ off the public route), so: the gate answers its own healthz
+# inside its container, and a write through Caddy gets the gate's 405 (Caddy and the gate up).
+gate_ready() {
+  docker compose exec -T gate python3 -c 'import urllib.request
+urllib.request.urlopen("http://127.0.0.1:8080/_gate/healthz", timeout=2)' >/dev/null 2>&1 \
+    && [[ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$BASE/artifacts/_ready")" == 405 ]]
+}
 for i in $(seq 1 60); do
-  curl -sf "$BASE/_gate/healthz" >/dev/null 2>&1 && break
+  gate_ready && break
   sleep 2
 done
-curl -sf "$BASE/_gate/healthz" >/dev/null || { echo "stack not ready"; exit 1; }
+gate_ready || { echo "stack not ready"; exit 1; }
 # oauth2-proxy (the gate's identity backend) must answer too, or gated reads 500
 for i in $(seq 1 60); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/oauth2/sign_in")
@@ -223,6 +231,22 @@ check "listing not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Aut
 check "_plugins not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/artifacts/_plugins/canvas/x.bin")"
 check "_gate state not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/artifacts/_gate/req/x.json")"
 check "writes refused (PUT)" 405 "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -d x "$BASE/artifacts/whatever")"
+# rule 4: the gate's health check and decision endpoints are not routed (Caddy's empty 404,
+# not the gate's page); the request-access surface is
+gate_body=$(mktemp)
+for p in /_gate/healthz /_gate/auth /_gate/plugin/authz /_gate/plugin/; do
+  check "$p not routed to the gate" "404 0" \
+    "$(curl -s -o "$gate_body" -w '%{http_code}' "$BASE$p") $(wc -c <"$gate_body" | tr -d ' ')"
+done
+rm -f "$gate_body"
+check "/_gate/approve routed to the gate" 410 "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/_gate/approve?token=x")"
+# the gate's own pages cannot be framed; request bodies are refused unread before login
+check "gate page X-Frame-Options" DENY \
+  "$(curl -s -D - -o /dev/null -X PUT "$BASE/artifacts/whatever" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-frame-options"{print $2}')"
+check "gate page CSP frame-ancestors" 1 \
+  "$(curl -s -D - -o /dev/null -X PUT "$BASE/artifacts/whatever" | tr -d '\r' | grep -ci "^content-security-policy:.*frame-ancestors 'none'")"
+check "oversized request-access body refused" 413 \
+  "$(head -c 20000 /dev/zero | tr '\0' x | curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @- "$BASE/_gate/request")"
 # forwardAuth answers 404 for every never-served key (ACLs, state, listings, traversal)
 check "traversal refused" 404 "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is "$BASE/artifacts/u/$RUN2/../..%2f.acl.json" -H "Authorization: Bearer $TOKEN")"
 

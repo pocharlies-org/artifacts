@@ -16,23 +16,33 @@ deny.
 The gate's decision endpoint for plugins. It lives **only on the internal (decision)
 listener** (`GATE_AUTH_PORT`, default `8081`) — the same listener as `/_gate/auth`. It is
 never routed publicly: the chart's public routes exclude it, and the gate itself answers
-404 on the public listener. Plugin traffic must reach it cluster-internal only.
+404 on the public listener. Plugin traffic must reach it cluster-internal only, and the
+port must be closed to everything else by a NetworkPolicy: allow it from the reverse proxy
+(forwardAuth) and the plugin pods only. The gate does not restrict callers itself; anyone
+who reaches the port can ask what a cookie they hold may read (no more than they can read
+at the edge, but each ask costs one proxy call and two MinIO calls).
 
 ### Request
 
 ```
 POST /_gate/plugin/authz HTTP/1.1
 Content-Type: application/json          (or application/x-www-form-urlencoded)
+Content-Length: <n>                     (required, at most 16384; no chunked body)
 Cookie: <the visitor's Cookie header, forwarded verbatim>
-   — or —
-Authorization: Bearer <id_token>        (validated by oauth2-proxy, skip-jwt-bearer-tokens)
+Authorization: <the visitor's Authorization header, if any, forwarded verbatim>
 
 {"artifact": "/<bucket>/<key>"}         (form field `artifact=` for the form encoding)
 ```
 
 Forward the visitor's `Cookie` **and** `Authorization` exactly as received; the gate
 passes them to oauth2-proxy `/auth` and trusts nothing the client sent as
-`X-Auth-Request-*`. The artifact path is the public path **including the bucket name**
+`X-Auth-Request-*`. The session cookie is the credential. A `Bearer` id_token in
+`Authorization` counts only where oauth2-proxy runs with `--skip-jwt-bearer-tokens`: the
+local compose stack sets it (its e2e reads with a Dex id_token), the Helm chart does not and
+refuses it in `oauth2Proxy.extraArgs`, so behind the chart a request with a Bearer token and
+no session cookie is `unauthenticated`. Send the body with a `Content-Length` (a JSON body of
+at most 16 KiB): the gate refuses a chunked body (`411`) and a larger one (`413`) without
+reading it. The artifact path is the public path **including the bucket name**
 (path-style, same shape as the delivered links of §5): `/<bucket>/<key>` — with the
 default bucket `artifacts` that is `/artifacts/<key>`; a gate configured with another
 `GATE_BUCKET` only accepts that bucket's prefix.
@@ -44,7 +54,7 @@ Always JSON. `200` with a decision, or an error status (§ table below).
 ```json
 {
   "allowed": true,
-  "reason": "acl: users",
+  "reason": "user",
   "user":     { "id": "alice@example.com", "name": "Alice Example", "anonymous": false },
   "artifact": { "key": "u/run-1/index.html", "expires": "2026-11-16", "ttl": 7 }
 }
@@ -57,32 +67,41 @@ Always JSON. `200` with a decision, or an error status (§ table below).
   that endpoint is never routed publicly). Used only when the token is the same identity
   (its `email`/`preferred_username`/`upn` equals `user.id`), trimmed to 128 printable
   characters; otherwise, or without a `name` claim, it is `user.id`. Display only — never
-  decide anything on it. `"anonymous"` for anonymous. `user.anonymous` — true when there
+  decide anything on it. `"anonymous"` for anonymous. It is **untrusted text** from the
+  identity provider: control, bidi and zero-width characters are removed, but markup and
+  quotes pass through (`<img src=x onerror=...>` comes back as is), so escape it wherever
+  you render it, like any user input. `user.anonymous` — true when there
   was no session.
 - `artifact.key` — the object key (no leading `/artifacts/`).
 - `artifact.expires` — ISO date when the artifact dies: the ACL `expires` when present,
   otherwise the `ttl` object tag applied to `Last-Modified`. `null` when neither exists
   (then the bucket ILM catch-all is the only expiry).
 - `artifact.ttl` — the `ttl` tag as an integer number of days, or `null`.
-- `reason` — the exact string `decide()` produced (e.g. `owner`, `acl: users`,
-  `acl: groups`, `pub: any signed-in`, `pub: anonymous (anonymous-pub enabled)`,
-  `no-acl`, `expired`, `groups-claim-empty`, `unauthenticated`, `acl-error`,
-  `object-missing`). Plugins must treat `reason` as informational; only `allowed` is
-  the decision.
+- `reason` — informational; only `allowed` is the decision. The exact strings:
+  - allowed: `owner`, `user` (listed in `users`), `group` (member of a listed group),
+    `pub: any signed-in tenant user` (a `pub/` key without ACL),
+    `pub: anonymous (anonymous-pub enabled)`;
+  - not allowed: `denied` (every deny `decide()` makes: not on the ACL, no ACL outside
+    `pub/`, a malformed ACL, an empty groups claim; the detail is written to the gate's log
+    only), `expired` and `object-missing` (see below), `unauthenticated` (no session, and not
+    an anonymous `pub/` read), `acl-error` (the ACL could not be read: fail closed).
 - **No existence leak**: `expired` and `object-missing` — and `artifact.expires`/`ttl` — are
   told only to a visitor who would otherwise be allowed (listed, owner, group member, or
-  anonymous on a `pub/` key without ACL). Anyone else gets exactly the answer they would get
-  for a live artifact they are not on (e.g. `not-listed`, `expires`/`ttl` null), so a plugin
-  answering `410` for `expired` and `403` for a deny reveals nothing to a stranger. The
-  forwardAuth path already answers both with the same 403 deny page.
+  anonymous on a `pub/` key without ACL). Anyone else gets `denied` with `expires`/`ttl`
+  null: the same answer for a live artifact they are not on, an expired one, a missing one,
+  and a directory with or without an ACL, so a plugin answering `410` for `expired` and `403`
+  for a deny reveals nothing to a stranger. The forwardAuth path already answers all of them
+  with the same 403 deny page.
 
 ### Status codes
 
 | Status | When |
 |---|---|
 | `200` | A decision was made (including `allowed: false` — a denial is not an HTTP error) |
-| `400` | Body/path malformed: missing `artifact`, not an `/artifacts/` path, or the path is refused outright (traversal, `.acl.json`, `_gate/`, `_plugins/`, trailing slash) |
+| `400` | Body/path malformed: missing `artifact`, not an `/artifacts/` path, or the path is refused outright (traversal, `.acl.json`, `_gate/`, `_plugins/`, trailing slash); or an invalid or repeated `Content-Length` |
 | `405` | Any method other than POST |
+| `411` | No `Content-Length`, or any `Transfer-Encoding` (chunked): the body is not read |
+| `413` | `Content-Length` above 16384: the body is not read |
 | `500` | Identity backend (oauth2-proxy) error — fail closed, deny the visitor |
 | `404` | Request hit the public listener (the endpoint is not routed there) |
 
@@ -110,7 +129,7 @@ artifacts host:
 ```yaml
 plugins:
   - name: canvas          # DNS-1123 label ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$; route and storage prefix derive from it
-    pathPrefix: /_canvas/ # must start with /_ and end with /
+    pathPrefix: /_canvas/ # ^/_[a-z0-9_-]+(/[a-z0-9_-]+)*/$: starts with /_, ends with /
     service: artifact-canvas
     port: 8080
     namespace: sso        # optional, defaults to the gate's namespace
@@ -122,6 +141,10 @@ plugins:
   Traefik `PathPrefix` is a plain string prefix, so the chart fails to render both a
   prefix **under** a reserved path (`/_gate/x/`) and one that **covers** it (`/_gate`,
   `/_ga`, `/_`), as well as a prefix without the trailing `/`.
+- The prefix is written into the Traefik rule as is, so it may hold only lowercase letters,
+  digits, `_` and `-` in `/`-separated segments; the chart refuses anything else (a backtick,
+  a space, a dot segment, upper case). The host names the route matches
+  (`artifactsHost`, `artifactsExtraHosts`) must be lowercase DNS names for the same reason.
 - The route carries the chart's `ingressRouteAnnotations` (for example the ingress class
   your Traefik watches), like the core's own routes.
 - The core never proxies plugin traffic itself beyond this route, and never rewrites it.

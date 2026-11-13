@@ -25,8 +25,10 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
 ```
 
 - **Identity**: oauth2-proxy in front of your OIDC provider. The gate authenticates by
-  calling the proxy's `/auth` with the visitor's cookie (or a `Bearer` id_token) and
-  never trusts client-supplied `X-Auth-Request-*` headers.
+  calling the proxy's `/auth` with the visitor's cookie and never trusts client-supplied
+  `X-Auth-Request-*` headers. A `Bearer` id_token is passed on too, but it counts only where
+  oauth2-proxy runs with `--skip-jwt-bearer-tokens`: the compose stack (its e2e reads with a
+  Dex id_token), never the chart, which refuses that flag.
 - **Authorization**: one `decide()` in `gate/gate.py` — ACL file `<dir>/.acl.json`
   (`owner`, `users`, `groups`, `expires`); no ACL → any signed-in user for `pub/`,
   deny elsewhere. The same function answers forwardAuth and the plugin authz API.
@@ -268,7 +270,8 @@ Everything is environment-driven; nothing is hardcoded.
 | `GATE_PLUGIN_PREFIX` | `_plugins` | plugin storage prefix (never served) |
 | `GATE_RATE_LIMIT_MAX` / `GATE_RATE_LIMIT_WINDOW_SECONDS` | `5` / `86400` | access requests per key |
 | `GATE_TOKEN_TTL_SECONDS` / `GATE_CSRF_TTL_SECONDS` | `604800` / `3600` | approve/deny link, CSRF |
-| `GATE_ACL_CACHE_SECONDS` | `15` | ACL cache |
+| `GATE_ACL_CACHE_SECONDS` | `15` | ACL cache: how long an entry is used |
+| `GATE_ACL_CACHE_MAX_ENTRIES` | `10000` | ACL cache: most entries kept (least recently used evicted first) |
 | `GATE_PORT` / `GATE_AUTH_PORT` | `8080` / `8081` | public / decision listeners |
 
 ### Publisher CLI (`cli/publish.sh`)
@@ -296,8 +299,10 @@ Everything is environment-driven; nothing is hardcoded.
 `gate.bakedImage` (default `false`) switches from the ConfigMap mode (`gate.image` + ConfigMap
 `artifact-gate-code`) to the gate image `gate.bakedImageRepository@gate.bakedImageDigest`
 (see [Gate image](#gate-image)). Plugin
-names must be DNS-1123 labels (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`): the chart refuses
-anything else.
+names must be DNS-1123 labels (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`), plugin prefixes
+`/_<segment>/[<segment>/...]` of `[a-z0-9_-]`, and `artifactsHost` / `artifactsExtraHosts`
+lowercase DNS names (no port, no wildcard): they are written into Traefik rules, and the chart
+refuses anything else.
 
 | Value | Default | Meaning |
 |---|---|---|
@@ -333,6 +338,17 @@ their real types).
   authority, and `.acl.json` / trailing-slash paths are refused at the proxy.
 - **Never MinIO root at runtime**: the gate uses two least-privilege users; root is
   only for the bootstrap.
+- **Request bodies before login**: only the gate's four POST endpoints (`/_gate/request`,
+  `/_gate/approve`, `/_gate/deny`, `/_gate/plugin/authz`) read a body, and only with a
+  `Content-Length` of at most 16 KiB. A chunked body (`411`), a larger one (`413`), a missing
+  or invalid length, and a body on any other request are refused without being read, and the
+  connection is closed. A client that stops sending is cut off after 30 s.
+- **Gate pages and logs**: the gate's own pages send `frame-ancestors 'none'` and
+  `X-Frame-Options: DENY` (they cannot be framed) and no Python version in `Server`. The access
+  log carries paths without query strings, so approve/deny tokens never reach a log line, and
+  control characters in any logged value are written as escapes (no forged lines). The
+  approve link of a visitor without a session still passes through oauth2-proxy's sign-in as
+  `rd=`, so keep oauth2-proxy's request log as private as the gate's.
 - **Forwarded headers**: `gate-auth` renders `trustForwardHeader: false` by default, so the
   method, host and URI the gate authorizes are the ones Traefik received, never a client's
   `X-Forwarded-Uri`. The login proxy runs with `--reverse-proxy=true`; list your ingress

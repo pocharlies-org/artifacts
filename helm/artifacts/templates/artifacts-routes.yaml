@@ -15,10 +15,7 @@
        callback to the IdP app. */ -}}
 {{- $m := .Values.minio }}
 {{- $sso := .Values.namespaces.sso }}
-{{- $hosts := prepend (default (list) .Values.artifactsExtraHosts) .Values.artifactsHost }}
-{{- $hm := list }}
-{{- range $h := $hosts }}{{ $hm = append $hm (printf "Host(`%s`)" $h) }}{{ end }}
-{{- $hostMatch := printf "(%s)" (join " || " $hm) }}
+{{- $hostMatch := include "artifacts.hostMatch" . }}
 {{- /* Edge block: a request carrying the unsigned-payload trailer sha256 or a snowball extract
        header matches no MinIO-backed rule (MinIO 400s on them anyway). Rule 1 (the gate's 405)
        is not MinIO-backed and is left as it is. */ -}}

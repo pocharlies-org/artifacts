@@ -38,6 +38,8 @@ oauth2Proxy:
     limits: {cpu: 200m, memory: 128Mi}
 
 # ---- the artifacts host ---------------------------------------------------------------
+# Lowercase DNS names only (letters, digits, inner '-', labels joined by '.'; no port, no
+# wildcard): they are written into Traefik rules, so the chart refuses anything else.
 artifactsHost: artifacts.example.com
 # Extra hostnames served with the same routes (e.g. a future public name).
 artifactsExtraHosts: []
@@ -124,7 +126,7 @@ gate:
 # Example:
 #   plugins:
 #     - name: canvas              # ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ (DNS-1123 label)
-#       pathPrefix: /_canvas/     # must start with /_
+#       pathPrefix: /_canvas/     # ^/_[a-z0-9_-]+(/[a-z0-9_-]+)*/$ (starts with /_, ends with /)
 #       service: artifact-canvas
 #       port: 8080
 #       namespace: sso            # optional; defaults to namespaces.sso

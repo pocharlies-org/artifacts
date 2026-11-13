@@ -4,7 +4,7 @@
 #   2. anonymous pub/ GET/HEAD     -> MinIO (no .acl.json, no trailing-slash listings)
 #   3. artifact GET/HEAD           -> forwardAuth to the gate's decision listener, then MinIO
 #                                     with the gate's SigV4 headers (no anonymous read off pub/)
-#   4. /_gate/* (not auth/healthz) -> gate
+#   4. /_gate/* except auth, healthz and plugin/ -> gate (those three answer 404 here)
 #   5. /oauth2/ browser endpoints  -> oauth2-proxy, ALLOW-LIST only: sign_in, start, callback,
 #                                     sign_out, static/<file>; any other /oauth2 path -> 404
 #   6. plugin routes               -> plugin services (env ARTIFACTS_CADDY_PLUGINS, see below)
@@ -88,7 +88,12 @@
 		}
 	}
 
-	@gateapi path /_gate/* !/_gate/auth !/_gate/healthz
+	# The chart's rule 4. The exclusions are a `not` matcher: inside `path`, an entry such as
+	# `!/_gate/auth` is a literal path, not a negation, and used to let /_gate/healthz through.
+	@gateapi {
+		path /_gate/*
+		not path /_gate/auth /_gate/healthz /_gate/plugin/*
+	}
 	handle @gateapi {
 		reverse_proxy gate:8080
 	}
