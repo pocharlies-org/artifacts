@@ -17,9 +17,9 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
  visitor ──HTTPS── reverse proxy (Traefik / Caddy)
                      ├── /artifacts/**  reads ──forwardAuth──> gate :8081 /_gate/auth ──> oauth2-proxy /auth
                      │        │ allowed ──> MinIO, signed by the gate   denied ──> 302 /oauth2/sign_in
-                     │        └ every response: CSP `sandbox allow-scripts` (opaque origin)
+                     │        └ every response: CSP `sandbox allow-scripts` (opaque origin), nosniff, no-referrer
                      ├── POST /artifacts/** ──> gate :8080  (request-access, approve, deny)
-                     ├── /_gate/** (except auth/healthz) ──> gate :8080
+                     ├── /_gate/** (except auth, healthz, plugin/) ──> gate :8080
                      ├── /oauth2/{sign_in,start,callback,sign_out,static/*} ──> oauth2-proxy (allow-list; rest 404)
                      └── /_<plugin>/** ──> plugin service        (plugin → gate :8081 /_gate/plugin/authz)
 ```
@@ -145,6 +145,15 @@ Prerequisites and what the chart does:
   `secret-key`, two **different** users; optional `artifact-gate-slack`) are created out of
   band — nothing secret goes through git. The S3 ones are needed in the gate's namespace
   (`namespaces.sso`) and in the bootstrap Job's (`minio.namespace`).
+- Namespaces: the gate, the login proxy and the middlewares go to `namespaces.sso`; the
+  routes and the bootstrap Job go to `minio.namespace`. Set both to the same value to run
+  everything in one namespace (CI checks that such a render has no cross-namespace reference).
+- Who may sign in: by default any account your issuer signs in gets a session
+  (`--email-domain=*`) and the artifact ACLs decide what it reads. List your domains in
+  `oauth2Proxy.emailDomains` to refuse every other account at login; add flags such as
+  `--allowed-group=<id>` with `oauth2Proxy.extraArgs`.
+- A Traefik that only watches one ingress class: put the class on every route with
+  `ingressRouteAnnotations` (`kubernetes.io/ingress.class: <class>`).
 
 ## Gate image
 
@@ -185,7 +194,8 @@ helm upgrade --install artifacts ./helm/artifacts --namespace sso \
 ```
 
 The chart renders `<gate.bakedImageRepository>@<gate.bakedImageDigest>` and refuses a missing
-or malformed digest, a repository with a tag, and a non-boolean `gate.bakedImage`.
+or malformed digest, a repository with a tag or with any character other than lowercase
+letters, digits and `. / : _ -`, and a non-boolean `gate.bakedImage`.
 
 **Docker** (same settings as the [gate configuration](#gate-gategatepy); the HMAC key file
 must be readable by uid 1000):
@@ -288,6 +298,20 @@ Everything is environment-driven; nothing is hardcoded.
 names must be DNS-1123 labels (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`): the chart refuses
 anything else.
 
+| Value | Default | Meaning |
+|---|---|---|
+| `ingressRouteAnnotations` | `{}` | annotations on every IngressRoute (artifacts host and plugin routes), e.g. `kubernetes.io/ingress.class: traefik-internal` |
+| `gate.trustForwardHeader` | `false` | `trustForwardHeader` of the `gate-auth` forwardAuth middleware; `false` makes Traefik set the `X-Forwarded-*` headers the gate decides on from the request itself |
+| `oauth2Proxy.emailDomains` | `[]` | one `--email-domain` per entry; empty renders `--email-domain=*`; an entry `*` is refused |
+| `oauth2Proxy.trustedProxyIPs` | `[]` | one `--trusted-proxy-ip` per IP or CIDR (proxies allowed to set `X-Forwarded-*`); the flag exists from oauth2-proxy v7.15.2, so set `image` to such a release first (the example `image`, v7.7.1, does not start with it) |
+| `oauth2Proxy.extraArgs` | `[]` | extra oauth2-proxy flags (`--name` or `--name=value`), appended last; `--email-domain`, `--trusted-proxy-ip` and `--trusted-ip` are refused |
+| `gate.resources`, `oauth2Proxy.resources`, `bootstrap.resources` | today's requests and limits | container resources; add `ephemeral-storage` under `requests` and `limits` to bound local disk |
+
+The `artifacts-csp` middleware sends `Content-Security-Policy: sandbox allow-scripts`,
+`X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer` on every artifact read
+(nosniff makes the browser keep the stored `Content-Type`, so publish scripts and styles with
+their real types).
+
 ## Security notes
 
 - **SigV4 replay window**: the headers the gate hands to the proxy are a normal SigV4
@@ -308,6 +332,11 @@ anything else.
   authority, and `.acl.json` / trailing-slash paths are refused at the proxy.
 - **Never MinIO root at runtime**: the gate uses two least-privilege users; root is
   only for the bootstrap.
+- **Forwarded headers**: `gate-auth` renders `trustForwardHeader: false` by default, so the
+  method, host and URI the gate authorizes are the ones Traefik received, never a client's
+  `X-Forwarded-Uri`. The login proxy runs with `--reverse-proxy=true`; with oauth2-proxy
+  v7.15.2 or newer, list your ingress proxies in `oauth2Proxy.trustedProxyIPs` so only they
+  can set `X-Forwarded-*` there (unset, oauth2-proxy trusts every source).
 
 ## Plugins
 
@@ -322,6 +351,8 @@ python3 -I -m unittest discover -s tests -p 'e2e_*.py' # e2e vs fake MinIO + fak
 helm lint helm/artifacts && helm template t helm/artifacts -f helm/artifacts/values.yaml
 helm template t helm/artifacts -f helm/artifacts/values.yaml | python3 -I tests/check_oauth2_routes.py
 python3 -I tests/check_gate_modes.py                   # chart: ConfigMap mode vs gate image mode
+python3 -I tests/check_chart_values.py                 # chart: annotations, forwardAuth trust, login flags, headers, resources
+python3 -I tests/check_single_namespace.py             # chart: one namespace for every object
 docker build -f gate/Dockerfile -t artifacts-gate:dev . && tests/gate_image_smoke.sh artifacts-gate:dev
 cd deploy/compose && docker compose up -d && docker compose up bootstrap && ./e2e.sh  # full stack (Docker required)
 ```

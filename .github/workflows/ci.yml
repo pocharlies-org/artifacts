@@ -96,6 +96,13 @@ jobs:
           fi
       - name: helm template gate code modes (ConfigMap default, baked image by digest)
         run: python3 -I tests/check_gate_modes.py
+      - name: helm template chart values (route annotations, forwardAuth trust, login proxy flags, headers, resources)
+        run: python3 -I tests/check_chart_values.py
+      - name: helm template one namespace for every object (namespaces.sso == minio.namespace)
+        run: |
+          helm lint helm/artifacts -f helm/artifacts/values.yaml \
+            --set namespaces.sso=artifacts --set minio.namespace=artifacts
+          python3 -I tests/check_single_namespace.py
 
   gate-image:
     # Builds gate/Dockerfile exactly as publish.yml does and smoke-tests it (read-only root

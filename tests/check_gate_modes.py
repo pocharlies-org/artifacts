@@ -96,6 +96,17 @@ refusals = [
       "--set", f"gate.bakedImageRepository={REPO}@{DIGEST}"), "gate.bakedImageRepository"),
     (("--set", "gate.bakedImage=true", "--set", f"gate.bakedImageDigest={DIGEST}",
       "--set", "gate.bakedImageRepository="), "gate.bakedImageRepository"),
+    # characters: only a repository reference reaches the Deployment (no newline, space,
+    # quote or upper case)
+    (("--set", "gate.bakedImage=true", "--set", f"gate.bakedImageDigest={DIGEST}",
+      "--set-json", 'gate.bakedImageRepository="ghcr.io/x/gate\\n          command: [sh]"'),
+     "gate.bakedImageRepository"),
+    (("--set", "gate.bakedImage=true", "--set", f"gate.bakedImageDigest={DIGEST}",
+      "--set", "gate.bakedImageRepository=ghcr.io/x/gate other"), "gate.bakedImageRepository"),
+    (("--set", "gate.bakedImage=true", "--set", f"gate.bakedImageDigest={DIGEST}",
+      "--set", 'gate.bakedImageRepository=ghcr.io/x/gate"'), "gate.bakedImageRepository"),
+    (("--set", "gate.bakedImage=true", "--set", f"gate.bakedImageDigest={DIGEST}",
+      "--set", "gate.bakedImageRepository=ghcr.io/X/gate"), "gate.bakedImageRepository"),
     (("--set-string", "gate.bakedImage=true"), "gate.bakedImage must be a boolean"),
     (("--set-string", "gate.bakedImage=false"), "gate.bakedImage must be a boolean"),
 ]

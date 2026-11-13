@@ -39,6 +39,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: artifacts
     artifacts.pocharlies.org/plugin: {{ $name }}
+  {{- with include "artifacts.ingressRouteAnnotations" $ }}{{ . | nindent 2 }}{{- end }}
 spec:
   entryPoints: [websecure]
   tls:

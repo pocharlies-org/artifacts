@@ -48,6 +48,11 @@
 		@pubbad path_regexp bad `\.acl\.json$|/$`
 		respond @pubbad 404
 		header Content-Security-Policy "sandbox allow-scripts"
+		# `>` sets the header once the upstream has answered, replacing its value: MinIO sends
+		# its own X-Content-Type-Options, which would otherwise appear twice (Traefik's
+		# customResponseHeaders replace it the same way)
+		header >X-Content-Type-Options "nosniff"
+		header >Referrer-Policy "no-referrer"
 		reverse_proxy minio:9000 {
 			header_up -Authorization
 			header_up -Cookie
@@ -72,6 +77,8 @@
 			}
 		}
 		header Content-Security-Policy "sandbox allow-scripts"
+		header >X-Content-Type-Options "nosniff"
+		header >Referrer-Policy "no-referrer"
 		reverse_proxy minio:9000 {
 			header_up -Cookie
 			header_up -X-Auth-Request-User

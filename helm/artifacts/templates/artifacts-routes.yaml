@@ -39,6 +39,7 @@ metadata:
   namespace: {{ $m.namespace }}
   labels:
     app.kubernetes.io/part-of: artifacts
+  {{- with include "artifacts.ingressRouteAnnotations" $ }}{{ . | nindent 2 }}{{- end }}
 spec:
   entryPoints: [websecure]
   tls:
@@ -103,15 +104,16 @@ spec:
         - {name: {{ $m.service }}, port: {{ $m.port }}}
     # 4. Gate's own endpoints (deny page posts here; approve/deny links open here). The gate does its
     #    own authentication for these (401 -> sign_in redirect is built by the gate itself).
-    #    /_gate/auth, /_gate/plugin/authz and /_gate/healthz are deliberately NOT routed: only
-    #    traefik (forwardAuth) and the cluster may reach them, so no one can drive a decision
-    #    endpoint directly. This exclusion is defense-in-depth on top of the structural port split:
-    #    the decision endpoints only listen on values.gate.authPort (8081), which no route here
-    #    points at, and the gate 404s them on this 8080 listener anyway.
+    #    /_gate/auth, /_gate/plugin/ (the plugin authz API) and /_gate/healthz are deliberately NOT
+    #    routed: only traefik (forwardAuth) and the cluster may reach them, so no one can drive a
+    #    decision endpoint directly. This exclusion is defense-in-depth on top of the
+    #    structural port split: the decision endpoints only listen on values.gate.authPort (8081),
+    #    which no route here points at, and the gate 404s them on this 8080 listener anyway.
     - kind: Rule
       priority: 400
       match: >-
         {{ $hostMatch }} && PathPrefix(`/_gate/`) && !Path(`/_gate/auth`) && !Path(`/_gate/healthz`)
+        && !PathPrefix(`/_gate/plugin/`)
       services:
         - {name: artifact-gate, namespace: {{ $sso }}, port: 8080}
     # 5. oauth2-proxy browser endpoints for this host: an ALLOW-LIST, nothing else under the

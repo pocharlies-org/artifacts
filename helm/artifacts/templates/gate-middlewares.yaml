@@ -14,10 +14,17 @@
                         (route middleware list [errors, gate-auth, strip, csp]) so it only touches upstream
                         responses: the gate's deny/confirmation pages keep their own stricter CSP, and
                         `sandbox` (which blocks form submission without allow-forms) cannot break the
-                        "Request access" button.
+                        "Request access" button. Next to the CSP it sends X-Content-Type-Options:
+                        nosniff (the browser keeps the stored Content-Type, never sniffs a script
+                        or stylesheet out of another type) and Referrer-Policy: no-referrer (links
+                        and subresources of an artifact never carry its URL to another site).
        artifacts-strip  drops the (large) session cookies and X-Auth-Request-* headers before MinIO:
                         MinIO rejects requests whose headers total > 8 KB with 400 MetadataTooLarge. */ -}}
 {{- $sso := .Values.namespaces.sso }}
+{{- $trustFwd := .Values.gate.trustForwardHeader | default false }}
+{{- if not (kindIs "bool" $trustFwd) }}
+{{- fail (printf "gate.trustForwardHeader must be a boolean (true or false), got %v" $trustFwd) }}
+{{- end }}
 ---
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
@@ -29,7 +36,10 @@ metadata:
 spec:
   forwardAuth:
     address: http://artifact-gate.{{ $sso }}.svc.cluster.local:{{ .Values.gate.authPort }}/_gate/auth
-    trustForwardHeader: true
+    # gate.trustForwardHeader, default false: Traefik then drops the request's X-Forwarded-*
+    # headers and sets the ones the gate reads (X-Forwarded-Method/-Uri/-Host) from the request it
+    # received, so the URI the gate authorizes is the URI that is served.
+    trustForwardHeader: {{ $trustFwd }}
     # On allow the gate signs the upstream MinIO read (SigV4, the dedicated read-signing user): the
     # bucket has no anonymous read policy outside pub/. Traefik copies these onto the request,
     # replacing anything the visitor sent.
@@ -68,6 +78,8 @@ spec:
       # allow-scripts is set because artifacts here are self-contained reports with inline JS.
       # allow-forms is NOT set, so the gate deny page keeps its own CSP and its form works.
       Content-Security-Policy: sandbox allow-scripts
+      X-Content-Type-Options: nosniff
+      Referrer-Policy: no-referrer
 ---
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
