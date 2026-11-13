@@ -82,9 +82,19 @@ Always JSON. `200` with a decision, or an error status (§ table below).
     `pub: any signed-in tenant user` (a `pub/` key without ACL),
     `pub: anonymous (anonymous-pub enabled)`;
   - not allowed: `denied` (every deny `decide()` makes: not on the ACL, no ACL outside
-    `pub/`, a malformed ACL, an empty groups claim; the detail is written to the gate's log
-    only), `expired` and `object-missing` (see below), `unauthenticated` (no session, and not
-    an anonymous `pub/` read), `acl-error` (the ACL could not be read: fail closed).
+    `pub/`, a key with no artifact root, a malformed ACL, an empty groups claim; and a
+    refused identity, see below; the detail is written to the gate's log only), `expired` and
+    `object-missing` (see below), `unauthenticated` (no session, and not an anonymous `pub/`
+    read), `acl-error` (the ACL could not be read: fail closed).
+- **Which ACL**: the same lookup as forwardAuth. A key `u/<run>/<path>` answers to
+  `u/<run>/.acl.json` and `g/<slug>/<run>/<path>` to `g/<slug>/<run>/.acl.json`, whatever the
+  depth of `<path>`; an `.acl.json` below that root is never read. A key with no artifact
+  root (directly under `u/` or `g/<slug>/`, `acl/…`, or outside `pub/`, `u/` and `g/`) is
+  `denied` for everyone. A `pub/` key keeps the ACL of its own directory (no ACL: any
+  signed-in user).
+- **Refused identities**: a session whose identity contains `#EXT#` (a directory guest's
+  UPN) gets `allowed: false`, `reason: "denied"`, `user.id` and `user.name` null, for every
+  key; the gate's other endpoints refuse it with `403` too.
 - **No existence leak**: `expired` and `object-missing` — and `artifact.expires`/`ttl` — are
   told only to a visitor who would otherwise be allowed (listed, owner, group member, or
   anonymous on a `pub/` key without ACL). Anyone else gets `denied` with `expires`/`ttl`
@@ -98,7 +108,7 @@ Always JSON. `200` with a decision, or an error status (§ table below).
 | Status | When |
 |---|---|
 | `200` | A decision was made (including `allowed: false` — a denial is not an HTTP error) |
-| `400` | Body/path malformed: missing `artifact`, not an `/artifacts/` path, or the path is refused outright (traversal, `.acl.json`, `_gate/`, `_plugins/`, trailing slash); or an invalid or repeated `Content-Length` |
+| `400` | Body/path malformed: missing `artifact`, not an `/artifacts/` path, or the path is refused outright (traversal, `.acl.json`, `_gate/`, `_plugins/`, `_mcp/`, trailing slash); or an invalid or repeated `Content-Length` |
 | `405` | Any method other than POST |
 | `411` | No `Content-Length`, or any `Transfer-Encoding` (chunked): the body is not read |
 | `413` | `Content-Length` above 16384: the body is not read |
@@ -168,7 +178,7 @@ the compose stack".
   values entry); the Job only (re)creates the policy and attaches it.
 - **The core never serves `_plugins/`** — not over the public routes, not through
   forwardAuth, not through the plugin authz endpoint (it answers 400). Same for
-  `_gate/` (gate state) and any `.acl.json`.
+  `_gate/` (gate state), `_mcp/` and any `.acl.json`, at an artifact root or below it.
 - Plugin objects should carry the artifact's `ttl` tag when they must die with the
   artifact; the bucket ILM catch-all (90 days by default) also covers `_plugins/`, so
   a forgotten object still goes away.

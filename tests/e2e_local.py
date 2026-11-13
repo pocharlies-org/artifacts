@@ -196,8 +196,8 @@ class E2ETest(unittest.TestCase):
         self.gate._acl_cache.clear()
         # pub artifact without ACL; private artifact with ACL (owner + bob's group); ACL for it
         OBJECTS["pub/free/index.html"] = b"<h1>free</h1>"
-        OBJECTS["team/secret/report.html"] = b"<h1>secret</h1>"
-        OBJECTS["team/secret/.acl.json"] = json.dumps({
+        OBJECTS["u/secret/report.html"] = b"<h1>secret</h1>"
+        OBJECTS["u/secret/.acl.json"] = json.dumps({
             "owner": "owner@example.com", "users": ["alice@example.com"],
             "groups": ["11111111-2222-4333-8444-555555555555"], "expires": None}).encode()
 
@@ -218,7 +218,7 @@ class E2ETest(unittest.TestCase):
         # MinIO's NoSuchKey XML — an existence leak. On allow the gate must HEAD the object and
         # answer the deny page when it is not there (same page as "not allowed").
         for uri in ("/artifacts/pub/free/does-not-exist.html",        # pub, no ACL, allowed-first
-                    "/artifacts/team/secret/does-not-exist.html"):     # ACL allows alice, object absent
+                    "/artifacts/u/secret/does-not-exist.html"):     # ACL allows alice, object absent
             st, body, _ = self.auth(uri, "alice")
             self.assertEqual(st, 403, uri)
             self.assertIn("Access required", body, uri)
@@ -232,7 +232,7 @@ class E2ETest(unittest.TestCase):
     def test_allow_signs_the_upstream_read(self):
         # MinIO has no anonymous read outside pub/: on ALLOW the gate returns SigV4 headers the
         # proxy copies onto the upstream request. They must bind method, Host and path.
-        uri = "/artifacts/team/secret/report.html"
+        uri = "/artifacts/u/secret/report.html"
         for method in ("GET", "HEAD"):
             st, _, h = self._auth_h(uri, "alice", host="reports.example.org", method=method)
             self.assertEqual(st, 200)
@@ -249,7 +249,7 @@ class E2ETest(unittest.TestCase):
     def test_deny_and_401_carry_no_signature(self):
         USERS["carol3"] = ("carol3@example.com", "aaaa")
         for sid, code in (("carol3", 403), (None, 401)):
-            st, _, h = self._auth_h("/artifacts/team/secret/report.html", sid)
+            st, _, h = self._auth_h("/artifacts/u/secret/report.html", sid)
             self.assertEqual(st, code)
             self.assertNotIn("Authorization", h)
             self.assertNotIn("X-Amz-Date", h)
@@ -257,7 +257,7 @@ class E2ETest(unittest.TestCase):
     def test_s3_subresource_or_override_query_refused(self):
         for q in ("response-content-type=text/html", "Response-Content-Disposition=x",
                   "tagging", "versionId=abc", "X-Amz-Expires=60"):
-            st, _, h = self._auth_h("/artifacts/team/secret/report.html?" + q, "alice")
+            st, _, h = self._auth_h("/artifacts/u/secret/report.html?" + q, "alice")
             self.assertEqual(st, 404, q)
             self.assertNotIn("Authorization", h, q)
 
@@ -268,13 +268,13 @@ class E2ETest(unittest.TestCase):
         for q in ("lambdaArn=arn:minio:s3-object-lambda::x:webhook", "acl", "ACL", "%61cl",
                   "acl%00", "%20acl", "acl&acl", "v=1&v=2", "acl;x=1", ";", "", "v=2&tab="):
             for method in ("GET", "HEAD"):
-                st, _, h = self._auth_h("/artifacts/team/secret/report.html?" + q, "alice",
+                st, _, h = self._auth_h("/artifacts/u/secret/report.html?" + q, "alice",
                                         method=method)
                 self.assertEqual(st, 404, (q, method))
                 self.assertNotIn("Authorization", h, q)
                 self.assertNotIn("X-Amz-Date", h, q)
         # the same read without a query is still allowed and signed
-        st, _, h = self._auth_h("/artifacts/team/secret/report.html", "alice")
+        st, _, h = self._auth_h("/artifacts/u/secret/report.html", "alice")
         self.assertEqual(st, 200)
         self.assertIn("Authorization", h)
 
@@ -286,7 +286,7 @@ class E2ETest(unittest.TestCase):
                          ("X-Minio-Extract", "true"), ("X-MINIO-Source-Proxy-Request", "true")):
             st, body, h = http(self.auth_base + "/_gate/auth",
                                headers={"X-Forwarded-Method": "GET",
-                                        "X-Forwarded-Uri": "/artifacts/team/secret/report.html",
+                                        "X-Forwarded-Uri": "/artifacts/u/secret/report.html",
                                         hdr: val},
                                cookie="sid=alice")
             self.assertEqual(st, 400, hdr)
@@ -295,7 +295,7 @@ class E2ETest(unittest.TestCase):
         # anonymous with the header: refused the same way (before the identity call)
         st, _, _ = http(self.auth_base + "/_gate/auth",
                         headers={"X-Forwarded-Method": "GET",
-                                 "X-Forwarded-Uri": "/artifacts/team/secret/report.html",
+                                 "X-Forwarded-Uri": "/artifacts/u/secret/report.html",
                                  "X-Amz-Checksum-Mode": "ENABLED"})
         self.assertEqual(st, 400)
 
@@ -304,26 +304,26 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 401)
 
     def test_private_acl_user_allowed(self):
-        st, _, _ = self.auth("/artifacts/team/secret/report.html", "alice")
+        st, _, _ = self.auth("/artifacts/u/secret/report.html", "alice")
         self.assertEqual(st, 200)
 
     def test_private_acl_group_member_allowed(self):
-        st, _, _ = self.auth("/artifacts/team/secret/report.html", "bob")
+        st, _, _ = self.auth("/artifacts/u/secret/report.html", "bob")
         self.assertEqual(st, 200)
 
     def test_private_acl_non_member_denied_with_page(self):
         # owner user has no groups claim -> group-only ACL denies (overage rule), but owner is
         # listed? owner@ is not in users; use a user not in the ACL at all:
         USERS["carol"] = ("carol@example.com", "aaaa")
-        st, body, _ = self.auth("/artifacts/team/secret/report.html", "carol")
+        st, body, _ = self.auth("/artifacts/u/secret/report.html", "carol")
         self.assertEqual(st, 403)
         self.assertIn("Request access", body)
-        self.assertIn("team/secret/report.html", body)
+        self.assertIn("u/secret/report.html", body)
 
     def test_missing_artifact_same_403_page_as_denied(self):
         USERS["carol2"] = ("carol2@example.com", "aaaa")
-        st1, b1, _ = self.auth("/artifacts/team/secret/report.html", "carol2")
-        st2, b2, _ = self.auth("/artifacts/team/secret/does-not-exist.html", "carol2")
+        st1, b1, _ = self.auth("/artifacts/u/secret/report.html", "carol2")
+        st2, b2, _ = self.auth("/artifacts/u/secret/does-not-exist.html", "carol2")
         self.assertEqual((st1, st2), (403, 403))
         # identical shape: both pages only echo the path the visitor asked for (no new info) and
         # both offer Request access; nothing distinguishes "missing" from "not allowed".
@@ -331,7 +331,7 @@ class E2ETest(unittest.TestCase):
         self.assertIn("does-not-exist", b2)  # the requested path itself is shown (not a leak)
 
     def test_acl_file_never_served(self):
-        st, _, _ = self.auth("/artifacts/team/secret/.acl.json", "alice")
+        st, _, _ = self.auth("/artifacts/u/secret/.acl.json", "alice")
         self.assertEqual(st, 404)
 
     def test_state_prefix_never_served(self):
@@ -355,7 +355,7 @@ class E2ETest(unittest.TestCase):
         # client sends its own X-Auth-Request-Email; gate must ask oauth2-proxy (no cookie -> 401)
         st, _, _ = http(self.auth_base + "/_gate/auth",
                         headers={"X-Forwarded-Method": "GET",
-                                 "X-Forwarded-Uri": "/artifacts/team/secret/report.html",
+                                 "X-Forwarded-Uri": "/artifacts/u/secret/report.html",
                                  "X-Auth-Request-Email": "alice@example.com"})
         self.assertEqual(st, 401)
 
@@ -366,7 +366,7 @@ class E2ETest(unittest.TestCase):
         # cannot reach /_gate/auth through the public surface.
         st, _, _ = http(self.base + "/_gate/auth",
                         headers={"X-Forwarded-Method": "GET",
-                                 "X-Forwarded-Uri": "/artifacts/team/secret/report.html"},
+                                 "X-Forwarded-Uri": "/artifacts/u/secret/report.html"},
                         cookie="sid=alice")
         self.assertEqual(st, 404)
 
@@ -396,13 +396,13 @@ class E2ETest(unittest.TestCase):
     def test_full_request_approve_flow(self):
         USERS["dave"] = ("dave@example.com", "aaaa")
         # 1) dave hits the deny page and extracts the CSRF token
-        st, page, _ = self.auth("/artifacts/team/secret/report.html", "dave")
+        st, page, _ = self.auth("/artifacts/u/secret/report.html", "dave")
         self.assertEqual(st, 403)
         csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
         # 2) dave requests access
         st, page, _ = http(self.base + "/_gate/request", method="POST",
                            data=urllib.parse.urlencode({"csrf": csrf,
-                                                        "artifact": "/artifacts/team/secret/report.html"}),
+                                                        "artifact": "/artifacts/u/secret/report.html"}),
                            headers={"Content-Type": "application/x-www-form-urlencoded"},
                            cookie="sid=dave")
         self.assertEqual(st, 200)
@@ -434,7 +434,7 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 200)
         with OBJECTS_LOCK:
             self.assertEqual(json.loads(OBJECTS[req_keys[0]])["status"], "approve")
-            acl = json.loads(OBJECTS["team/secret/.acl.json"])
+            acl = json.loads(OBJECTS["u/secret/.acl.json"])
         self.assertIn("dave@example.com", acl["users"])
         # 7) token is now single-use: replay fails
         st, body, _ = http(url, method="POST", data=urllib.parse.urlencode({"token": token}),
@@ -444,21 +444,21 @@ class E2ETest(unittest.TestCase):
         self.assertIn("already <b>approved</b>", body,
                       "replay page must read 'already approved', not the raw action verb")
         # 8) dave can now read (forwardAuth allows)
-        st, _, _ = self.auth("/artifacts/team/secret/report.html", "dave")
+        st, _, _ = self.auth("/artifacts/u/secret/report.html", "dave")
         self.assertEqual(st, 200)
 
     def test_deny_flow_leaves_acl_untouched(self):
         USERS["erin"] = ("erin@example.com", "aaaa")
-        st, page, _ = self.auth("/artifacts/team/secret/report.html", "erin")
+        st, page, _ = self.auth("/artifacts/u/secret/report.html", "erin")
         csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
         st, _, _ = http(self.base + "/_gate/request", method="POST",
                        data=urllib.parse.urlencode({"csrf": csrf,
-                                                    "artifact": "/artifacts/team/secret/report.html"}),
+                                                    "artifact": "/artifacts/u/secret/report.html"}),
                        headers={"Content-Type": "application/x-www-form-urlencoded"},
                        cookie="sid=erin")
         with OBJECTS_LOCK:
             rec = json.loads(OBJECTS[next(k for k in OBJECTS if k.startswith("_gate/req/"))])
-        acl_before = OBJECTS["team/secret/.acl.json"]
+        acl_before = OBJECTS["u/secret/.acl.json"]
         token = self.gate.make_action_token(rec["id"], "deny", self.gate._KEY, 1_800_000_000)
         st, _, _ = http(self.base + "/_gate/deny", method="POST",
                         data=urllib.parse.urlencode({"token": token}),
@@ -466,11 +466,11 @@ class E2ETest(unittest.TestCase):
                         cookie="sid=owner")
         self.assertEqual(st, 200)
         with OBJECTS_LOCK:
-            self.assertEqual(OBJECTS["team/secret/.acl.json"], acl_before)
+            self.assertEqual(OBJECTS["u/secret/.acl.json"], acl_before)
             self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rec['id']}.json"])["status"], "deny")
 
     def _pending_request(self, requester):
-        rid = self.gate.REQUESTS.create(requester, "/artifacts/team/secret/report.html",
+        rid = self.gate.REQUESTS.create(requester, "/artifacts/u/secret/report.html",
                                         "owner@example.com", 1_800_000_000)
         return rid
 
@@ -484,7 +484,7 @@ class E2ETest(unittest.TestCase):
         # finding 3: the token's `act` binds the endpoint. A deny token POSTed (or opened) on
         # /_gate/approve is refused with 410: no state change, no ACL grant.
         rid = self._pending_request("frank@example.com")
-        acl_before = OBJECTS["team/secret/.acl.json"]
+        acl_before = OBJECTS["u/secret/.acl.json"]
         token = self.gate.make_action_token(rid, "deny", self.gate._KEY, 1_800_000_000)
         st, body, _ = self._post_action("approve", token)
         self.assertEqual(st, 410)
@@ -494,13 +494,13 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 410)
         with OBJECTS_LOCK:
             self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
-            self.assertEqual(OBJECTS["team/secret/.acl.json"], acl_before)
+            self.assertEqual(OBJECTS["u/secret/.acl.json"], acl_before)
         # the right endpoint still works with the same token
         st, _, _ = self._post_action("deny", token)
         self.assertEqual(st, 200)
         with OBJECTS_LOCK:
             self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "deny")
-            self.assertEqual(OBJECTS["team/secret/.acl.json"], acl_before)
+            self.assertEqual(OBJECTS["u/secret/.acl.json"], acl_before)
 
     def test_approve_token_cannot_deny(self):
         # finding 3, other direction: an approve token on /_gate/deny is refused (410)
@@ -518,15 +518,15 @@ class E2ETest(unittest.TestCase):
         with OBJECTS_LOCK:
             self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "approve")
             self.assertIn("grace@example.com",
-                          json.loads(OBJECTS["team/secret/.acl.json"])["users"])
+                          json.loads(OBJECTS["u/secret/.acl.json"])["users"])
 
     def test_request_access_missing_artifact_uniform_response_no_state(self):
         USERS["frank"] = ("frank@example.com", "aaaa")
-        st, page, _ = self.auth("/artifacts/team/secret/ghost.html", "frank")
+        st, page, _ = self.auth("/artifacts/u/secret/ghost.html", "frank")
         csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
         st, page2, _ = http(self.base + "/_gate/request", method="POST",
                             data=urllib.parse.urlencode({"csrf": csrf,
-                                                         "artifact": "/artifacts/team/secret/ghost.html"}),
+                                                         "artifact": "/artifacts/u/secret/ghost.html"}),
                            headers={"Content-Type": "application/x-www-form-urlencoded"},
                            cookie="sid=frank")
         self.assertEqual(st, 200)
@@ -537,19 +537,19 @@ class E2ETest(unittest.TestCase):
     def test_request_access_rate_limited(self):
         USERS["gina"] = ("gina@example.com", "aaaa")
         for i in range(2):                                # GATE_RATE_LIMIT_MAX=2
-            st, page, _ = self.auth("/artifacts/team/secret/report.html", "gina")
+            st, page, _ = self.auth("/artifacts/u/secret/report.html", "gina")
             csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
             st, _, _ = http(self.base + "/_gate/request", method="POST",
                             data=urllib.parse.urlencode({"csrf": csrf,
-                                                         "artifact": "/artifacts/team/secret/report.html"}),
+                                                         "artifact": "/artifacts/u/secret/report.html"}),
                             headers={"Content-Type": "application/x-www-form-urlencoded"},
                             cookie="sid=gina")
             self.assertEqual(st, 200, f"request {i}")
-        st, page, _ = self.auth("/artifacts/team/secret/report.html", "gina")
+        st, page, _ = self.auth("/artifacts/u/secret/report.html", "gina")
         csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
         st, page, _ = http(self.base + "/_gate/request", method="POST",
                            data=urllib.parse.urlencode({"csrf": csrf,
-                                                        "artifact": "/artifacts/team/secret/report.html"}),
+                                                        "artifact": "/artifacts/u/secret/report.html"}),
                            headers={"Content-Type": "application/x-www-form-urlencoded"},
                            cookie="sid=gina")
         self.assertEqual(st, 429)
@@ -557,19 +557,19 @@ class E2ETest(unittest.TestCase):
 
     def test_csrf_rejected_on_foreign_or_stale_token(self):
         USERS["hank"] = ("hank@example.com", "aaaa")
-        st, page, _ = self.auth("/artifacts/team/secret/report.html", "hank")
+        st, page, _ = self.auth("/artifacts/u/secret/report.html", "hank")
         csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
         # hank replays his token but claims another artifact
         st, _, _ = http(self.base + "/_gate/request", method="POST",
                         data=urllib.parse.urlencode({"csrf": csrf,
-                                                     "artifact": "/artifacts/team/secret/other.html"}),
+                                                     "artifact": "/artifacts/u/secret/other.html"}),
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
                         cookie="sid=hank")
         self.assertEqual(st, 403)
         # bob steals hank's token
         st, _, _ = http(self.base + "/_gate/request", method="POST",
                         data=urllib.parse.urlencode({"csrf": csrf,
-                                                     "artifact": "/artifacts/team/secret/report.html"}),
+                                                     "artifact": "/artifacts/u/secret/report.html"}),
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
                         cookie="sid=bob")
         self.assertEqual(st, 403)
@@ -580,17 +580,17 @@ class E2ETest(unittest.TestCase):
 
     def test_gate_pages_have_csp_and_no_store(self):
         USERS["ivy"] = ("ivy@example.com", "aaaa")
-        st, _, hdrs = self.auth("/artifacts/team/secret/report.html", "ivy")
+        st, _, hdrs = self.auth("/artifacts/u/secret/report.html", "ivy")
         self.assertEqual(st, 403)
         self.assertIn("default-src 'none'", hdrs.get("Content-Security-Policy", ""))
         self.assertEqual(hdrs.get("Cache-Control"), "no-store")
 
     def test_expired_acl_denies(self):
-        OBJECTS["team/secret/.acl.json"] = json.dumps(
+        OBJECTS["u/secret/.acl.json"] = json.dumps(
             {"owner": "owner@example.com", "users": ["alice@example.com"],
              "expires": "2020-01-01"}).encode()
         self.gate._acl_cache.clear()
-        st, _, _ = self.auth("/artifacts/team/secret/report.html", "alice")
+        st, _, _ = self.auth("/artifacts/u/secret/report.html", "alice")
         self.assertEqual(st, 403)
 
 
@@ -636,43 +636,43 @@ class E2ETest(unittest.TestCase):
             return st, body
 
     def test_plugin_authz_allow_user(self):
-        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="alice")
+        st, ans = self.plugin_authz("/artifacts/u/secret/report.html", sid="alice")
         self.assertEqual(st, 200)
         self.assertTrue(ans["allowed"], ans)
         self.assertEqual(ans["user"]["id"], "alice@example.com")
         self.assertEqual(ans["user"]["name"], "Alice Example")   # id_token `name` claim
         self.assertFalse(ans["user"]["anonymous"])
-        self.assertEqual(ans["artifact"]["key"], "team/secret/report.html")
+        self.assertEqual(ans["artifact"]["key"], "u/secret/report.html")
 
     def test_plugin_authz_name_falls_back_to_email(self):
-        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="owner")
+        st, ans = self.plugin_authz("/artifacts/u/secret/report.html", sid="owner")
         self.assertEqual((st, ans["allowed"]), (200, True))
         self.assertEqual(ans["user"]["name"], "owner@example.com")   # no id_token from the proxy
 
     def test_plugin_authz_expired_not_leaked_to_strangers(self):
-        OBJECTS["team/secret/.acl.json"] = json.dumps(
+        OBJECTS["u/secret/.acl.json"] = json.dumps(
             {"owner": "owner@example.com", "users": ["alice@example.com"],
              "expires": "2020-01-01"}).encode()
         self.gate._acl_cache.clear()
         # bob is in no listed group: same answer as for a live artifact he is not on
-        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="bob")
+        st, ans = self.plugin_authz("/artifacts/u/secret/report.html", sid="bob")
         self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "denied"))
         self.assertEqual((ans["artifact"]["expires"], ans["artifact"]["ttl"]), (None, None))
 
     def test_plugin_authz_allow_group_member(self):
-        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="bob")
+        st, ans = self.plugin_authz("/artifacts/u/secret/report.html", sid="bob")
         self.assertEqual((st, ans["allowed"]), (200, True))
         self.assertEqual(ans["reason"], "group")
 
     def test_plugin_authz_bearer_token_accepted(self):
         # the gate forwards the visitor's Authorization bearer to oauth2-proxy (fake proxy maps
         # Bearer <sid> to the same user): identity still comes from the proxy's response only.
-        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", bearer="alice")
+        st, ans = self.plugin_authz("/artifacts/u/secret/report.html", bearer="alice")
         self.assertEqual((st, ans["allowed"]), (200, True))
         self.assertEqual(ans["user"]["id"], "alice@example.com")
 
     def test_plugin_authz_deny_no_acl_outside_pub(self):
-        st, ans = self.plugin_authz("/artifacts/team/noteam/x.html", sid="alice")
+        st, ans = self.plugin_authz("/artifacts/u/noteam/x.html", sid="alice")
         self.assertEqual(st, 200)
         self.assertFalse(ans["allowed"])
         self.assertEqual(ans["reason"], "denied")
@@ -681,11 +681,11 @@ class E2ETest(unittest.TestCase):
         # a stranger gets one answer for a directory without an ACL and for an ACL that does not
         # list them; the gate's log keeps the detailed reason
         USERS["stranger"] = ("stranger@example.com", "99999999-2222-4333-8444-555555555555")
-        OBJECTS["team/noacl/report.html"] = b"x"
+        OBJECTS["u/noacl/report.html"] = b"x"
         log = self.capture_log()
-        _, no_acl = self.plugin_authz("/artifacts/team/noacl/report.html", sid="stranger")
-        _, listed_not_me = self.plugin_authz("/artifacts/team/secret/report.html", sid="stranger")
-        _, missing = self.plugin_authz("/artifacts/team/secret/ghost.html", sid="stranger")
+        _, no_acl = self.plugin_authz("/artifacts/u/noacl/report.html", sid="stranger")
+        _, listed_not_me = self.plugin_authz("/artifacts/u/secret/report.html", sid="stranger")
+        _, missing = self.plugin_authz("/artifacts/u/secret/ghost.html", sid="stranger")
         for ans in (no_acl, listed_not_me, missing):
             self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), ans)
             self.assertEqual((ans["artifact"]["expires"], ans["artifact"]["ttl"]), (None, None))
@@ -695,27 +695,27 @@ class E2ETest(unittest.TestCase):
         self.assertIn("reason=denied detail=not-listed", lines[1])
 
     def test_plugin_authz_deny_expired(self):
-        OBJECTS["team/secret/.acl.json"] = json.dumps(
+        OBJECTS["u/secret/.acl.json"] = json.dumps(
             {"owner": "owner@example.com", "users": ["alice@example.com"],
              "expires": "2020-01-01"}).encode()
         self.gate._acl_cache.clear()
-        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="alice")
+        st, ans = self.plugin_authz("/artifacts/u/secret/report.html", sid="alice")
         self.assertEqual((st, ans["allowed"]), (200, False))
         self.assertEqual(ans["reason"], "expired")
 
     def test_plugin_authz_expiry_from_acl(self):
-        OBJECTS["team/secret/.acl.json"] = json.dumps(
+        OBJECTS["u/secret/.acl.json"] = json.dumps(
             {"owner": "owner@example.com", "users": ["alice@example.com"],
              "expires": "2030-01-02"}).encode()
         self.gate._acl_cache.clear()
-        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="alice")
+        st, ans = self.plugin_authz("/artifacts/u/secret/report.html", sid="alice")
         self.assertTrue(ans["allowed"])
         self.assertTrue(ans["artifact"]["expires"].startswith("2030-01-02"))
 
     def test_plugin_authz_expiry_from_ttl_tag(self):
         # no ACL expires: ttl tag + Last-Modified compose the ILM expiry (docs/plugins.md §4)
-        TAGS["team/secret/report.html"] = {"ttl": "7"}
-        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", sid="alice")
+        TAGS["u/secret/report.html"] = {"ttl": "7"}
+        st, ans = self.plugin_authz("/artifacts/u/secret/report.html", sid="alice")
         self.assertTrue(ans["allowed"])
         self.assertEqual(ans["artifact"]["ttl"], 7)
         from datetime import datetime, timezone
@@ -737,7 +737,7 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(ans["reason"], "unauthenticated")
 
     def test_plugin_authz_anonymous_outside_pub_denied_even_flag_on(self):
-        st, ans = self.plugin_authz("/artifacts/team/secret/report.html", flag=True)
+        st, ans = self.plugin_authz("/artifacts/u/secret/report.html", flag=True)
         self.assertEqual(st, 200)
         self.assertFalse(ans["allowed"])
         self.assertEqual(ans["reason"], "unauthenticated")
@@ -747,8 +747,8 @@ class E2ETest(unittest.TestCase):
         self.assertEqual((st, ans["allowed"]), (200, True))
 
     def test_plugin_authz_traversal_400(self):
-        for art in ("/artifacts/pub/../team/secret/report.html",
-                    "/artifacts/team/secret/../../etc/passwd"):
+        for art in ("/artifacts/pub/../u/secret/report.html",
+                    "/artifacts/u/secret/../../etc/passwd"):
             st, ans = self.plugin_authz(art, sid="alice")
             self.assertEqual(st, 400, art)
 
@@ -764,7 +764,7 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 400)
 
     def test_plugin_authz_acl_file_400(self):
-        st, _ = self.plugin_authz("/artifacts/team/secret/.acl.json", sid="alice")
+        st, _ = self.plugin_authz("/artifacts/u/secret/.acl.json", sid="alice")
         self.assertEqual(st, 400)
 
     def test_plugin_authz_bad_artifact_400(self):
@@ -776,7 +776,7 @@ class E2ETest(unittest.TestCase):
     def test_plugin_authz_not_on_public_listener(self):
         # fail-closed listener split: the public listener 404s the decision endpoints
         st, _, _ = http(self.base + "/_gate/plugin/authz", method="POST",
-                     data=json.dumps({"artifact": "/artifacts/team/secret/report.html"}),
+                     data=json.dumps({"artifact": "/artifacts/u/secret/report.html"}),
                      headers={"Content-Type": "application/json"}, cookie="sid=alice")
         self.assertEqual(st, 404)
 
@@ -785,7 +785,7 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 405)
         self.assertEqual(json.loads(body), {"error": "POST required"})
         # a GET carrying a body is refused before routing (a GET takes no body)
-        st, _ = self.plugin_authz("/artifacts/team/secret/report.html", sid="alice", method="GET")
+        st, _ = self.plugin_authz("/artifacts/u/secret/report.html", sid="alice", method="GET")
         self.assertEqual(st, 400)
 
     def test_plugin_authz_proxy_error_fails_closed(self):
@@ -793,7 +793,7 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 500)
 
     def test_plugin_authz_allowed_but_object_missing(self):
-        st, ans = self.plugin_authz("/artifacts/team/secret/ghost.html", sid="alice")
+        st, ans = self.plugin_authz("/artifacts/u/secret/ghost.html", sid="alice")
         self.assertEqual((st, ans["allowed"]), (200, False))
         self.assertEqual(ans["reason"], "object-missing")
 
@@ -906,7 +906,7 @@ class E2ETest(unittest.TestCase):
         hostport = self.base.split("//", 1)[1]
         conn = http_client.HTTPConnection(hostport, timeout=10)
         self.addCleanup(conn.close)
-        prefix = "artifact=/artifacts/team/secret/report.html&csrf="
+        prefix = "artifact=/artifacts/u/secret/report.html&csrf="
         body = prefix + "x" * (16 * 1024 - len(prefix))     # exactly POST_BODY_MAX bytes
         conn.request("POST", "/_gate/request", body=body,
                      headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -972,7 +972,7 @@ class E2ETest(unittest.TestCase):
     def test_forwarded_uri_read_two_ways_is_refused(self):
         # L1: "#frag" was decided as pub/free/index.html and signed as ".../index.html#frag";
         # "//host/..." and "http://host/..." put a host into one reading of the path
-        for uri in ("/artifacts/pub/free/index.html#frag", "/artifacts/team/secret/report.html#x",
+        for uri in ("/artifacts/pub/free/index.html#frag", "/artifacts/u/secret/report.html#x",
                     "//evil.example/artifacts/pub/free/index.html",
                     "http://evil.example/artifacts/pub/free/index.html",
                     "/artifacts/pub/free/in dex.html", "/artifacts/pub/free/index.html\x7f"):
@@ -1003,8 +1003,8 @@ class E2ETest(unittest.TestCase):
     def test_client_values_cannot_forge_log_lines(self):
         log = self.capture_log()
         forged = "INFO action=approve id=deadbeef by=owner@example.com"
-        self._auth_h("/artifacts/team/secret/x%0A" + urllib.parse.quote(forged), "alice")
-        self._auth_h("/artifacts/team/secret/report.html?x=%0A" + urllib.parse.quote(forged), "alice")
+        self._auth_h("/artifacts/u/secret/x%0A" + urllib.parse.quote(forged), "alice")
+        self._auth_h("/artifacts/u/secret/report.html?x=%0A" + urllib.parse.quote(forged), "alice")
         # urlsplit drops \n from the form value; other line breaks of str.splitlines() remain
         for sep in ("\x0b", "\x1e", "\x85", "\u2028"):
             http(self.base + "/_gate/request", method="POST",
@@ -1012,24 +1012,175 @@ class E2ETest(unittest.TestCase):
                  headers={"Content-Type": "application/x-www-form-urlencoded"}, cookie="sid=alice")
         lines = log.getvalue().splitlines()
         self.assertFalse([ln for ln in lines if ln.startswith(forged)], lines)
-        self.assertTrue([ln for ln in lines if "key=team/secret/x\\x0aINFO action" in ln], lines)
+        self.assertTrue([ln for ln in lines if "key=u/secret/x\\x0aINFO action" in ln], lines)
         self.assertEqual(len([ln for ln in lines if "csrf rejected" in ln and "u/x\\" in ln]), 4,
                          lines)
 
     def test_gate_pages_cannot_be_framed(self):
         USERS["fran"] = ("fran@example.com", "aaaa")
-        answers = [self.auth("/artifacts/team/secret/report.html", "fran"),          # 403 deny page
-                   self.auth("/artifacts/team/secret/.acl.json", "fran"),            # 404
+        answers = [self.auth("/artifacts/u/secret/report.html", "fran"),          # 403 deny page
+                   self.auth("/artifacts/u/secret/.acl.json", "fran"),            # 404
                    http(self.base + "/artifacts/x", method="DELETE"),                # 405
                    http(self.base + "/_gate/approve?token=x"),                       # 410
                    http(self.base + "/_gate/healthz")]                               # 200
-        st, _ = self.plugin_authz("/artifacts/team/secret/report.html", sid="fran")
+        st, _ = self.plugin_authz("/artifacts/u/secret/report.html", sid="fran")
         self.assertEqual(st, 200)
         for st, _, h in answers:
             self.assertIn("frame-ancestors 'none'", h.get("Content-Security-Policy", ""), st)
             self.assertIn("default-src 'none'", h.get("Content-Security-Policy", ""), st)
             self.assertEqual(h.get("X-Frame-Options"), "DENY", st)
             self.assertEqual(h.get("Server"), "artifact-gate/1.0", st)  # no Python version
+
+    # -- ACL at the artifact root, keys without one, _mcp/, refused identities ----------
+    def test_subfolder_files_answer_to_the_root_acl(self):
+        # a zip with subfolders is one artifact: every depth opens for who the root ACL lists
+        # and closes for everyone when they are removed from it
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/assets/css/app.css"] = b"body{}"
+            OBJECTS["g/team-a/run1/index.html"] = b"<h1>g</h1>"
+            OBJECTS["g/team-a/run1/a/b/c.js"] = b"1"
+            OBJECTS["g/team-a/run1/.acl.json"] = json.dumps(
+                {"owner": "owner@example.com", "groups": ["11111111-2222-4333-8444-555555555555"]}).encode()
+        for uri, sid in (("/artifacts/u/secret/assets/css/app.css", "alice"),
+                         ("/artifacts/u/secret/assets/css/app.css", "bob"),
+                         ("/artifacts/g/team-a/run1/index.html", "bob"),
+                         ("/artifacts/g/team-a/run1/a/b/c.js", "bob")):
+            st, _, h = self._auth_h(uri, sid)
+            self.assertEqual(st, 200, (uri, sid))
+            self.assertIn("Authorization", h)
+            st, ans = self.plugin_authz(uri, sid=sid)
+            self.assertEqual((st, ans["allowed"]), (200, True), (uri, sid))
+        USERS["carol4"] = ("carol4@example.com", "aaaa")
+        st, body, _ = self.auth("/artifacts/u/secret/assets/css/app.css", "carol4")
+        self.assertEqual(st, 403)
+        self.assertIn("Request access", body)
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/.acl.json"] = json.dumps(
+                {"owner": "owner@example.com", "users": [], "groups": []}).encode()
+        self.gate._acl_cache.clear()                     # the 15 s cache, not the rule
+        for uri in ("/artifacts/u/secret/report.html", "/artifacts/u/secret/assets/css/app.css"):
+            st, _, _ = self.auth(uri, "alice")
+            self.assertEqual(st, 403, uri)
+
+    def test_stray_nested_acl_never_consulted_or_served(self):
+        USERS["mallory"] = ("mallory@example.com", "aaaa")
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/sub/x.html"] = b"x"
+            OBJECTS["u/secret/sub/.acl.json"] = json.dumps(
+                {"owner": "mallory@example.com", "users": ["mallory@example.com"]}).encode()
+        st, _, h = self._auth_h("/artifacts/u/secret/sub/x.html", "mallory")
+        self.assertEqual(st, 403)
+        self.assertNotIn("Authorization", h)
+        _, ans = self.plugin_authz("/artifacts/u/secret/sub/x.html", sid="mallory")
+        self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"))
+        st, _, _ = self.auth("/artifacts/u/secret/sub/x.html", "alice")   # listed at the root
+        self.assertEqual(st, 200)
+        for sid in ("mallory", "alice"):
+            st, body, _ = self.auth("/artifacts/u/secret/sub/.acl.json", sid)
+            self.assertEqual(st, 404, sid)
+            self.assertIn("Nothing here", body)
+            st, _ = self.plugin_authz("/artifacts/u/secret/sub/.acl.json", sid=sid)
+            self.assertEqual(st, 400, sid)
+
+    def test_keys_without_artifact_root_denied(self):
+        # an ACL where the old per-directory lookup would find one lets nobody in
+        acl = json.dumps({"owner": "alice@example.com", "users": ["alice@example.com"]}).encode()
+        keys = ["u/x.html", "g/team-a/x.html", "acl/run.json", "other/run/x.html", "x.html"]
+        with OBJECTS_LOCK:
+            for d in ("u/", "g/team-a/", "acl/", "other/run/", ""):
+                OBJECTS[d + ".acl.json"] = acl
+            for k in keys:
+                OBJECTS[k] = b"x"
+        for k in keys:
+            st, body, h = self._auth_h("/artifacts/" + k, "alice")
+            self.assertEqual(st, 403, k)
+            self.assertIn("Access required", body, k)
+            self.assertNotIn("Authorization", h, k)
+            st, ans = self.plugin_authz("/artifacts/" + k, sid="alice")
+            self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "denied"), k)
+
+    def test_mcp_prefix_is_bad_path(self):
+        with OBJECTS_LOCK:
+            OBJECTS["_mcp/sessions/x.json"] = b"{}"
+            OBJECTS["_mcp/sessions/.acl.json"] = json.dumps({"owner": "alice@example.com"}).encode()
+        for sid in ("alice", None):
+            st, body, h = self._auth_h("/artifacts/_mcp/sessions/x.json", sid)
+            self.assertEqual(st, 404, sid)
+            self.assertIn("Nothing here", body)
+            self.assertNotIn("Authorization", h)
+        st, _ = self.plugin_authz("/artifacts/_mcp/sessions/x.json", sid="alice")
+        self.assertEqual(st, 400)
+
+    def test_approval_for_a_nested_file_writes_only_the_root_acl(self):
+        USERS["dora"] = ("dora@example.com", "aaaa")
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/assets/app.css"] = b"body{}"
+        uri = "/artifacts/u/secret/assets/app.css"
+        st, page, _ = self.auth(uri, "dora")
+        self.assertEqual(st, 403)
+        csrf = re.search(r'name=csrf value="([^"]+)"', page).group(1)
+        st, page, _ = http(self.base + "/_gate/request", method="POST",
+                           data=urllib.parse.urlencode({"csrf": csrf, "artifact": uri}),
+                           headers={"Content-Type": "application/x-www-form-urlencoded"},
+                           cookie="sid=dora")
+        self.assertEqual(st, 200)
+        with OBJECTS_LOCK:
+            req_keys = [k for k in OBJECTS if k.startswith("_gate/req/")]
+            acls_before = sorted(k for k in OBJECTS if k.endswith(".acl.json"))
+        self.assertEqual(len(req_keys), 1)              # the root ACL's owner is asked
+        rec = json.loads(OBJECTS[req_keys[0]])
+        self.assertEqual((rec["owner"], rec["artifact"]), ("owner@example.com", uri))
+        token = self.gate.make_action_token(rec["id"], "approve", self.gate._KEY, int(time.time()))
+        st, _, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200)
+        with OBJECTS_LOCK:
+            acls_after = sorted(k for k in OBJECTS if k.endswith(".acl.json"))
+            root = json.loads(OBJECTS["u/secret/.acl.json"])
+        self.assertEqual(acls_after, acls_before)       # no ACL object created
+        self.assertEqual(acls_after, ["u/secret/.acl.json"])
+        self.assertIn("dora@example.com", root["users"])
+        for u in (uri, "/artifacts/u/secret/report.html"):
+            st, _, _ = self.auth(u, "dora")
+            self.assertEqual(st, 200, u)
+
+    def test_guest_identity_refused_on_every_endpoint(self):
+        guest = "guest_example.org#EXT#@tenant.example"
+        USERS["guest"] = (guest, "11111111-2222-4333-8444-555555555555")
+        with OBJECTS_LOCK:
+            acl = json.loads(OBJECTS["u/secret/.acl.json"])
+            acl["users"].append(guest.lower())          # listed, and in the listed group
+            OBJECTS["u/secret/.acl.json"] = json.dumps(acl).encode()
+        log = self.capture_log()
+        for uri in ("/artifacts/u/secret/report.html", "/artifacts/pub/free/index.html"):
+            st, body, h = self._auth_h(uri, "guest")
+            self.assertEqual(st, 403, uri)
+            self.assertIn("Access refused", body)
+            self.assertNotIn("Request access", body)
+            self.assertNotIn("Authorization", h)
+            st, ans = self.plugin_authz(uri, sid="guest", flag=True)
+            self.assertEqual((st, ans["allowed"], ans["reason"], ans["user"]["id"]),
+                             (200, False, "denied", None), uri)
+        st, body, _ = http(self.base + "/_gate/request", method="POST",
+                           data=urllib.parse.urlencode({"csrf": "x",
+                                                        "artifact": "/artifacts/u/secret/report.html"}),
+                           headers={"Content-Type": "application/x-www-form-urlencoded"},
+                           cookie="sid=guest")
+        self.assertEqual(st, 403)
+        self.assertIn("Access refused", body)
+        rid = self._pending_request("dave@example.com")
+        token = self.gate.make_action_token(rid, "approve", self.gate._KEY, int(time.time()))
+        st, body, _ = http(self.base + "/_gate/approve?token=" + urllib.parse.quote(token, safe=""),
+                           cookie="sid=guest")
+        self.assertEqual(st, 403)
+        self.assertIn("Access refused", body)
+        st, _, _ = http(self.base + "/_gate/approve", method="POST",
+                        data=urllib.parse.urlencode({"token": token}),
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                        cookie="sid=guest")
+        self.assertEqual(st, 403)
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+        self.assertIn("identity refused (guest account)", log.getvalue())
 
 
 if __name__ == "__main__":

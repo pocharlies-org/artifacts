@@ -12,14 +12,21 @@ Role in the chain (Traefik IngressRoute `artifacts-routes`, ns minio):
 
 The gate answers Traefik's forwardAuth (`GET /_gate/auth`): it authenticates the visitor by calling
 oauth2-proxy's own `/auth` endpoint with the visitor's cookie (so it NEVER trusts client-supplied
-X-Auth-Request-* headers), then decides against the artifact's `<dir>/.acl.json`:
+X-Auth-Request-* headers), then decides against the ACL at the artifact's root (acl_key_for):
+`u/<run>/.acl.json` for every key `u/<run>/...` and `g/<slug>/<run>/.acl.json` for every key
+`g/<slug>/<run>/...`, at any depth (a zip with subfolders is one artifact, one ACL):
 
     { "owner": "<UPN>", "users": ["<UPN>", ...], "groups": ["<entra object id>", ...],
       "expires": "YYYY-MM-DD" | ISO datetime | null }
 
   - ACL allows: owner, any UPN in `users`, any member of any Entra object id in `groups`.
-  - `pub/` objects WITHOUT an ACL: any signed-in user of the tenant.
+  - An `.acl.json` below the artifact root is never read and never served.
+  - No artifact root (a key directly under `u/` or `g/<slug>/`, `acl/...`, anything outside the
+    pub prefixes, `u/` and `g/`): deny, whatever ACL objects exist.
+  - `pub/` objects WITHOUT an ACL: any signed-in user of the tenant. A `pub/` ACL, where one
+    exists, is still the `.acl.json` of the key's own directory (unchanged).
   - Anything else without an ACL: deny (the request-access button on the deny page goes nowhere).
+  - An identity containing `#EXT#` (a directory guest's UPN) is refused on every endpoint.
   - `expires` in the past: deny (still requestable: the owner still exists).
   - Groups in the ACL but no `groups` claim from Entra (overage or user with no groups): deny + log.
   - Missing artifact and "not allowed" answer with the SAME 403 page (no existence leak) and the
@@ -54,8 +61,8 @@ plugins must call POST /_gate/plugin/authz (internal listener only, never routed
 of re-implementing decide(). It answers {allowed, reason, user:{id,name,anonymous},
 artifact:{key,expires,ttl}} using the one and only decide(). Anonymous visitors are allowed only
 for pub/ keys and only while GATE_ANONYMOUS_PUB_ENABLED is true. Keys under the plugin storage
-prefix (GATE_PLUGIN_PREFIX, default "_plugins") and gate state (GATE_STATE_PREFIX) are never
-served on any route.
+prefix (GATE_PLUGIN_PREFIX, default "_plugins"), gate state (GATE_STATE_PREFIX) and `_mcp/`
+are never served on any route.
 
 Single file, stdlib only, mounted from a ConfigMap onto a digest-pinned python:3.12-slim.
 Configuration is env-only (see CONFIG below); secrets come from k8s secrets.
@@ -140,6 +147,8 @@ PUB_PREFIXES = tuple(p for p in _env("GATE_PUB_PREFIXES", "pub/").split(",") if 
 # it explicitly, and it must be false before any public hostname or tunnel (docs/plugins.md).
 ANONYMOUS_PUB_ENABLED = _env("GATE_ANONYMOUS_PUB_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 PLUGIN_PREFIX = _env("GATE_PLUGIN_PREFIX", "_plugins")  # plugin storage prefix: never served
+# Reserved for an MCP publisher's own bookkeeping objects: never an artifact, never served.
+MCP_PREFIX = "_mcp"
 RATE_LIMIT_MAX = int(_env("GATE_RATE_LIMIT_MAX", "5"))
 RATE_LIMIT_WINDOW = int(_env("GATE_RATE_LIMIT_WINDOW_SECONDS", "86400"))
 TOKEN_TTL = int(_env("GATE_TOKEN_TTL_SECONDS", "604800"))    # approve/deny links: 7 days
@@ -147,8 +156,9 @@ CSRF_TTL = int(_env("GATE_CSRF_TTL_SECONDS", "3600"))
 # Negative/positive ACL cache TTL. This 15 s is the REAL default (the
 # README said "30 s" — the docs now follow the code; keep them in sync if this ever changes).
 ACL_CACHE_TTL = int(_env("GATE_ACL_CACHE_SECONDS", "15"))
-# Upper bound of that cache (least recently used entries go first): one entry per directory
-# asked about, so without a bound any signed-in visitor could grow it without limit.
+# Upper bound of that cache (least recently used entries go first): one entry per ACL key
+# asked about (an artifact root, or a pub/ directory), so without a bound any signed-in
+# visitor could grow it without limit.
 ACL_CACHE_MAX = max(1, int(_env("GATE_ACL_CACHE_MAX_ENTRIES", "10000")))
 LISTEN_PORT = int(_env("GATE_PORT", "8080"))           # public surface (see module docstring)
 AUTH_LISTEN_PORT = int(_env("GATE_AUTH_PORT", "8081"))  # forwardAuth decision endpoint only
@@ -419,8 +429,41 @@ def _parse_expires(value):
         return None
 
 
+# Audience prefixes of an artifact root: u/<run>/ (people) and g/<slug>/<run>/ (a group).
+_ROOT_SEGMENTS = {"u": 2, "g": 3}
+
+
+def acl_key_for(key, pub_prefixes=PUB_PREFIXES):
+    """The one ACL object that governs `key`, or None when no ACL can (the key is denied).
+
+    The single derivation of an ACL key: read_acl, grant_access and decide() all call it, so
+    the forwardAuth decision, the plugin authz answer and the approval write agree on it.
+
+        u/<run>/<path>           -> u/<run>/.acl.json          (the artifact root)
+        g/<slug>/<run>/<path>    -> g/<slug>/<run>/.acl.json   (the artifact root)
+        <pub prefix>...          -> the .acl.json of the key's own directory (pub/ unchanged)
+        anything else            -> None
+
+    <path> is one or more segments: every file of an artifact, at any depth, answers to the
+    root ACL, and an .acl.json below the root is never read. None covers a key with no object
+    below an artifact root (`u/x`, `g/<slug>/x`, an empty <run> or <slug>), `acl/...`, `_gate/...`
+    and every key outside the pub prefixes, `u/` and `g/`."""
+    if not isinstance(key, str) or not key:
+        return None
+    if key.startswith(pub_prefixes):
+        return key.rsplit("/", 1)[0] + "/.acl.json" if "/" in key else ".acl.json"
+    parts = key.split("/")
+    n = _ROOT_SEGMENTS.get(parts[0])
+    if n is None or len(parts) <= n or not all(parts[:n]) or not "/".join(parts[n:]):
+        return None
+    return "/".join(parts[:n]) + "/.acl.json"
+
+
 def decide(user_email, user_groups, key, acl, now, pub_prefixes=PUB_PREFIXES):
-    """(allowed, reason). acl=None means the .acl.json does not exist."""
+    """(allowed, reason). acl is the object at acl_key_for(key); None means it does not exist."""
+    if acl_key_for(key, pub_prefixes) is None:
+        # no artifact root: no ACL can allow it, whatever objects exist (see acl_key_for)
+        return False, "no-artifact-root: deny"
     if acl is None:
         if key.startswith(pub_prefixes):
             return True, "pub: any signed-in tenant user"
@@ -460,7 +503,8 @@ def key_from_path(path):
 
 def _bad_key(key):
     """Keys the gate must never serve, on any route (forwardAuth and plugin authz share this):
-    empty, directory listing, ACL files, gate state, plugin storage, traversal segments."""
+    empty, directory listing, ACL files (at the root or nested), gate state, plugin storage,
+    `_mcp/`, traversal segments."""
     if not key or key.endswith("/"):
         return True                                          # bucket root / dir listing: never
     if key == ".acl.json" or key.endswith("/.acl.json"):
@@ -469,6 +513,8 @@ def _bad_key(key):
         return True                                          # gate state is never served
     if key == PLUGIN_PREFIX or key.startswith(PLUGIN_PREFIX + "/"):
         return True                                          # plugin storage is never served
+    if key == MCP_PREFIX or key.startswith(MCP_PREFIX + "/"):
+        return True                                          # MCP bookkeeping is never served
     if any(seg in (".", "..") for seg in key.split("/")):
         return True                                          # traversal attempts
     return False
@@ -657,6 +703,19 @@ def display_name_from_auth_headers(hdrs, email):
         return email
     clean = " ".join("".join(ch for ch in raw if ch.isprintable()).split())[:_NAME_MAX].strip()
     return clean or email
+
+
+# A directory guest's UPN carries `#EXT#` (`alice_example.org#EXT#@tenant.example`). The gate
+# refuses such an identity on every endpoint, whatever the ACLs say. Defence in depth only: the
+# identity the gate sees is the proxy's email claim, which for a guest is usually the guest's
+# own address, so the login proxy's domain or group restriction stays the control.
+_REFUSED_IDENTITY_MARKERS = ("#ext#",)
+
+
+def refused_identity(email):
+    """True when the gate must refuse this identity even with a valid session."""
+    e = (email or "").lower()
+    return any(m in e for m in _REFUSED_IDENTITY_MARKERS)
 
 
 class RateLimiter:
@@ -940,9 +999,10 @@ class GateHandler(BaseHTTPRequestHandler):
     # public route to the proxy's /auth endpoint is blocked (the gate reaches it in-cluster).
     def _authenticate(self):
         """Ask oauth2-proxy about the visitor's cookie. Returns (email, groups, status).
-        status: None = authenticated, 401 = no session, 500 = proxy unreachable or unexpected
-        answer (fail closed). Only headers from THIS response are trusted; incoming
-        X-Auth-Request-* are ignored. See the contract comment above."""
+        status: None = authenticated, 401 = no session, 403 = a session whose identity the gate
+        refuses (refused_identity: email None, every caller answers 403), 500 = proxy
+        unreachable or unexpected answer (fail closed). Only headers from THIS response are
+        trusted; incoming X-Auth-Request-* are ignored. See the contract comment above."""
         self._display_name = None
         # PUBLIC_HOST is used here on purpose: the gate talks to the proxy over the cluster
         # network and oauth2-proxy validates rd=/redirect against its own --whitelist-domain, so
@@ -980,6 +1040,9 @@ class GateHandler(BaseHTTPRequestHandler):
             # fail closed: no X-Auth-Request-Email means no identity (see contract comment)
             LOG.error("oauth2-proxy /auth 202 without X-Auth-Request-Email — failing closed")
             return None, [], 500
+        if refused_identity(email):
+            LOG.warning("identity refused (guest account) user=%s", email.lower())
+            return None, [], 403
         # display name for the plugin authz answer (never identity; see the helper)
         self._display_name = display_name_from_auth_headers(hdrs, email.lower())
         return email.lower(), groups, None
@@ -1002,10 +1065,15 @@ class GateHandler(BaseHTTPRequestHandler):
             f"<button type=submit>Request access</button></form>"
             f"<p class=muted>artifact-gate</p>"), status=403)
 
+    def _refused_page(self):
+        # the same page for every key and endpoint: it depends on the identity only
+        return self._page("Access refused", "<p>This account cannot open artifacts here.</p>"
+                                            "<p class=muted>artifact-gate</p>")
+
     # -- forwardAuth ---------------------------------------------------------------
     def _authz_for(self, uri):
         """Shared by /_gate/auth and the request flow. Returns (verdict, artifact_key, acl).
-        verdict: allow | deny | not_found | bad_path | unauth_401 | unauth_500"""
+        verdict: allow | deny | not_found | bad_path | unauth_401 | refused | unauth_500"""
         target = split_forwarded_uri(uri)
         if target is None:
             # a URI the decision and the signature could read differently: never served
@@ -1020,6 +1088,8 @@ class GateHandler(BaseHTTPRequestHandler):
         email, groups, status = self._authenticate()
         if status == 401:
             return "unauth_401", key, None
+        if status == 403:
+            return "refused", key, None
         if status == 500:
             return "unauth_500", key, None
         self._email, self._groups = email, groups
@@ -1062,6 +1132,8 @@ class GateHandler(BaseHTTPRequestHandler):
             return self._send(200, b"ok", "text/plain", extra=sig)
         if verdict == "unauth_401":
             return self._send(401, b"login required", "text/plain")   # errors middleware -> 302 sign_in
+        if verdict == "refused":
+            return self._send(403, self._refused_page())
         if verdict == "unauth_500":
             return self._send(500, b"identity backend error", "text/plain")
         if verdict == "bad_path":
@@ -1106,6 +1178,14 @@ class GateHandler(BaseHTTPRequestHandler):
         if status == 500:
             return self._send(500, json.dumps({"error": "identity backend error"}),
                               "application/json")
+        if status == 403:
+            # refused identity (refused_identity): the uniform deny, for every key
+            ans = {"allowed": False, "reason": DENIED_REASON,
+                   "user": {"id": None, "name": None, "anonymous": False},
+                   "artifact": {"key": key, "expires": None, "ttl": None}}
+            LOG.info("plugin-authz refused identity key=%s allowed=False reason=%s",
+                     key, DENIED_REASON)
+            return self._send(200, json.dumps(ans), "application/json")
         if status == 401:
             # anonymous: only pub/ keys, and only while anonymous pub access is enabled at all
             if not (ANONYMOUS_PUB_ENABLED and key.startswith(PUB_PREFIXES)):
@@ -1151,6 +1231,8 @@ class GateHandler(BaseHTTPRequestHandler):
         if status == 401:
             return self._send(401, self._page("Session expired",
                                               "<p>Go back and sign in again, then request access.</p>"))
+        if status == 403:
+            return self._send(403, self._refused_page())
         if status == 500:
             return self._send(500, self._page("Error", "<p>Identity backend error.</p>"))
         self._email, self._groups = email, groups
@@ -1219,6 +1301,8 @@ class GateHandler(BaseHTTPRequestHandler):
             loc = f"https://{PUBLIC_HOST}/oauth2-artifacts/sign_in?rd=" + \
                 urllib.parse.quote(f"https://{PUBLIC_HOST}/_gate/{action}?token={token}", safe="")
             return self._send(302, b"", "text/plain", {"Location": loc})
+        if status == 403:
+            return self._send(403, self._refused_page())
         if status == 500:
             return self._send(500, self._page("Error", "<p>Identity backend error.</p>"))
         self._email = email
@@ -1364,8 +1448,12 @@ def _acl_cache_put(acl_key, entry, now):
 
 
 def read_acl(minio, key, now, bypass_cache=False):
-    """Return (acl|None, error|None). acl=None means the .acl.json does not exist."""
-    acl_key = key.rsplit("/", 1)[0] + "/.acl.json" if "/" in key else ".acl.json"
+    """Return (acl|None, error|None) for the ACL that governs `key` (acl_key_for). acl=None
+    means that object does not exist, or the key has no ACL at all (no artifact root): then
+    nothing is read and decide() denies."""
+    acl_key = acl_key_for(key)
+    if acl_key is None:
+        return None, None
     if not bypass_cache:
         hit = _acl_cache_get(acl_key, now)
         if hit is not None:
@@ -1392,8 +1480,8 @@ def read_acl(minio, key, now, bypass_cache=False):
 # replica but ThreadingHTTPServer: two owners approving two requests for the SAME directory at
 # the same time used to read-modify-write concurrently and one grant could be silently lost
 # (MinIO has no CAS/If-Match support here). One lock per acl_key serialises the read-modify-write
-# inside the process. The dict grows one entry per directory with an approved grant — bounded by
-# the number of published directories; fine at PoC volume (no eviction by design: a lock with
+# inside the process. The dict grows one entry per artifact root with an approved grant — bounded
+# by the number of published artifacts; fine at PoC volume (no eviction by design: a lock with
 # waiters must not be dropped).
 _grant_locks = {}
 _grant_locks_guard = threading.Lock()
@@ -1410,12 +1498,16 @@ def _grant_lock(acl_key):
 def grant_access(minio, artifact_path, requester):
     """Add `requester` to the ACL users of `artifact_path`. (ok, note).
 
-    Serialised per ACL directory (see _grant_lock): concurrent approvals of the same directory
-    can no longer lose a grant."""
+    Writes only the ACL that governs the path (acl_key_for: the artifact root for u/ and g/,
+    whatever the file's depth) and only when it already exists: an approval never creates an
+    ACL object. Serialised per ACL key (see _grant_lock): concurrent approvals of the same
+    artifact can no longer lose a grant."""
     key = key_from_path(artifact_path)
     if key is None:
         return False, "bad artifact path"
-    acl_key = key.rsplit("/", 1)[0] + "/.acl.json" if "/" in key else ".acl.json"
+    acl_key = acl_key_for(key)
+    if acl_key is None:
+        return False, "no artifact root"
     with _grant_lock(acl_key):
         acl, err = read_acl(minio, key, now=int(time.time()), bypass_cache=True)  # write path: no cache
         if err or not isinstance(acl, dict):
