@@ -42,18 +42,19 @@ TMP = tempfile.mkdtemp(prefix="pub-routes-")
 MINIO_SERVICE = "minio"                     # values.yaml minio.service
 FORWARD_AUTH = {"gate-auth", "gate-pub-auth"}
 
-# request targets on the artifacts host, as sent; the C29 probe list among them
+# request targets on the artifacts host, as sent; REFUSED_CHARS: traversal spellings and the
+# characters the anonymous decision refuses
 PUB_TARGETS = ["/artifacts/pub/run/index.html", "/artifacts/pub/run/a/b.css",
                "/artifacts/pub/flat-0123abcd.html", "/artifacts/pub/run/.acl.json",
                "/artifacts/pub/.acl.json", "/artifacts/pub/run/", "/artifacts/pub/",
                "/artifacts/pub/run/x%2Fy", "/artifacts/pub/%72un/index.html"]
 OTHER_TARGETS = ["/artifacts/u/r/index.html", "/artifacts/g/s/r/index.html",
                  "/artifacts/_gate/req/x.json", "/artifacts/acl/r.json", "/artifacts/top.html"]
-C29 = ["/artifacts/pub/../u/c.html", "/artifacts/pub/%2e%2e/u/c.html",
-       "/artifacts/pub/%252e%252e/u/c.html", "/artifacts/pub//../u/c.html",
-       "/artifacts/pub/x;/../u/c.html", "/artifacts/pub/x/..;/../g/s/r/c.html",
-       "/artifacts/pub/x%2f..%2f..%2fu/c.html", "/artifacts/pub/%5c..%5cu/c.html",
-       "/artifacts/pub/../_gate/c.json", "/artifacts/pub/../acl/c.json"]
+REFUSED_CHARS = ["/artifacts/pub/../u/c.html", "/artifacts/pub/%2e%2e/u/c.html",
+                 "/artifacts/pub/%252e%252e/u/c.html", "/artifacts/pub//../u/c.html",
+                 "/artifacts/pub/x;/../u/c.html", "/artifacts/pub/x/..;/../g/s/r/c.html",
+                 "/artifacts/pub/x%2f..%2f..%2fu/c.html", "/artifacts/pub/%5c..%5cu/c.html",
+                 "/artifacts/pub/../_gate/c.json", "/artifacts/pub/../acl/c.json"]
 
 
 def render(values=None):
@@ -207,7 +208,7 @@ def main():
         res = routed(rs, t)
         check(res is not None and res[0] is not None and "gate-pub-auth" not in res[0]["middlewares"],
               "through the gate: %s is not on the anonymous rule" % t)
-    for t in C29:
+    for t in REFUSED_CHARS:
         res = routed(rs, t)
         if res is None:
             print("ok: through the gate: %s refused by Traefik (400) before routing" % t)

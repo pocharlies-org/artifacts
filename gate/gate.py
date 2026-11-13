@@ -1349,7 +1349,7 @@ class GateHandler(BaseHTTPRequestHandler):
     def _handle_pub_auth(self, method, uri):
         """GET /_gate/pub-auth: the anonymous pub/ decision (pub_auth_decision), forwardAuth
         target of the gate-pub-auth middleware. Allow: 200 with the signed upstream read, like
-        /_gate/auth. Everything else: one answer (C28), the same status, headers and body for
+        /_gate/auth. Everything else: one uniform answer, the same status, headers and body for
         a missing key, a key whose pub root has an ACL, a listing, an .acl.json, a key outside
         pub/, a malformed path, a write and a client S3 header, GET and HEAD alike, and never
         a redirect to a login."""

@@ -1536,7 +1536,7 @@ class AclRootTest(unittest.TestCase):
 class PubAuthDecisionTest(unittest.TestCase):
     """The anonymous pub/ decision (GET /_gate/pub-auth): allowed only for an existing pub/
     object whose pub root has no ACL; every other request is refused, before any store read
-    when its shape alone is refused (the C29 list included)."""
+    when its shape alone is refused (the refused-character list included)."""
 
     ACL = {"owner": "own@x.com", "users": ["alice@x.com"]}
 
@@ -1571,8 +1571,9 @@ class PubAuthDecisionTest(unittest.TestCase):
                                  (uri, method))
 
     def test_acl_at_the_pub_root_refuses_and_decide_still_evaluates_it(self):
-        # security C28 over AC27's wording: an ACL'd pub/ key is refused to anonymous callers
-        # with the one uniform answer; the signed-in decision stays decide() on /_gate/auth
+        # an ACL'd pub/ key is refused to anonymous callers with the one uniform answer (no
+        # signed-in fallback, which would tell a prober which keys exist behind an ACL); the
+        # signed-in decision stays decide() on /_gate/auth
         for uri in ("/artifacts/pub/closed/index.html", "/artifacts/pub/closed/sub/y.html"):
             allowed, _key, reason = self.d(uri)
             self.assertEqual((allowed, reason), (False, "acl present"), uri)

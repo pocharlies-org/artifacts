@@ -1728,7 +1728,7 @@ class E2ETest(unittest.TestCase):
         with OBJECTS_LOCK:
             OBJECTS["pub/mcp-report-0123abcd.html"] = b"<h1>mcp</h1>"
         self.assertEqual(self.pub_auth("/artifacts/pub/mcp-report-0123abcd.html")[0], 200)
-        # /_gate/auth stays the signed-in decision: never 200 without a session (C27)
+        # /_gate/auth stays the signed-in decision: never 200 without a session
         saved = self.gate.ANONYMOUS_PUB_ENABLED
         self.gate.ANONYMOUS_PUB_ENABLED = True
         self.addCleanup(setattr, self.gate, "ANONYMOUS_PUB_ENABLED", saved)
@@ -1738,9 +1738,9 @@ class E2ETest(unittest.TestCase):
             self.assertNotIn("Authorization", h)
 
     def test_pub_auth_one_uniform_answer_for_everything_it_refuses(self):
-        # C28: the same status, headers and body for a missing key, a key whose pub root has an
-        # ACL, a listing, an .acl.json, _gate/, _mcp/, a malformed path, a query, a write and a
-        # client S3 header; GET and HEAD alike; no login redirect, nothing from the store
+        # one answer: the same status, headers and body for a missing key, a key whose pub root
+        # has an ACL, a listing, an .acl.json, _gate/, _mcp/, a malformed path, a query, a write
+        # and a client S3 header; GET and HEAD alike; no login redirect, nothing from the store
         self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html")[0], 200)   # control
         with OBJECTS_LOCK:
             OBJECTS["pub/closed/index.html"] = b"x"

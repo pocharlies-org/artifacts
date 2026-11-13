@@ -35,7 +35,8 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   subfolders is one artifact); an `.acl.json` below the root is never read or served, and
   an approval only ever updates the root one. Denied whatever ACL objects exist: a key
   directly under `u/` or `g/<slug>/` (no artifact root), `acl/…`, and anything outside
-  `pub/`, `u/` and `g/`. `pub/`: no ACL → any signed-in user. Its root is
+  `pub/`, `u/` and `g/`. `pub/`: no ACL → open to everyone, anonymous visitors included
+  (anonymous read by design, see "Anonymous `pub/`" below). Its root is
   `pub/<run>/` for a CLI run (`pub/<run>/.acl.json`, at any depth) and `pub/` itself for a
   single file published directly under it by the MCP (`pub/.acl.json`); an ACL there,
   which the publishers never write, is honoured at that root like any other. The same
@@ -319,7 +320,7 @@ Everything is environment-driven; nothing is hardcoded.
 | `HMAC_KEY_B64` / `HMAC_KEY_FILE` | `/secrets/hmac-key` | signs approve/deny tokens |
 | `PUBLIC_HOST` | `artifacts.example.com` | host used in generated links |
 | `SLACK_BOT_TOKEN` | empty | optional DM notification on access requests |
-| `GATE_PUB_PREFIXES` | `pub/` | comma list treated as "any signed-in user" without ACL; each entry ends in `/` (one that does not has no artifact root: denied) |
+| `GATE_PUB_PREFIXES` | `pub/` | comma list of anonymous-read prefixes: a key there without an ACL is open to everyone, anonymous visitors included; each entry ends in `/` (one that does not has no artifact root: denied) |
 | `GATE_ANONYMOUS_PUB_ENABLED` | `false` | anonymous reads of `pub/` (plugin authz and `/_gate/pub-auth`); must stay false on public hosts |
 | `GATE_STATE_PREFIX` | `_gate` | gate state prefix (never served) |
 | `GATE_PLUGIN_PREFIX` | `_plugins` | plugin storage prefix (never served) |
