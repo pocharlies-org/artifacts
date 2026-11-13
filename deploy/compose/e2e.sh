@@ -242,6 +242,35 @@ done
 check "publisher probes left no object" 0 "$(mc_admin "mc find local/artifacts --name 'e2e-probe*' 2>/dev/null | wc -l" | tr -d ' ')"
 mc_admin "mc alias rm e2e-pub >/dev/null" || true
 
+# ---- the gate's own S3 user writes an ACL only at an artifact root --------------------
+# bootstrap.sh's gate policy, probed with the gate's own client (MinioClient in /app/gate.py,
+# the same signing and request shape as an approval): u/<run>/.acl.json, g/<slug>/<run>/.acl.json
+# and _gate/ state are writable; an .acl.json below a root, without a root, a non-ACL object
+# are refused by the store (a policy `*` crosses `/`: the explicit Deny is what refuses depth).
+PROBE="e2e-policy-$(date +%s)"
+gate_put_out=$(docker compose exec -T -e P="$PROBE" gate python3 - <<'PY'
+import importlib.util, os
+spec = importlib.util.spec_from_file_location("g", "/app/gate.py")
+g = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(g)
+p = os.environ["P"]
+for key in ("u/P/.acl.json", "g/P/r/.acl.json", "_gate/P.json", "u/P/a/.acl.json",
+            "u/P/a/b/.acl.json", "g/P/r/a/.acl.json", "g/P/.acl.json", "pub/P/.acl.json",
+            "u/P/index.html"):
+    print(key, g.MINIO.put(key.replace("P", p), b"{}", "application/json"))
+PY
+)
+gate_put() { echo "$gate_put_out" | awk -v k="$1" '$1==k{print $2}'; }
+for k in u/P/.acl.json g/P/r/.acl.json _gate/P.json; do
+  check "gate S3 user may write $k" 200 "$(gate_put "$k")"
+done
+for k in u/P/a/.acl.json u/P/a/b/.acl.json g/P/r/a/.acl.json g/P/.acl.json pub/P/.acl.json u/P/index.html; do
+  check "gate S3 user may not write $k" 403 "$(gate_put "$k")"
+done
+for d in u g pub; do mc_admin "mc rm --recursive --force local/artifacts/$d/$PROBE >/dev/null 2>&1" || true; done
+mc_admin "mc rm --force local/artifacts/_gate/$PROBE.json >/dev/null 2>&1" || true
+check "gate policy probes left no object" 0 "$(mc_admin "mc ls --recursive local/artifacts/u/$PROBE local/artifacts/g/$PROBE local/artifacts/pub/$PROBE local/artifacts/_gate/$PROBE.json 2>/dev/null | wc -l" | tr -d ' ')"
+
 # ---- bootstrap-job regression: two-arg `mc admin user add` against real MinIO -----------
 # (helm/artifacts/templates/bootstrap-job.yaml uses the same command shape; the one-arg
 # form silently created a user with a wrong secret)

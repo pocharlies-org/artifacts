@@ -149,7 +149,8 @@ Prerequisites and what the chart does:
     code is inside the image, referenced by digest; no ConfigMap. See [Gate image](#gate-image).
 - The bootstrap Job (helm hook) creates the bucket, the ILM rules, the anonymous `pub/`
   policy, and the least-privilege S3 users: `artifact-gate` (GetObject + GetObjectTagging
-  on `artifacts/*`, PutObject only on `*/.acl.json` and `_gate/*`; ACL/state work),
+  on `artifacts/*`, PutObject only on the artifact-root ACLs `u/*/.acl.json` and
+  `g/*/*/.acl.json`, with an explicit Deny one level deeper, and on `_gate/*`; ACL/state work),
   `artifact-gate-read` (GetObject on `artifacts/*` with an explicit Deny on `_gate/*`,
   `_plugins/*` and every `.acl.json`; signs the forwarded reads only),
   `artifact-publisher` (optional; Put/Get/tagging on `artifacts/*` including `.acl.json`,
@@ -386,6 +387,7 @@ helm template t helm/artifacts -f helm/artifacts/values.yaml | python3 -I tests/
 python3 -I tests/check_gate_modes.py                   # chart: ConfigMap mode vs gate image mode
 python3 -I tests/check_chart_values.py                 # chart: annotations, forwardAuth trust, login flags, headers, resources
 python3 -I tests/check_single_namespace.py             # chart: one namespace for every object
+python3 -I tests/check_gate_policy.py                  # chart + compose: gate writes only root ACLs
 docker build -f gate/Dockerfile -t artifacts-gate:dev . && tests/gate_image_smoke.sh artifacts-gate:dev
 cd deploy/compose && docker compose up -d && docker compose up bootstrap && ./e2e.sh  # full stack (Docker required)
 ```
