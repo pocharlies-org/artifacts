@@ -56,6 +56,10 @@ PUB_URL="$BASE/artifacts/pub/$RUN/index.html"
 check "anonymous pub read" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$PUB_URL")"
 check "pub CSP sandbox" "sandbox allow-scripts" \
   "$(curl -sI "$PUB_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-security-policy"{print $2}' | tr -d '\r')"
+check "pub nosniff" "nosniff" \
+  "$(curl -sI "$PUB_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-content-type-options"{print $2}')"
+check "pub no-referrer" "no-referrer" \
+  "$(curl -sI "$PUB_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="referrer-policy"{print $2}')"
 
 # ---- pub/ never serves an ACL or a listing anonymously -----------------------------------
 # Seed a pub/ .acl.json through the admin path (the publisher refuses to write one): the
@@ -96,6 +100,10 @@ check "gated read with Bearer id_token" 200 "$(curl -s -o /dev/null -w '%{http_c
 check "gated HEAD with Bearer id_token" 200 "$(curl -s -o /dev/null -I -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL")"
 check "gated CSP sandbox" "sandbox allow-scripts" \
   "$(curl -sI -H "Authorization: Bearer $TOKEN" "$GATED_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-security-policy"{print $2}')"
+check "gated nosniff" "nosniff" \
+  "$(curl -sI -H "Authorization: Bearer $TOKEN" "$GATED_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-content-type-options"{print $2}')"
+check "gated no-referrer" "no-referrer" \
+  "$(curl -sI -H "Authorization: Bearer $TOKEN" "$GATED_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="referrer-policy"{print $2}')"
 # the gate signs the upstream read; MinIO itself serves nothing anonymously off pub/
 check "direct anonymous MinIO read of u/ refused" 403 "$(curl -s -o /dev/null -w '%{http_code}' "$S3/artifacts/u/$RUN2/index.html")"
 check "S3 response override query refused" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL?response-content-type=text/plain")"

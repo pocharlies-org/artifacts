@@ -12,6 +12,32 @@ cookieExpire: 8h
 cookieCsrfExpire: 1h        # login -> callback window (CSRF cookie)
 oidcPrompt: select_account  # show the account picker; avoids silent 403 on shared browsers
 
+oauth2Proxy:
+  # Who may sign in at all (oauth2-proxy --email-domain). Empty (default): the chart renders
+  # --email-domain=*, so every account the issuer accepts gets a session and the artifact ACLs
+  # decide what it reads. List your organisation's verified domains to refuse every other
+  # account at login, e.g. [example.com, example.org]: one --email-domain per entry and never
+  # `*` (oauth2-proxy also reads `.example.com` and `*.example.com` as "any subdomain"). An
+  # entry `*` is refused (leave the list empty for that).
+  emailDomains: []
+  # Reverse proxies allowed to set X-Forwarded-* and the client-IP header (one
+  # --trusted-proxy-ip per IP or CIDR, e.g. your ingress controller's pod CIDR). The flag
+  # exists from oauth2-proxy v7.15.2 (v7.15.5 or newer recommended): set this only with such
+  # an image (the example image above, v7.7.1, refuses the flag and does not start). Empty
+  # (default): no flag, and oauth2-proxy keeps its own default (v7.15.2 and later trust
+  # every source).
+  trustedProxyIPs: []
+  # Extra oauth2-proxy flags, appended after the chart's own. Only --allowed-group=<group id>
+  # (non-empty id; one entry per group) is accepted: any other flag is refused, because a flag
+  # appended last can override the chart's own, so a different login-proxy flag is a chart
+  # change. --email-domain and --trusted-proxy-ip have the two lists above.
+  extraArgs: []
+  # Container resources. To bound local disk, add ephemeral-storage to both, e.g.
+  #   requests: {ephemeral-storage: 16Mi}   limits: {ephemeral-storage: 64Mi}
+  resources:
+    requests: {cpu: 25m, memory: 64Mi}
+    limits: {cpu: 200m, memory: 128Mi}
+
 # ---- the artifacts host ---------------------------------------------------------------
 artifactsHost: artifacts.example.com
 # Extra hostnames served with the same routes (e.g. a future public name).
@@ -22,8 +48,16 @@ artifactsExtraHosts: []
 # same time: anonymous pub/ is only safe on a host that is not publicly reachable.
 publicExposure: false
 
-# Namespaces the chart deploys into (routes live with the MinIO service because that is
-# where the IngressRoute TLS secrets are).
+# Annotations put on every IngressRoute the chart renders (the artifacts host routes and
+# every plugin route), e.g. the class your Traefik watches:
+#   ingressRouteAnnotations:
+#     kubernetes.io/ingress.class: traefik-internal
+ingressRouteAnnotations: {}
+
+# Namespaces the chart deploys into: the gate, the login proxy and the middlewares go to
+# namespaces.sso; the routes and the bootstrap Job go to minio.namespace (with the MinIO
+# service, because that is where the IngressRoute TLS secrets are). Set both to the same
+# value to run everything in one namespace. namespaces.minio is not read by any template.
 namespaces:
   sso: sso
   minio: minio
@@ -63,6 +97,18 @@ gate:
   # forwardAuth decision listener: the gate serves /_gate/auth and /_gate/plugin/authz
   # ONLY on this port, which no public route points at. The public surface stays on 8080.
   authPort: 8081
+  # trustForwardHeader of the gate-auth forwardAuth middleware (always rendered explicitly).
+  # false (default): Traefik drops every X-Forwarded-* header of the request and sets
+  # X-Forwarded-For/-Method/-Proto/-Port/-Host/-Uri for the gate from the request it received,
+  # so the URI the gate authorizes is the URI that is served, whatever the client sent.
+  # true forwards the X-Forwarded-* headers the request carries, i.e. whatever the
+  # entrypoint's forwardedHeaders settings let through from the client.
+  trustForwardHeader: false
+  # Container resources. To bound local disk, add ephemeral-storage to both, e.g.
+  #   requests: {ephemeral-storage: 16Mi}   limits: {ephemeral-storage: 64Mi}
+  resources:
+    requests: {cpu: 25m, memory: 64Mi}
+    limits: {cpu: 200m, memory: 128Mi}
   s3SecretName: artifact-gate-s3        # keys access-key, secret-key (least-privilege gate user:
                                         # ACL + _gate/ state work)
   # Dedicated read-signing user, keys access-key/secret-key. Signs ONLY the forwarded artifact
@@ -92,5 +138,9 @@ bootstrap:
   # Docker Hub (404). This image bundles the mc client at
   # /opt/bitnami/minio-client/bin/mc (the Job exports that PATH).
   image: bitnamilegacy/minio@sha256:d7cd0e172c4cc0870f4bdc3142018e2a37be9acf04d68f386600daad427e0cab
-  # MinIO admin credentials the Job uses (keys access-key/secret-key, in namespaces.minio).
+  # MinIO admin credentials the Job uses (keys access-key/secret-key, in minio.namespace).
   adminSecretName: minio-bootstrap-admin
+  # Container resources (ephemeral-storage can be added as for the gate).
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {cpu: 200m, memory: 128Mi}

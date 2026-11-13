@@ -1,10 +1,55 @@
 {{- /* The login proxy for the artifacts host. Same image and hardening as a classic
-       oauth2-proxy deployment, but NO --allowed-group: ANY user of the IdP gets a session
-       here; who reads what is decided per artifact by artifact-gate (gate/gate.py) from the
-       artifact's .acl.json. Own prefix, redirect URL and cookie so its callback never lands
-       on another proxy (and vice versa). */ -}}
+       oauth2-proxy deployment, but by default NO --allowed-group and --email-domain=*: ANY
+       user of the IdP gets a session here; who reads what is decided per artifact by
+       artifact-gate (gate/gate.py) from the artifact's .acl.json. Own prefix, redirect URL and
+       cookie so its callback never lands on another proxy (and vice versa).
+
+       Values (oauth2Proxy.*):
+         emailDomains     one --email-domain per entry instead of --email-domain=* (never `*`)
+         trustedProxyIPs  one --trusted-proxy-ip per entry (oauth2-proxy v7.15.5 or newer
+                          recommended)
+         extraArgs        appended after the chart's flags; only --allowed-group=<id> (non-empty)
+                          is accepted there, any other flag is refused
+         resources        container resources (add ephemeral-storage to bound local disk) */ -}}
 {{- $sso := .Values.namespaces.sso }}
 {{- $slug := "artifacts" }}
+{{- $op := .Values.oauth2Proxy | default dict }}
+{{- $domains := $op.emailDomains | default list }}
+{{- $proxies := $op.trustedProxyIPs | default list }}
+{{- $extra := $op.extraArgs | default list }}
+{{- range $k, $v := dict "emailDomains" $domains "trustedProxyIPs" $proxies "extraArgs" $extra }}
+{{- if not (kindIs "slice" $v) }}
+{{- fail (printf "oauth2Proxy.%s must be a list, got %v" $k $v) }}
+{{- end }}
+{{- end }}
+{{- range $d := $domains }}
+{{- if eq (toString $d) "*" }}
+{{- fail "oauth2Proxy.emailDomains: `*` is not a domain; leave the list empty to accept every account the issuer signs in" }}
+{{- end }}
+{{- if not (regexMatch "^(\\*?\\.)?[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" (toString $d)) }}
+{{- fail (printf "oauth2Proxy.emailDomains: %q is not a domain name" (toString $d)) }}
+{{- end }}
+{{- end }}
+{{- range $ip := $proxies }}
+{{- if not (regexMatch "^[0-9A-Fa-f.:]+(/[0-9]{1,3})?$" (toString $ip)) }}
+{{- fail (printf "oauth2Proxy.trustedProxyIPs: %q is not an IP address or CIDR range" (toString $ip)) }}
+{{- end }}
+{{- end }}
+{{- range $a := $extra }}
+{{- if not (regexMatch "^--[a-z0-9][a-z0-9-]*(=.*)?$" (toString $a)) }}
+{{- fail (printf "oauth2Proxy.extraArgs: %q must be one flag, --name or --name=value, on one line" (toString $a)) }}
+{{- end }}
+{{- $flag := regexReplaceAll "=.*$" (toString $a) "" }}
+{{- if has $flag (list "--email-domain" "--trusted-proxy-ip") }}
+{{- fail (printf "oauth2Proxy.extraArgs: set %s through oauth2Proxy.%s, not extraArgs" $flag (ternary "emailDomains" "trustedProxyIPs" (eq $flag "--email-domain"))) }}
+{{- end }}
+{{- if eq $flag "--trusted-ip" }}
+{{- fail "oauth2Proxy.extraArgs: --trusted-ip is refused: it lets matching client addresses skip authentication, and the gate takes this proxy's answer as the visitor's identity (for X-Forwarded-* trust use oauth2Proxy.trustedProxyIPs)" }}
+{{- end }}
+{{- if not (regexMatch "^--allowed-group=.+$" (toString $a)) }}
+{{- fail (printf "oauth2Proxy.extraArgs: only --allowed-group=<id> is accepted, got %q; any other login-proxy flag is a chart change" (toString $a)) }}
+{{- end }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -39,15 +84,24 @@ spec:
           args:
             - --provider=oidc
             - --oidc-issuer-url={{ .Values.oidcIssuer }}
-            # --email-domain=* is NOT an open door: the real boundary is the IdP the issuer URL
-            # pins (in the Entra example, a SINGLE-TENANT app, so only accounts of that tenant can
-            # ever complete a login here). If the app registration is ever made multi-tenant (or
-            # the issuer swapped for a common/multi-tenant endpoint), tighten --email-domain to the
-            # tenant's verified domain(s) BEFORE that change ships.
+            {{- if $domains }}
+            # oauth2Proxy.emailDomains: only accounts of these domains get a session (no `*`)
+            {{- range $d := $domains }}
+            - --email-domain={{ $d }}
+            {{- end }}
+            {{- else }}
+            # --email-domain=* (oauth2Proxy.emailDomains empty) is NOT an open door: the real
+            # boundary is the IdP the issuer URL pins (in the Entra example, a SINGLE-TENANT app, so
+            # only accounts of that tenant can ever complete a login here). If the app registration
+            # is ever made multi-tenant (or the issuer swapped for a common/multi-tenant endpoint),
+            # list the tenant's verified domain(s) in oauth2Proxy.emailDomains BEFORE that change
+            # ships.
             - --email-domain=*
+            {{- end }}
             - --oidc-email-claim=preferred_username
             - --oidc-groups-claim=groups
-            # no --allowed-group: IdP membership is the gate's "signed in" test; the artifact ACL decides access
+            # no --allowed-group by default (oauth2Proxy.extraArgs can add one): IdP membership is the
+            # gate's "signed in" test; the artifact ACL decides access
             - --scope=openid email profile
             - --code-challenge-method=S256
             - --proxy-prefix=/oauth2-{{ $slug }}
@@ -60,6 +114,9 @@ spec:
             - --cookie-expire={{ .Values.cookieExpire }}
             - --cookie-csrf-expire={{ .Values.cookieCsrfExpire }}
             - --reverse-proxy=true
+            {{- range $ip := $proxies }}
+            - --trusted-proxy-ip={{ $ip }}
+            {{- end }}
             - --set-xauthrequest=true
             # the /auth 202 also carries `Authorization: Bearer <id_token>`; the gate reads its
             # `name` claim as the DISPLAY name for plugins (identity stays X-Auth-Request-Email).
@@ -71,6 +128,9 @@ spec:
             - --http-address=0.0.0.0:4180
             - --upstream=static://202
             - --silence-ping-logging=true
+            {{- range $a := $extra }}
+            - {{ toString $a | quote }}
+            {{- end }}
           env:
             - name: OAUTH2_PROXY_CLIENT_ID
               valueFrom:
@@ -92,8 +152,7 @@ spec:
             initialDelaySeconds: 3
             periodSeconds: 10
           resources:
-            requests: {cpu: 25m, memory: 64Mi}
-            limits: {cpu: 200m, memory: 128Mi}
+            {{- toYaml (required "oauth2Proxy.resources is required" $op.resources) | nindent 12 }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

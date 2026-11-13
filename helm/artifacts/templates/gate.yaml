@@ -32,8 +32,10 @@
 {{- if $baked }}
 {{- $repo := .Values.gate.bakedImageRepository | default "" }}
 {{- $digest := .Values.gate.bakedImageDigest | default "" }}
-{{- if or (not $repo) (contains "@" $repo) (contains ":" (base $repo)) }}
-{{- fail (printf "gate.bakedImageRepository must be an image repository without a tag or digest, got %q" $repo) }}
+{{- /* characters first (fail closed: nothing but a repository reference reaches the
+       Deployment, no newline, space or quote), then no tag and no digest */ -}}
+{{- if or (not $repo) (not (regexMatch "^[a-z0-9./:_-]+$" $repo)) (contains ":" (base $repo)) }}
+{{- fail (printf "gate.bakedImageRepository must be an image repository (lowercase letters, digits and . / : _ -) without a tag or digest, got %q" $repo) }}
 {{- end }}
 {{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) }}
 {{- fail (printf "gate.bakedImageDigest must be sha256:<64 lowercase hex> when gate.bakedImage is true, got %q" $digest) }}
@@ -118,8 +120,7 @@ spec:
             initialDelaySeconds: 2
             periodSeconds: 10
           resources:
-            requests: {cpu: 25m, memory: 64Mi}
-            limits: {cpu: 200m, memory: 128Mi}
+            {{- toYaml (required "gate.resources is required" .Values.gate.resources) | nindent 12 }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

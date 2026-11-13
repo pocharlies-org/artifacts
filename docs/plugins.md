@@ -122,6 +122,8 @@ plugins:
   Traefik `PathPrefix` is a plain string prefix, so the chart fails to render both a
   prefix **under** a reserved path (`/_gate/x/`) and one that **covers** it (`/_gate`,
   `/_ga`, `/_`), as well as a prefix without the trailing `/`.
+- The route carries the chart's `ingressRouteAnnotations` (for example the ingress class
+  your Traefik watches), like the core's own routes.
 - The core never proxies plugin traffic itself beyond this route, and never rewrites it.
   WebSockets are the plugin's business (the chart route is plain pass-through).
 - A plugin's own pages must not weaken the artifact isolation: artifact content is

@@ -173,8 +173,7 @@ spec:
             capabilities:
               drop: ["ALL"]
           resources:
-            requests: {cpu: 10m, memory: 32Mi}
-            limits: {cpu: 200m, memory: 128Mi}
+            {{- toYaml (required "bootstrap.resources is required" .Values.bootstrap.resources) | nindent 12 }}
           volumeMounts:
             - {name: admin, mountPath: /secrets/admin, readOnly: true}
             - {name: gate, mountPath: /secrets/gate, readOnly: true}
