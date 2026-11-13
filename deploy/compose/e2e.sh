@@ -170,6 +170,35 @@ print(u["id"], "|", u["name"])'
 }
 check "plugin authz: display name from the name claim" "test@example.com | Test One" \
   "$(authz_user "/artifacts/u/$RUN2/index.html" "$TOKEN")"
+
+# ---- the ACL lives at the artifact root ------------------------------------------------
+# A file in a subfolder answers to u/<run>/.acl.json; a stray .acl.json below the root (here
+# in the file's own folder, listing test2 only) is never read or served; a key with no
+# artifact root is denied whatever ACL objects exist; _mcp/ is never served. Seeded through
+# the admin path (the CLI publishes flat runs), before any read, so no cached answer helps.
+TOKEN2=$(curl -sf -X POST http://127.0.0.1:5556/dex/token \
+  -d 'grant_type=password&username=test2@example.com&password=test2-password&client_id=artifacts-dev&client_secret=artifacts-dev-secret-not-a-real-secret&scope=openid email profile' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["id_token"])')
+echo 'body{}' | mc_admin "mc pipe local/artifacts/u/$RUN2/assets/css/app.css >/dev/null" \
+  || { echo "FAIL: could not seed a nested object"; fail=1; }
+echo '{"owner":"test2@example.com","users":["test2@example.com"]}' \
+  | mc_admin "mc pipe local/artifacts/u/$RUN2/assets/css/.acl.json >/dev/null" \
+  || { echo "FAIL: could not seed a nested .acl.json"; fail=1; }
+NESTED_URL="$BASE/artifacts/u/$RUN2/assets/css/app.css"
+check "nested file opens for the root ACL's user" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$NESTED_URL")"
+check "nested .acl.json never consulted (test2 listed only there)" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN2" "$NESTED_URL")"
+check "nested .acl.json never served" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN2" "$BASE/artifacts/u/$RUN2/assets/css/.acl.json")"
+check "plugin authz: nested file answers to the root ACL" "True user test@example.com None True" \
+  "$(authz "/artifacts/u/$RUN2/assets/css/app.css" "$TOKEN")"
+check "plugin authz: nested .acl.json grants nothing" "False denied test2@example.com None False" \
+  "$(authz "/artifacts/u/$RUN2/assets/css/app.css" "$TOKEN2")"
+echo '{"owner":"test@example.com","users":["test@example.com"]}' \
+  | mc_admin "mc pipe local/artifacts/u/.acl.json >/dev/null" \
+  && echo x | mc_admin "mc pipe local/artifacts/u/$RUN2.html >/dev/null" \
+  || { echo "FAIL: could not seed a key without artifact root"; fail=1; }
+check "key with no artifact root denied (u/<file>, u/.acl.json present)" 403 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/artifacts/u/$RUN2.html")"
+mc_admin "mc rm local/artifacts/u/.acl.json local/artifacts/u/$RUN2.html >/dev/null" || true
+check "_mcp/ not served" 404 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/artifacts/_mcp/x.json")"
 # oauth2-proxy (--upstream=static://202, --set-authorization-header) answers 202 + the
 # session's id_token for EVERY path its router does not claim: /auth, but also /zzz, /,
 # /ping, /sign_inX, /SIGN_IN... Caddy routes an allow-list only (sign_in, start, callback,

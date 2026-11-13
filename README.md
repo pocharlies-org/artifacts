@@ -29,9 +29,20 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   `X-Auth-Request-*` headers. A `Bearer` id_token is passed on too, but it counts only where
   oauth2-proxy runs with `--skip-jwt-bearer-tokens`: the compose stack (its e2e reads with a
   Dex id_token), never the chart, which refuses that flag.
-- **Authorization**: one `decide()` in `gate/gate.py` — ACL file `<dir>/.acl.json`
-  (`owner`, `users`, `groups`, `expires`); no ACL → any signed-in user for `pub/`,
-  deny elsewhere. The same function answers forwardAuth and the plugin authz API.
+- **Authorization**: one `decide()` in `gate/gate.py` — one ACL file per artifact, at its
+  root: `u/<run>/.acl.json`, `g/<slug>/<run>/.acl.json` (`owner`, `users`, `groups`,
+  `expires`). Every file of the artifact, at any depth, answers to it (a zip with
+  subfolders is one artifact); an `.acl.json` below the root is never read or served, and
+  an approval only ever updates the root one. Denied whatever ACL objects exist: a key
+  directly under `u/` or `g/<slug>/` (no artifact root), `acl/…`, and anything outside
+  `pub/`, `u/` and `g/`. `pub/`: no ACL → any signed-in user (an ACL there, which the
+  publishers never write, is the one in the key's own directory). The same function and
+  the same ACL lookup answer forwardAuth and the plugin authz API.
+- **Guest identities**: an identity containing `#EXT#` (a directory guest's UPN) is refused
+  on every gate endpoint, whatever the ACLs say. Defence in depth: the gate sees the login
+  proxy's email claim, which for a guest is usually the guest's own address, so restrict
+  the login proxy (`oauth2Proxy.emailDomains`, `--allowed-group` in `oauth2Proxy.extraArgs`)
+  as the control.
 - **Signed upstream reads**: the bucket has no anonymous read policy outside `pub/`. On
   allow, the gate answers forwardAuth with SigV4 headers (`Authorization`, `X-Amz-Date`,
   `X-Amz-Content-Sha256`) for that exact method, host, path and query, signed with a
@@ -49,8 +60,9 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   `/_gate/plugin/authz`). The public routes never reach the decision listener.
 - **Expiry**: objects carry a `ttl` tag (`1|7|14|30` days), ILM expires by tag, and a
   catch-all (90 days) takes everything untagged — including `_plugins/`.
-- **Never served**: directory listings, `.acl.json`, `_gate/` (gate state), `_plugins/`
-  (plugin storage), and any path with a `.`/`..` segment.
+- **Never served**: directory listings, `.acl.json` (at the root or nested), `_gate/` (gate
+  state), `_plugins/` (plugin storage), `_mcp/` (an MCP publisher's bookkeeping), and any
+  path with a `.`/`..` segment.
 
 ## Quick start (laptop, Docker Compose)
 

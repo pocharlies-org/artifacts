@@ -94,8 +94,10 @@ class FakeMinio:
     def __init__(self, objects=None):
         self.objects = dict(objects or {})   # key -> bytes
         self.puts = []
+        self.gets = []
 
     def get(self, key):
+        self.gets.append(key)
         if key in self.objects:
             return 200, self.objects[key]
         return 404, b""
@@ -122,44 +124,44 @@ class DecideTest(unittest.TestCase):
         self.assertIn("pub", reason)
 
     def test_private_without_acl_denies(self):
-        ok, reason = self.d("a@example.com", [], "team/x/report.html", None)
+        ok, reason = self.d("a@example.com", [], "u/x/report.html", None)
         self.assertFalse(ok)
         self.assertEqual(reason, "no-acl: deny by default (no owner to ask)")
 
     def test_owner_case_insensitive(self):
         acl = {"owner": "owner@example.com", "users": [], "groups": []}
-        ok, reason = self.d("owner@example.com", [], "t/x", acl)
+        ok, reason = self.d("owner@example.com", [], "u/r/x", acl)
         self.assertTrue(ok)
         self.assertEqual(reason, "owner")
 
     def test_user_listed(self):
         acl = {"owner": "o@example.com", "users": ["Other@Example.com"], "groups": []}
-        ok, reason = self.d("other@example.com", [], "t/x", acl)
+        ok, reason = self.d("other@example.com", [], "u/r/x", acl)
         self.assertTrue(ok)
         self.assertEqual(reason, "user")
 
     def test_group_member(self):
         acl = {"owner": "o@example.com", "users": [], "groups": ["11111111-2222-4333-8444-555555555555"]}
-        ok, reason = self.d("x@example.com", ["deadbeef", "11111111-2222-4333-8444-555555555555"], "t/x", acl)
+        ok, reason = self.d("x@example.com", ["deadbeef", "11111111-2222-4333-8444-555555555555"], "u/r/x", acl)
         self.assertTrue(ok)
         self.assertEqual(reason, "group")
 
     def test_group_in_acl_but_no_claim_denies_as_overage(self):
         acl = {"owner": "o@example.com", "users": [], "groups": ["11111111-2222-4333-8444-555555555555"]}
         for groups in ([], None):
-            ok, reason = self.d("x@example.com", groups, "t/x", acl)
+            ok, reason = self.d("x@example.com", groups, "u/r/x", acl)
             self.assertFalse(ok)
             self.assertIn("overage", reason)
 
     def test_not_listed(self):
         acl = {"owner": "o@example.com", "users": ["a@example.com"], "groups": ["g1"]}
-        ok, reason = self.d("z@example.com", ["other-group"], "t/x", acl)
+        ok, reason = self.d("z@example.com", ["other-group"], "u/r/x", acl)
         self.assertFalse(ok)
         self.assertEqual(reason, "not-listed")
 
     def test_expired_date_denies(self):
         acl = {"owner": "o@example.com", "users": ["u@example.com"], "expires": "2020-01-01"}
-        ok, reason = self.d("u@example.com", [], "t/x", acl)
+        ok, reason = self.d("u@example.com", [], "u/r/x", acl)
         self.assertFalse(ok)
         self.assertEqual(reason, "expired")
 
@@ -168,40 +170,40 @@ class DecideTest(unittest.TestCase):
         import calendar
         iso = time.strftime("%Y-%m-%d", time.gmtime(NOW))
         acl = {"owner": "o@example.com", "users": ["u@example.com"], "expires": iso}
-        ok, _ = self.d("u@example.com", [], "t/x", acl)
+        ok, _ = self.d("u@example.com", [], "u/r/x", acl)
         self.assertTrue(ok)
         end = calendar.timegm(time.strptime(iso, "%Y-%m-%d")) + 86399
-        ok, reason = gate.decide("u@example.com", [], "t/x", acl, int(end) + 1, pub_prefixes=self.PUB)
+        ok, reason = gate.decide("u@example.com", [], "u/r/x", acl, int(end) + 1, pub_prefixes=self.PUB)
         self.assertFalse(ok)
         self.assertEqual(reason, "expired")
 
     def test_datetime_expires(self):
         acl = {"owner": "o@example.com", "users": ["u@example.com"],
                "expires": "2020-06-01T12:00:00+00:00"}
-        ok, reason = self.d("u@example.com", [], "t/x", acl)
+        ok, reason = self.d("u@example.com", [], "u/r/x", acl)
         self.assertFalse(ok)
         self.assertEqual(reason, "expired")
 
     def test_expires_null_ignored(self):
         acl = {"owner": "o@example.com", "users": ["u@example.com"], "expires": None}
-        ok, _ = self.d("u@example.com", [], "t/x", acl)
+        ok, _ = self.d("u@example.com", [], "u/r/x", acl)
         self.assertTrue(ok)
 
     def test_owner_beats_expiry(self):
         # expiry is checked first: even the owner cannot read past it (they fix the ACL instead).
         acl = {"owner": "o@example.com", "expires": "2020-01-01"}
-        ok, reason = self.d("o@example.com", [], "t/x", acl)
+        ok, reason = self.d("o@example.com", [], "u/r/x", acl)
         self.assertFalse(ok)
         self.assertEqual(reason, "expired")
 
     def test_malformed_acl_denies(self):
-        ok, reason = self.d("u@example.com", [], "t/x", "not-a-dict")
+        ok, reason = self.d("u@example.com", [], "u/r/x", "not-a-dict")
         self.assertFalse(ok)
         self.assertEqual(reason, "bad-acl")
 
     def test_owner_only_acl_no_users_key(self):
         acl = {"owner": "o@example.com"}
-        ok, reason = self.d("o@example.com", [], "t/x", acl)
+        ok, reason = self.d("o@example.com", [], "u/r/x", acl)
         self.assertTrue(ok)
         self.assertEqual(reason, "owner")
 
@@ -645,17 +647,17 @@ class GrantLockTest(unittest.TestCase):
                 time.sleep(0.05)
                 return super().put(key, data, ctype)
 
-        m = SlowMinio({"d/x/.acl.json": json.dumps(acl).encode()})
+        m = SlowMinio({"u/x/.acl.json": json.dumps(acl).encode()})
         results = []
         threads = [threading.Thread(target=lambda r=requester: results.append(
-                       gate.grant_access(m, "/artifacts/d/x/report.html", r)))
+                       gate.grant_access(m, "/artifacts/u/x/report.html", r)))
                    for requester in ("a@x.com", "b@x.com")]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
         self.assertTrue(all(ok for ok, _ in results), results)
-        saved = json.loads(m.objects["d/x/.acl.json"])
+        saved = json.loads(m.objects["u/x/.acl.json"])
         self.assertEqual(sorted(saved["users"]), ["a@x.com", "b@x.com"])
 
 
@@ -691,19 +693,19 @@ class PluginAuthzDecisionTest(unittest.TestCase):
 
     def test_allow_carries_identity_and_acl_expiry(self):
         acl = dict(self.ACL, expires="2030-01-02")
-        ans = self.d("alice@example.com", "team/x/r.html", acl)
+        ans = self.d("alice@example.com", "u/x/r.html", acl)
         self.assertTrue(ans["allowed"])
         self.assertFalse(ans["user"]["anonymous"])
         self.assertEqual(ans["user"]["id"], "alice@example.com")
         self.assertEqual(ans["user"]["name"], "alice@example.com")
         self.assertTrue(ans["artifact"]["expires"].startswith("2030-01-02"))
-        self.assertEqual(ans["artifact"]["key"], "team/x/r.html")
+        self.assertEqual(ans["artifact"]["key"], "u/x/r.html")
 
     def test_deny_no_acl_outside_pub(self):
-        ans = self.d("x@example.com", "team/x/r.html", None)
+        ans = self.d("x@example.com", "u/x/r.html", None)
         self.assertFalse(ans["allowed"])
         self.assertEqual(ans["reason"], "denied")
-        _, detail = gate.plugin_authz_decision_detail("x@example.com", [], "team/x/r.html", None,
+        _, detail = gate.plugin_authz_decision_detail("x@example.com", [], "u/x/r.html", None,
                                                       NOW, 200)
         self.assertIn("no-acl", detail)                  # the detail is for the gate's log
 
@@ -719,17 +721,17 @@ class PluginAuthzDecisionTest(unittest.TestCase):
         }
         for want_detail, acl in cases.items():
             for head in (200, 404):
-                ans, detail = gate.plugin_authz_decision_detail("x@example.com", [], "team/x/r.html",
+                ans, detail = gate.plugin_authz_decision_detail("x@example.com", [], "u/x/r.html",
                                                                 acl, NOW, head, {"ttl": "7"}, NOW)
                 self.assertEqual(ans, {"allowed": False, "reason": "denied",
                                        "user": {"id": "x@example.com", "name": "x@example.com",
                                                 "anonymous": False},
-                                       "artifact": {"key": "team/x/r.html", "expires": None,
+                                       "artifact": {"key": "u/x/r.html", "expires": None,
                                                     "ttl": None}}, (want_detail, head))
                 self.assertEqual(detail, want_detail)
 
     def test_deny_expired_even_owner(self):
-        ans = self.d("owner@example.com", "team/x/r.html",
+        ans = self.d("owner@example.com", "u/x/r.html",
                      {"owner": "owner@example.com", "expires": "2020-01-01"})
         self.assertFalse(ans["allowed"])
         self.assertEqual(ans["reason"], "expired")
@@ -737,45 +739,45 @@ class PluginAuthzDecisionTest(unittest.TestCase):
     def test_expired_told_only_to_who_would_be_allowed(self):
         acl = dict(self.ACL, expires="2020-01-01")
         for who in ("owner@example.com", "alice@example.com"):
-            ans = self.d(who, "team/x/r.html", acl)
+            ans = self.d(who, "u/x/r.html", acl)
             self.assertEqual((ans["allowed"], ans["reason"]), (False, "expired"), who)
             self.assertTrue(ans["artifact"]["expires"].startswith("2020-01-01"))
         # a stranger (and anonymous) gets the same deny as for a live artifact, no expiry/ttl
         users_only = {k: v for k, v in self.ACL.items() if k != "groups"}
-        live = self.d("mallory@example.com", "team/x/r.html", users_only, tags={"ttl": "7"}, lm=NOW)
-        dead = self.d("mallory@example.com", "team/x/r.html", dict(users_only, expires="2020-01-01"),
+        live = self.d("mallory@example.com", "u/x/r.html", users_only, tags={"ttl": "7"}, lm=NOW)
+        dead = self.d("mallory@example.com", "u/x/r.html", dict(users_only, expires="2020-01-01"),
                       tags={"ttl": "7"}, lm=NOW)
         self.assertEqual((dead["allowed"], dead["reason"]), (False, "denied"))
         self.assertEqual(dead, live)
-        self.assertEqual(dead["artifact"], {"key": "team/x/r.html", "expires": None, "ttl": None})
-        anon = self.d("", "team/x/r.html", dict(users_only, expires="2020-01-01"))
+        self.assertEqual(dead["artifact"], {"key": "u/x/r.html", "expires": None, "ttl": None})
+        anon = self.d("", "u/x/r.html", dict(users_only, expires="2020-01-01"))
         self.assertEqual((anon["allowed"], anon["reason"]), (False, "denied"))
         self.assertIsNone(anon["artifact"]["expires"])
         # group ACL: a member is told `expired`, a visitor in no listed group gets the live deny
         member = gate.plugin_authz_decision("carol@example.com", ["11111111-2222-4333-8444-555555555555"],
-                                            "team/x/r.html", acl, NOW, 200)
+                                            "u/x/r.html", acl, NOW, 200)
         self.assertEqual(member["reason"], "expired")
         other = gate.plugin_authz_decision("carol@example.com", ["99999999-2222-4333-8444-555555555555"],
-                                           "team/x/r.html", acl, NOW, 200)
+                                           "u/x/r.html", acl, NOW, 200)
         self.assertEqual((other["reason"], other["artifact"]["expires"]), ("denied", None))
-        empty, detail = gate.plugin_authz_decision_detail("carol@example.com", [], "team/x/r.html",
+        empty, detail = gate.plugin_authz_decision_detail("carol@example.com", [], "u/x/r.html",
                                                           acl, NOW, 200)
         self.assertEqual(empty["reason"], "denied")
         self.assertIn("groups-claim-empty", detail)
 
     def test_object_missing_told_only_to_who_would_be_allowed(self):
         users_only = {k: v for k, v in self.ACL.items() if k != "groups"}
-        stranger = self.d("mallory@example.com", "team/x/r.html", users_only, head=404)
+        stranger = self.d("mallory@example.com", "u/x/r.html", users_only, head=404)
         self.assertEqual((stranger["allowed"], stranger["reason"]), (False, "denied"))
-        listed = self.d("alice@example.com", "team/x/r.html", self.ACL, head=404)
+        listed = self.d("alice@example.com", "u/x/r.html", self.ACL, head=404)
         self.assertEqual(listed["reason"], "object-missing")
 
     def test_display_name_passed_through_email_fallback(self):
-        ans = gate.plugin_authz_decision("alice@example.com", [], "team/x/r.html", self.ACL, NOW, 200,
+        ans = gate.plugin_authz_decision("alice@example.com", [], "u/x/r.html", self.ACL, NOW, 200,
                                          name="Alice Example")
         self.assertEqual(ans["user"], {"id": "alice@example.com", "name": "Alice Example",
                                        "anonymous": False})
-        self.assertEqual(self.d("alice@example.com", "team/x/r.html", self.ACL)["user"]["name"],
+        self.assertEqual(self.d("alice@example.com", "u/x/r.html", self.ACL)["user"]["name"],
                          "alice@example.com")
         anon = gate.plugin_authz_decision("", [], "pub/free/x.html", None, NOW, 200, name="Nope")
         self.assertEqual(anon["user"]["name"], "anonymous")
@@ -789,28 +791,28 @@ class PluginAuthzDecisionTest(unittest.TestCase):
         self.assertEqual(ans["user"]["name"], "anonymous")
 
     def test_anonymous_outside_pub_denied_by_decide(self):
-        ans = self.d("", "team/x/r.html", None)
+        ans = self.d("", "u/x/r.html", None)
         self.assertFalse(ans["allowed"])
 
     def test_allowed_but_object_missing_denies(self):
-        ans = self.d("alice@example.com", "team/x/r.html", self.ACL, head=404)
+        ans = self.d("alice@example.com", "u/x/r.html", self.ACL, head=404)
         self.assertFalse(ans["allowed"])
         self.assertEqual(ans["reason"], "object-missing")
 
     def test_ttl_tag_gives_expiry(self):
         lm = 1_800_000_000
-        ans = self.d("alice@example.com", "team/x/r.html", self.ACL, tags={"ttl": "7"}, lm=lm)
+        ans = self.d("alice@example.com", "u/x/r.html", self.ACL, tags={"ttl": "7"}, lm=lm)
         self.assertEqual(ans["artifact"]["ttl"], 7)
         self.assertEqual(ans["artifact"]["expires"],
                          datetime.fromtimestamp(lm + 7 * 86400, timezone.utc).isoformat())
 
     def test_acl_expiry_wins_over_ttl(self):
         acl = dict(self.ACL, expires="2030-01-02")
-        ans = self.d("alice@example.com", "team/x/r.html", acl, tags={"ttl": "7"}, lm=NOW)
+        ans = self.d("alice@example.com", "u/x/r.html", acl, tags={"ttl": "7"}, lm=NOW)
         self.assertTrue(ans["artifact"]["expires"].startswith("2030-01-02"))
 
     def test_garbage_ttl_is_none(self):
-        ans = self.d("alice@example.com", "team/x/r.html", self.ACL, tags={"ttl": "banana"}, lm=NOW)
+        ans = self.d("alice@example.com", "u/x/r.html", self.ACL, tags={"ttl": "banana"}, lm=NOW)
         self.assertIsNone(ans["artifact"]["ttl"])
         self.assertIsNone(ans["artifact"]["expires"])
 
@@ -949,3 +951,154 @@ class AclCacheBoundTest(unittest.TestCase):
         self.assertEqual(gate.read_acl(m, "u/c/f", NOW + gate.ACL_CACHE_TTL + 1), (None, None))
         self.assertEqual(gate.read_acl(m, "u/c/f", NOW + 2 * gate.ACL_CACHE_TTL),
                          ({"owner": "o@example.com"}, None))
+
+
+class AclRootTest(unittest.TestCase):
+    """The ACL of an artifact lives at its root (u/<run>/, g/<slug>/<run>/) and governs every
+    file of it at any depth. One helper (acl_key_for) derives it for read_acl, grant_access and
+    decide(); a key with no artifact root is denied whatever ACL objects exist; pub/ keeps the
+    ACL of the key's own directory."""
+
+    ROOT_ACL = {"owner": "own@x.com", "users": ["alice@x.com"]}
+
+    def setUp(self):
+        gate._acl_cache.clear()
+        self.addCleanup(gate._acl_cache.clear)
+
+    def test_root_acl_key_at_every_depth(self):
+        cases = {
+            "u/r/index.html": "u/r/.acl.json",
+            "u/r/assets/css/app.css": "u/r/.acl.json",
+            "u/r/a/b/c/d/e.js": "u/r/.acl.json",
+            "g/team/r/index.html": "g/team/r/.acl.json",
+            "g/team/r/a/b.css": "g/team/r/.acl.json",
+        }
+        for key, want in cases.items():
+            self.assertEqual(gate.acl_key_for(key), want, key)
+
+    def test_keys_without_artifact_root(self):
+        for key in ("u/x.html", "u/r", "u/", "u//x.html", "g/team/x.html", "g/team/r", "g/team",
+                    "g//r/x.html", "g/team//x.html", "acl/run.json", "acl/r/x.json",
+                    "_gate/req/x.json", "_mcp/x.json", "team/secret/report.html", "x.html",
+                    ".acl.json", "U/r/x.html", "public/x.html", ""):
+            self.assertIsNone(gate.acl_key_for(key), key)
+
+    def test_pub_keeps_its_own_directory(self):
+        self.assertEqual(gate.acl_key_for("pub/x.html"), "pub/.acl.json")
+        self.assertEqual(gate.acl_key_for("pub/run/index.html"), "pub/run/.acl.json")
+        self.assertEqual(gate.acl_key_for("pub/run/a/b.css"), "pub/run/a/.acl.json")
+        for key in ("pub/x.html", "pub/run/index.html", "pub/run/a/b/c.css"):
+            self.assertEqual(gate.decide("a@x.com", [], key, None, NOW),
+                             (True, "pub: any signed-in tenant user"), key)
+
+    def test_decide_denies_a_key_without_root_whatever_the_acl(self):
+        permissive = {"owner": "a@x.com", "users": ["a@x.com"], "groups": ["g1"]}
+        for key in ("u/x.html", "g/team/x.html", "acl/run.json", "team/secret/r.html", "x.html"):
+            for acl in (None, permissive):
+                self.assertEqual(gate.decide("a@x.com", ["g1"], key, acl, NOW),
+                                 (False, "no-artifact-root: deny"), (key, acl))
+        # the same ACL at an artifact root lets the owner in, at any depth
+        self.assertEqual(gate.decide("a@x.com", [], "u/r/a/b.js", permissive, NOW), (True, "owner"))
+
+    def test_read_acl_reads_the_root_never_a_nested_acl(self):
+        m = FakeMinio({"u/r/.acl.json": json.dumps(self.ROOT_ACL).encode(),
+                       "u/r/a/.acl.json": json.dumps({"owner": "mallory@x.com"}).encode(),
+                       "g/team/r/.acl.json": json.dumps(self.ROOT_ACL).encode(),
+                       "g/team/r/a/b/.acl.json": b"{}"})
+        for key in ("u/r/index.html", "u/r/a/x.js", "u/r/a/b/c/d.css", "g/team/r/index.html",
+                    "g/team/r/a/b/x.css"):
+            self.assertEqual(gate.read_acl(m, key, NOW, bypass_cache=True), (self.ROOT_ACL, None), key)
+        self.assertEqual(set(m.gets), {"u/r/.acl.json", "g/team/r/.acl.json"})
+        # through decide(): the nested ACL's owner is not let in, the root's user is
+        acl, _ = gate.read_acl(m, "u/r/a/x.js", NOW)
+        self.assertFalse(gate.decide("mallory@x.com", [], "u/r/a/x.js", acl, NOW)[0])
+        self.assertTrue(gate.decide("alice@x.com", [], "u/r/a/x.js", acl, NOW)[0])
+        # and a nested ACL is never served (guard: true before this change as well)
+        self.assertTrue(gate._bad_key("u/r/a/.acl.json"))
+
+    def test_read_acl_without_root_reads_nothing(self):
+        acl = b'{"owner": "a@x.com", "users": ["a@x.com"]}'
+        m = FakeMinio({"u/.acl.json": acl, "g/team/.acl.json": acl, "acl/.acl.json": acl,
+                       ".acl.json": acl})
+        for key in ("u/x.html", "g/team/x.html", "acl/run.json", "x.html"):
+            self.assertEqual(gate.read_acl(m, key, NOW), (None, None), key)
+        self.assertEqual(m.gets, [])
+        self.assertEqual(len(gate._acl_cache), 0)
+
+    def test_one_helper_for_read_acl_grant_access_and_decide(self):
+        from unittest import mock
+        acl = {"owner": "own@x.com", "users": []}
+        m = FakeMinio({"elsewhere/.acl.json": json.dumps(acl).encode()})
+        calls = []
+
+        def fake(key, pub_prefixes=gate.PUB_PREFIXES):
+            calls.append(key)
+            return "elsewhere/.acl.json"
+
+        with mock.patch.object(gate, "acl_key_for", fake):
+            self.assertEqual(gate.read_acl(m, "u/r/a.js", NOW, bypass_cache=True), (acl, None))
+            ok, note = gate.grant_access(m, "/artifacts/u/r/a/b.js", "new@x.com")
+            self.assertTrue(ok, note)
+            self.assertEqual(m.puts, ["elsewhere/.acl.json"])     # the write follows the helper
+            self.assertIn("elsewhere/.acl.json", gate._grant_locks)
+            self.assertEqual(gate.decide("own@x.com", [], "anything", acl, NOW), (True, "owner"))
+        self.assertEqual(calls, ["u/r/a.js", "u/r/a/b.js", "u/r/a/b.js", "anything"])
+        with mock.patch.object(gate, "acl_key_for", lambda key, pub_prefixes=None: None):
+            self.assertEqual(gate.decide("own@x.com", [], "u/r/a.js", acl, NOW),
+                             (False, "no-artifact-root: deny"))
+            self.assertEqual(gate.read_acl(m, "u/r/a.js", NOW), (None, None))
+            self.assertEqual(gate.grant_access(m, "/artifacts/u/r/a.js", "x@x.com"),
+                             (False, "no artifact root"))
+
+    def test_grant_for_a_nested_file_writes_only_the_root_acl(self):
+        m = FakeMinio({"u/r/.acl.json": json.dumps(self.ROOT_ACL).encode(), "u/r/a/b/c.js": b"x"})
+        ok, note = gate.grant_access(m, "/artifacts/u/r/a/b/c.js", "new@x.com")
+        self.assertTrue(ok, note)
+        self.assertEqual(m.puts, ["u/r/.acl.json"])
+        self.assertEqual(json.loads(m.objects["u/r/.acl.json"])["users"], ["alice@x.com", "new@x.com"])
+        self.assertEqual([k for k in m.objects if k.endswith(".acl.json")], ["u/r/.acl.json"])
+        m = FakeMinio({"g/team/r/.acl.json": json.dumps(self.ROOT_ACL).encode()})
+        ok, note = gate.grant_access(m, "/artifacts/g/team/r/a/b.css", "new@x.com")
+        self.assertTrue(ok, note)
+        self.assertEqual(m.puts, ["g/team/r/.acl.json"])
+
+    def test_grant_never_uses_or_creates_a_nested_acl(self):
+        nested = json.dumps({"owner": "own@x.com", "users": []}).encode()
+        m = FakeMinio({"u/r/a/.acl.json": nested})         # a stray nested ACL, no root ACL
+        self.assertEqual(gate.grant_access(m, "/artifacts/u/r/a/x.js", "new@x.com"),
+                         (False, "acl unreadable: missing"))
+        self.assertEqual(m.puts, [])
+        self.assertEqual(m.objects["u/r/a/.acl.json"], nested)
+        # no artifact root: refused before any read or write
+        m = FakeMinio({"u/.acl.json": nested, "acl/.acl.json": nested})
+        for path in ("/artifacts/u/x.js", "/artifacts/acl/run.json", "/artifacts/other/r/x.js"):
+            self.assertEqual(gate.grant_access(m, path, "new@x.com"), (False, "no artifact root"), path)
+        self.assertEqual((m.gets, m.puts), ([], []))
+
+    def test_mcp_prefix_is_never_served(self):
+        for key in ("_mcp", "_mcp/x.json", "_mcp/sessions/a/b.json", "_mcp/.acl.json"):
+            self.assertTrue(gate._bad_key(key), key)
+        self.assertFalse(gate._bad_key("_mcpx/y.json"))     # the prefix only ...
+        self.assertIsNone(gate.acl_key_for("_mcpx/y.json"))  # ... and that key has no root
+
+    def test_plugin_answer_uses_the_same_decision(self):
+        acl = {"owner": "a@x.com"}
+        ans, detail = gate.plugin_authz_decision_detail("a@x.com", [], "u/x.html", acl, NOW, 200,
+                                                        {"ttl": "7"}, NOW)
+        self.assertEqual((ans["allowed"], ans["reason"], detail),
+                         (False, "denied", "no-artifact-root: deny"))
+        self.assertEqual(ans["artifact"], {"key": "u/x.html", "expires": None, "ttl": None})
+        ans = gate.plugin_authz_decision("a@x.com", [], "u/r/a/b.js", acl, NOW, 200)
+        self.assertEqual((ans["allowed"], ans["reason"]), (True, "owner"))
+
+
+class RefusedIdentityTest(unittest.TestCase):
+    """A directory guest's UPN (`#EXT#`) is refused by the gate, whatever the ACLs say."""
+
+    def test_guest_upn_refused(self):
+        for email in ("alice_example.org#EXT#@tenant.example", "ALICE_EXAMPLE.ORG#ext#@TENANT.EXAMPLE",
+                      "a#Ext#b@example.org"):
+            self.assertTrue(gate.refused_identity(email), email)
+        for email in ("alice@example.org", "ext@example.org", "a#ex#t@example.org", "#ext@x.org",
+                      "", None):
+            self.assertFalse(gate.refused_identity(email), email)

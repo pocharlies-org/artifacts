@@ -186,7 +186,8 @@ class S3Client:
         self._call("PUT", key, data, headers)
 
     def put_acl(self, dir_key: str, acl_json: str) -> None:
-        """Write <dir>/.acl.json (the gate's per-directory ACL)."""
+        """Write <dir>/.acl.json: the gate's ACL for the artifact rooted at dir_key (u/<run>,
+        g/<slug>/<run>), which governs every file under it at any depth."""
         self._call("PUT", f"{dir_key}/.acl.json", acl_json.encode(),
                    {"content-type": "application/json", "cache-control": "no-cache"})
 
