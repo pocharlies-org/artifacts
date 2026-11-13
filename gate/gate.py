@@ -1771,8 +1771,9 @@ ACL_MALFORMED = "malformed JSON"
 
 def read_acl(minio, key, now, bypass_cache=False):
     """Return (acl|None, error|None) for the ACL that governs `key` (acl_key_for). acl=None
-    means that object does not exist, or the key has no ACL at all (no artifact root): then
-    nothing is read and decide() denies."""
+    with no error means that object does not exist, or the key has no ACL at all (no artifact
+    root): then nothing is read and decide() denies. An object that is not JSON, or whose JSON
+    is `null`, is (None, ACL_MALFORMED)."""
     acl_key = acl_key_for(key)
     if acl_key is None:
         return None, None
@@ -1788,6 +1789,10 @@ def read_acl(minio, key, now, bypass_cache=False):
             try:
                 acl = json.loads(body)
             except ValueError:
+                err = ACL_MALFORMED
+            if acl is None and err is None:
+                # an object that exists and says `null` is not "no ACL": refuse it like any
+                # other unusable ACL (it would otherwise open a pub/ root it was meant to close)
                 err = ACL_MALFORMED
         elif status != 404:
             err = f"HTTP {status}"

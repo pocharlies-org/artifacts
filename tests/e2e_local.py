@@ -1749,6 +1749,27 @@ class E2ETest(unittest.TestCase):
         self.assertEqual((st, ans["allowed"], ans["reason"]),
                          (200, True, "pub: no ACL (anonymous read by design)"))
 
+    def test_null_acl_at_a_pub_root_fails_closed(self):
+        # a pub/ root ACL whose body is the JSON literal `null` is an unusable ACL, not "no ACL":
+        # the anonymous decision, the plugin's anonymous answer and the signed-in decision all
+        # refuse, as for any other malformed ACL
+        self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html")[0], 200)   # control
+        for body in (b"null", b" null "):
+            self.gate._acl_cache.clear()
+            with OBJECTS_LOCK:
+                OBJECTS["pub/free/.acl.json"] = body
+            st, page, h = self.pub_auth("/artifacts/pub/free/index.html")
+            self.assertEqual(st, 404, body)
+            self.assertIn("Nothing here", page)
+            self.assertNotIn("Authorization", h)
+            _, ans = self.plugin_authz("/artifacts/pub/free/index.html", flag=True)    # anonymous
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), body)
+            _, ans = self.plugin_authz("/artifacts/pub/free/index.html", sid="alice")
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), body)
+            st, _, h = self._auth_h("/artifacts/pub/free/index.html", "alice")       # signed in
+            self.assertEqual(st, 403, body)
+            self.assertNotIn("Authorization", h)
+
     def test_keys_without_artifact_root_denied(self):
         # an ACL where the old per-directory lookup would find one lets nobody in
         acl = json.dumps({"owner": "alice@example.com", "users": ["alice@example.com"]}).encode()

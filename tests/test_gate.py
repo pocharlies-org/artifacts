@@ -1645,6 +1645,24 @@ class PubAuthDecisionTest(unittest.TestCase):
                 continue                                  # not on the anonymous rule
             self.assertFalse(self.d(upstream)[0], (target, upstream))
 
+    def test_null_acl_at_the_pub_root_is_refused(self):
+        # an ACL object whose JSON is `null` exists: it is unusable (malformed), never "no ACL"
+        for body in (b"null", b" null ", b"null\n", b"\tnull"):
+            gate._acl_cache.clear()
+            m = FakeMinio({"pub/n/index.html": b"x", "pub/n/.acl.json": body,
+                           "u/n/index.html": b"x", "u/n/.acl.json": body})
+            for key in ("pub/n/index.html", "u/n/index.html"):
+                self.assertEqual(gate.read_acl(m, key, NOW, bypass_cache=True),
+                                 (None, gate.ACL_MALFORMED), (body, key))
+            self.assertEqual(gate.pub_auth_decision("GET", "/artifacts/pub/n/index.html", m, NOW,
+                                                    enabled=True)[0::2],
+                             (False, "acl unreadable (malformed JSON)"), body)
+        # control: the same root without an ACL object is open
+        gate._acl_cache.clear()
+        m = FakeMinio({"pub/n/index.html": b"x"})
+        self.assertTrue(gate.pub_auth_decision("GET", "/artifacts/pub/n/index.html", m, NOW,
+                                               enabled=True)[0])
+
     def test_pub_key_refused_characters(self):
         for key in ("pub/a..b", "pub/a//b", "pub/a\\b", "pub/a;b", "pub/a%b", "pub/a#b",
                     "pub/a?b", "pub/a\x00b", "pub/a\x1fb", "pub/a\x7fb", "pub/a\x85b",
