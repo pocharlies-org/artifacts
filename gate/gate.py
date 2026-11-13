@@ -1027,8 +1027,9 @@ class RequestStore:
             return None
 
     def mark(self, rid, status, now):
-        """Transition pending -> approved|denied. Returns the record ONLY when this call performed
-        the transition; None when missing or already decided. Single-use without a CAS primitive:
+        """Transition pending -> approve|deny. Returns the record ONLY when this call performed
+        the transition; None when missing or already decided. An approval calls it only after
+        the grant succeeded (_handle_action). Single-use without a CAS primitive:
         two concurrent POSTs that both read `pending` can both act (grant is idempotent; the
         requester could get a duplicate DM) — acceptable for the PoC, see README residual risks."""
         rec = self.get(rid)
@@ -1037,16 +1038,6 @@ class RequestStore:
         rec["status"], rec["updated"] = status, now
         self.store.put_json(f"req/{rid}.json", rec)
         return rec
-
-    def reopen(self, rid, status, now):
-        """Put a request that this process just marked `status` back to pending (an approval
-        whose ACL write failed): the owner's link works again. True when it was reopened."""
-        rec = self.get(rid)
-        if rec is None or rec.get("status") != status:
-            return False
-        rec["status"], rec["updated"] = "pending", now
-        self.store.put_json(f"req/{rid}.json", rec)
-        return True
 
 
 # --------------------------------------------------------------------------------------------
@@ -1712,56 +1703,85 @@ class GateHandler(BaseHTTPRequestHandler):
                 f"<form method=POST action=https://{PUBLIC_HOST}/_gate/{action}>"
                 f"<input type=hidden name=token value=\"{html.escape(token, quote=True)}\">"
                 f"<button type=submit>Confirm {action}</button></form>")))
-        # POST: perform. Single-use: only a still-pending request transitions (last-writer-wins).
-        updated = REQUESTS.mark(rec["id"], action, int(time.time()))
-        if updated is None or updated["status"] != action:
-            return self._send(410, self._page("Already decided", "<p>Another decision won the race.</p>"))
+        # POST: perform. An approval grants first and records the decision second. The grant
+        # is idempotent (a requester already listed is not written again), so a cut reply on
+        # the request's record, or a gate stopped between the two writes, leaves at worst a
+        # pending request whose access is already granted (the same link closes it), never a
+        # request recorded as approved with nothing granted.
         note = ""
         if action == "approve":
             try:
                 ok, note = grant_access(MINIO, rec["artifact"], rec["requester"])
-            except Exception as e:  # noqa: BLE001 - defensive: the request is already marked
+            except Exception as e:  # noqa: BLE001 - defensive
                 # Any failure grant_access does not report itself is still a failed grant: the
-                # same answer as below, never a dropped connection that leaves the request
-                # marked approved with no grant. The log gets the class name only (no text,
-                # no traceback: either could carry request or store data).
+                # same answer as below, never a dropped connection. The log gets the class
+                # name only (no text, no traceback: either could carry request or store data).
                 ok, note = False, f"unexpected {type(e).__name__}"
             if not ok:
                 # Never "approved" for a grant that did not happen: the requester is not told
-                # anything, the request goes back to pending (the same link can be used again)
-                # and the owner's page says what happened. The cause stays in the log.
-                try:
-                    reopened = REQUESTS.reopen(rec["id"], action, int(time.time()))
-                except ConnectionError:
-                    reopened = False
+                # anything, the request is still pending (it was not marked, so the same link
+                # can be used again) and the owner's page says what happened. The cause stays
+                # in the log.
                 unknown = grant_outcome_unknown(note)
                 LOG.error("approve %s: ACL write failed: %s (requester=%s artifact=%s "
-                          "request reopened=%s, requester not notified, access list %s)",
-                          rec["id"], note, rec["requester"], rec["artifact"], reopened,
+                          "request still pending, requester not notified, access list %s)",
+                          rec["id"], note, rec["requester"], rec["artifact"],
                           "may or may not have been updated" if unknown else "unchanged")
                 if unknown:
                     # The store may have applied the write (its reply was lost or was a 5xx,
-                    # and a re-read did not settle it): never "nothing was changed" here. A retry of the same
-                    # link finishes the approval and never adds anyone twice; Deny writes no ACL,
-                    # so it would not take back an access that was already added.
+                    # and a re-read did not settle it): never "nothing was changed" here. A
+                    # retry of the same link finishes the approval and never adds anyone twice;
+                    # Deny writes no ACL, so it would not take back an access already added.
                     return self._send(503, self._page("Access not confirmed", (
                         f"<p>It is not known whether <b>{requester}</b> was given access to the "
                         f"artifact <code>{root_html}</code>: the store did not confirm the "
                         f"update, so its access list may or may not have been updated. They "
                         f"were not notified.</p>"
-                        + ("<p>Use the same link again to finish: it reads the access list "
-                           "again and never adds anyone twice.</p>" if reopened else
-                           "<p>The request could not be reopened, so this link will not work "
-                           "again: ask them to request access again (an approval never adds "
-                           "anyone twice).</p>")
-                        + "<p>Deny does not remove access that was already added: to take it "
-                          "back, publish the artifact's access list again without them.</p>")))
+                        "<p>Use the same link again to finish: it reads the access list "
+                        "again and never adds anyone twice.</p>"
+                        "<p>Deny does not remove access that was already added: to take it "
+                        "back, publish the artifact's access list again without them.</p>")))
                 return self._send(503, self._page("Access not granted", (
                     f"<p><b>{requester}</b> was <b>not</b> given access to the artifact "
                     f"<code>{root_html}</code>: its access list could not be updated. "
                     f"Nothing was changed and they were not notified.</p>"
-                    + ("<p>The request is still open: the same link can be used again.</p>"
-                       if reopened else ""))))
+                    "<p>The request is still open: the same link can be used again.</p>")))
+        # Record the decision. Single-use: only a still-pending request transitions
+        # (last-writer-wins).
+        try:
+            updated = REQUESTS.mark(rec["id"], action, int(time.time()))
+        except ConnectionError as e:
+            if action == "deny":
+                LOG.error("deny %s: the decision could not be recorded: %s (requester=%s "
+                          "artifact=%s, requester not notified)", rec["id"], e,
+                          rec["requester"], rec["artifact"])
+                return self._send(503, self._page("Decision not confirmed", (
+                    f"<p>The store did not confirm that the request of <b>{requester}</b> "
+                    f"is denied. They were not notified.</p>"
+                    "<p>Use the same link again: it denies the request if it is still "
+                    "open.</p>")))
+            # The access is granted, and that is the outcome: the requester is told. The record
+            # may still say pending; then the same link closes it (the grant finds the
+            # requester listed and writes nothing).
+            LOG.error("approve %s: access granted, but the decision could not be recorded: %s "
+                      "(requester=%s artifact=%s)", rec["id"], e, rec["requester"],
+                      rec["artifact"])
+            updated = {"status": action}
+        if updated is None or updated["status"] != action:
+            current = (REQUESTS.get(rec["id"]) or {}).get("status")
+            if action == "approve" and current == "deny":
+                # Approve and Deny of one request at the same time: this approval granted the
+                # access, the Deny recorded the decision. Say both; Deny writes no ACL.
+                LOG.warning("approve %s: access granted (%s), but a deny was recorded at the "
+                            "same time (requester=%s artifact=%s, not notified of the approval)",
+                            rec["id"], note, rec["requester"], rec["artifact"])
+                return self._send(409, self._page("Decided twice", (
+                    f"<p><b>{requester}</b> was given access to the whole artifact "
+                    f"<code>{root_html}</code> by this approval, but a Deny of the same request "
+                    f"was recorded at the same time. They were not told about the approval.</p>"
+                    "<p>Deny does not remove access that was already added: to take it back, "
+                    "publish the artifact's access list again without them.</p>")))
+            return self._send(410, self._page("Already decided", "<p>Another decision won the race.</p>"))
         self._release_owner_slot(rec)
         if action == "approve":
             msg = (f"Your access request for `{rec['artifact']}` was approved: you can now open "

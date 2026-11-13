@@ -916,6 +916,117 @@ class E2ETest(unittest.TestCase):
         self.assertIn("tess@example.com", json.loads(OBJECTS["u/secret/.acl.json"])["users"])
         self.assertEqual(len(sent), 1)
 
+    # -- the grant comes first, then the request's record: a cut reply or a stop between the
+    #    two writes never leaves a request "approved" with no access granted ----------------
+    def _approval_state(self, rid, requester):
+        with OBJECTS_LOCK:
+            status = json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"]
+            listed = requester in json.loads(OBJECTS["u/secret/.acl.json"])["users"]
+        return status, listed
+
+    def _post_action_or_dropped(self, endpoint, token):
+        try:
+            return self._post_action(endpoint, token)
+        except (OSError, http_client.HTTPException):
+            return None, "", {}                       # the connection was dropped unanswered
+
+    def test_cut_reply_on_the_request_record_never_leaves_approved_without_access(self):
+        # the store applies the write of the request's new status but its reply is cut
+        sent = self.record_notifications()
+        rid, token = self._approve("cora@example.com")
+        with OBJECTS_LOCK:
+            PLAN[("PUT", f"_gate/req/{rid}.json")] = ["cut"]
+        st, page, _ = self._post_action_or_dropped("approve", token)
+        status, listed = self._approval_state(rid, "cora@example.com")
+        if status == "approve":
+            self.assertTrue(listed, "the request is recorded as approved and nothing was granted")
+        # the access was granted, so that is what the owner and the requester are told
+        self.assertEqual((st, status, listed), (200, "approve", True), page)
+        self.assertIn("<title>Request approved</title>", page)
+        self.assertEqual([to for to, _ in sent], ["cora@example.com"])
+        st, page, _ = self._post_action("approve", token)        # the link was used
+        self.assertEqual(st, 410, page)
+        self.assertIn("already <b>approved</b>", page)
+
+    def test_lost_write_of_the_request_record_leaves_it_open_with_the_access(self):
+        # the write of the request's status is lost (not applied, no answer): the access was
+        # granted, the request is still pending, and the same link closes it without a
+        # second ACL write
+        sent = self.record_notifications()
+        rid, token = self._approve("dina@example.com")
+        with OBJECTS_LOCK:
+            PLAN[("PUT", f"_gate/req/{rid}.json")] = ["drop"]
+        st, page, _ = self._post_action_or_dropped("approve", token)
+        self.assertEqual(self._approval_state(rid, "dina@example.com"), ("pending", True))
+        self.assertEqual(st, 200, page)
+        self.assertIn("<title>Request approved</title>", page)
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "dina@example.com"), ("approve", True))
+        with OBJECTS_LOCK:
+            self.assertEqual([s for k, _im, _t, s in PUTS if k == "u/secret/.acl.json"], [200])
+        self.assertEqual(len(sent), 2)                      # told on each click that granted
+
+    def test_a_gate_stopped_between_the_two_writes_never_leaves_approved_without_access(self):
+        class Stopped(BaseException):
+            """The process ends here (killed, OOM): nothing after it runs."""
+        rid, token = self._approve("elio@example.com")
+        calls = []
+
+        def stop_on_second_write(name, real):
+            def run(*args, **kwargs):
+                calls.append(name)
+                if len(calls) == 2:
+                    raise Stopped(name)
+                return real(*args, **kwargs)
+            return run
+        with mock.patch.object(self.gate, "grant_access",
+                               stop_on_second_write("grant", self.gate.grant_access)), \
+                mock.patch.object(self.gate.REQUESTS, "mark",
+                                  stop_on_second_write("mark", self.gate.REQUESTS.mark)), \
+                mock.patch.object(threading, "excepthook", lambda args: None):
+            self._post_action_or_dropped("approve", token)
+        status, listed = self._approval_state(rid, "elio@example.com")
+        if status == "approve":
+            self.assertTrue(listed, "the request is recorded as approved and nothing was granted")
+        self.assertEqual(calls, ["grant", "mark"])
+        self.assertEqual((status, listed), ("pending", True))
+        st, page, _ = self._post_action("approve", token)      # the same link finishes it
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "elio@example.com"), ("approve", True))
+
+    def test_approve_and_deny_at_the_same_time_says_what_happened(self):
+        # the owner's Deny is recorded while this approval is granting: the page says both
+        sent = self.record_notifications()
+        rid, token = self._approve("gus@example.com")
+        real_grant = self.gate.grant_access
+
+        def grant_then_a_deny_lands(*args, **kwargs):
+            out = real_grant(*args, **kwargs)
+            self.gate.REQUESTS.mark(rid, "deny", int(time.time()))
+            return out
+        with mock.patch.object(self.gate, "grant_access", grant_then_a_deny_lands):
+            st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 409, page)
+        self.assertIn("<title>Decided twice</title>", page)
+        self.assertIn("Deny does not remove access that was already added", page)
+        self.assertEqual(self._approval_state(rid, "gus@example.com"), ("deny", True))
+        self.assertEqual(sent, [])
+
+    def test_deny_whose_record_cannot_be_written_says_so(self):
+        sent = self.record_notifications()
+        rid = self._pending_request("fay@example.com")
+        token = self.gate.make_action_token(rid, "deny", self.gate._KEY, int(time.time()))
+        with OBJECTS_LOCK:
+            PLAN[("PUT", f"_gate/req/{rid}.json")] = ["drop"]
+        st, page, _ = self._post_action_or_dropped("deny", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("<title>Decision not confirmed</title>", page)
+        self.assertEqual(sent, [])
+        st, page, _ = self._post_action("deny", token)          # the same link works again
+        self.assertEqual(st, 200, page)
+        self.assertEqual(self._approval_state(rid, "fay@example.com"), ("deny", False))
+
     def test_deny_message_unchanged(self):
         sent = self.record_notifications()
         rid = self._pending_request("mike@example.com")
