@@ -1,5 +1,10 @@
-{{- /* artifact-gate. Single-file stdlib service (gate/gate.py) mounted from the ConfigMap
-       <sso>/artifact-gate-code, recreated from git on every deploy (see values.yaml "gate").
+{{- /* artifact-gate. Single-file stdlib service (gate/gate.py), run as /app/gate.py in one of two
+       modes (values.yaml "gate"):
+         gate.bakedImage=false (default): gate.image (stock Python) + the code mounted from the
+                                ConfigMap <sso>/artifact-gate-code, recreated from git on every deploy.
+         gate.bakedImage=true:  the gate image (gate/Dockerfile) with the code inside, referenced as
+                                <gate.bakedImageRepository>@<gate.bakedImageDigest>; no ConfigMap,
+                                no code volume, no mount.
        Lives in the sso namespace because traefik must be able to watch its routes there.
 
        Two listeners, one process: the public surface (request-access: /_gate/request|approve|deny,
@@ -19,6 +24,22 @@
          <sso>/artifact-gate-slack  bot-token: optional; without it the gate logs notifications
                                     instead of sending DMs. */ -}}
 {{- $sso := .Values.namespaces.sso }}
+{{- $baked := .Values.gate.bakedImage | default false }}
+{{- if not (kindIs "bool" $baked) }}
+{{- fail (printf "gate.bakedImage must be a boolean (true or false), got %v" $baked) }}
+{{- end }}
+{{- $gateImage := .Values.gate.image }}
+{{- if $baked }}
+{{- $repo := .Values.gate.bakedImageRepository | default "" }}
+{{- $digest := .Values.gate.bakedImageDigest | default "" }}
+{{- if or (not $repo) (contains "@" $repo) (contains ":" (base $repo)) }}
+{{- fail (printf "gate.bakedImageRepository must be an image repository without a tag or digest, got %q" $repo) }}
+{{- end }}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" $digest) }}
+{{- fail (printf "gate.bakedImageDigest must be sha256:<64 lowercase hex> when gate.bakedImage is true, got %q" $digest) }}
+{{- end }}
+{{- $gateImage = printf "%s@%s" $repo $digest }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -53,7 +74,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gate
-          image: {{ .Values.gate.image }}
+          image: {{ $gateImage }}
           command: ["python3", "/app/gate.py"]
           env:
             - name: MINIO_ENDPOINT
@@ -105,13 +126,17 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
+            {{- if not $baked }}
             - {name: code, mountPath: /app, readOnly: true}
+            {{- end }}
             - {name: hmac-key, mountPath: /secrets, readOnly: true}
       volumes:
+        {{- if not $baked }}
         - name: code
           configMap:
             name: artifact-gate-code
             defaultMode: 0444
+        {{- end }}
         - name: hmac-key
           secret:
             secretName: {{ .Values.gate.keysSecretName }}

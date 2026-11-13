@@ -1,0 +1,4 @@
+# Build context of gate/Dockerfile (built from the repository root): an allow-list.
+# Only the gate file goes in; tests/, deploy/ (dev secrets), helm/, cli/, mcp/ and .git never do.
+*
+!gate/gate.py
