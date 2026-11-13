@@ -35,9 +35,12 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   subfolders is one artifact); an `.acl.json` below the root is never read or served, and
   an approval only ever updates the root one. Denied whatever ACL objects exist: a key
   directly under `u/` or `g/<slug>/` (no artifact root), `acl/…`, and anything outside
-  `pub/`, `u/` and `g/`. `pub/`: no ACL → any signed-in user (an ACL there, which the
-  publishers never write, is the one in the key's own directory). The same function and
-  the same ACL lookup answer forwardAuth and the plugin authz API.
+  `pub/`, `u/` and `g/`. `pub/`: no ACL → open to everyone, anonymous visitors included
+  (anonymous read by design, see "Anonymous `pub/`" below). Its root is
+  `pub/<run>/` for a CLI run (`pub/<run>/.acl.json`, at any depth) and `pub/` itself for a
+  single file published directly under it by the MCP (`pub/.acl.json`); an ACL there,
+  which the publishers never write, is honoured at that root like any other. The same
+  function and the same ACL lookup answer forwardAuth and the plugin authz API.
 - **Guest identities**: an identity containing `#EXT#` (a directory guest's UPN) is refused
   on every gate endpoint, whatever the ACLs say. Defence in depth: the gate sees the login
   proxy's email claim, which for a guest is usually the guest's own address, so restrict
@@ -61,22 +64,41 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   artifact root); a key with no artifact root offers no request (there is no owner to ask),
   and neither a request nor an approval is ever taken for a path the gate would not serve
   (dot segments, an `.acl.json`, `_gate/`, a listing) or one without an artifact root.
+  `pub/` takes no requests at all: it is anonymous-readable by design, so its deny page
+  offers none, a request for it is refused, and the gate never writes a `pub/` ACL (its S3
+  policy refuses that write too).
   The approval adds the requester to the root ACL with a conditional write: the gate reads
   the ACL with its ETag and writes it back with `If-Match`, so a change made by anyone else in
   between is never overwritten (the store answers `412`; the gate reads again and retries
   once, then gives up). Everything else in the ACL (`owner`,
   `groups`, `expires`, unknown fields) and the ACL's tags (its `ttl`) are kept. A write that
   fails is never reported as approved: the requester is told nothing, the owner sees that
-  access was not granted, and the request stays open. Your store must honour `If-Match` on
-  `PutObject` (MinIO does; a store that ignores it brings back the lost-update race).
+  access was not granted, and the request stays open. When the store may have applied the
+  write anyway (its reply was lost, or it answered with a 5xx server error), the gate reads
+  the ACL once more: the requester listed means approved; otherwise the owner is told the
+  access list may or may not have been updated, to use the same link again (it never adds
+  anyone twice), and that Deny does not take back an access already added. "Nothing was
+  changed" is said only when that is known (a refusal before the write, or a 4xx). Your store must honour `If-Match` on `PutObject` (MinIO does; a store that ignores
+  it brings back the lost-update race).
 - **Two listeners, one process**: `:8080` public (request-access pages, approve/deny
   links, health) and `:8081` internal (decision endpoints only: `/_gate/auth`,
-  `/_gate/plugin/authz`). The public routes never reach the decision listener.
+  `/_gate/pub-auth`, `/_gate/plugin/authz`). The public routes never reach the decision
+  listener.
+- **Anonymous `pub/`**: `pub/` is anonymous read by design, for a host reachable on a
+  private network only (the chart refuses `artifactsGate.anonymousPubEnabled` together with
+  `publicExposure`). `/_gate/auth` never answers `200` without a session; the anonymous
+  decision is `GET /_gate/pub-auth`, which asks no identity and allows a read only when the
+  object exists and its pub root has no ACL. Any `pub/` key that, decoded once, contains
+  `..`, `//`, `\`, `;`, `%`, `#`, `?` or a control character is refused before the store is
+  read. Everything it refuses (a missing key, a key with an ACL, a listing, an `.acl.json`, a
+  malformed path, a write) gets one answer: the same `404` page, status, headers and body, for
+  `GET` and `HEAD`, never a login redirect. Whether the route asks it is a chart value, see
+  [Helm](#helm-helmartifactsvaluesyaml).
 - **Expiry**: objects carry a `ttl` tag (`1|7|14|30` days), ILM expires by tag, and a
   catch-all (90 days) takes everything untagged — including `_plugins/`.
 - **Never served**: directory listings, `.acl.json` (at the root or nested), `_gate/` (gate
   state), `_plugins/` (plugin storage), `_mcp/` (an MCP publisher's bookkeeping), and any
-  path with a `.`/`..` segment.
+  path with a `.`/`..` segment, an empty segment (`//`) or a NUL.
 
 ## Quick start (laptop, Docker Compose)
 
@@ -91,7 +113,10 @@ docker compose up bootstrap   # bucket, ILM rules, anonymous pub/ policy, gate S
 ```
 
 Then open <http://127.0.0.1:8080/artifacts/pub/<run>/index.html> — anonymous `pub/`
-reads work; gated reads (`/artifacts/u/...`) redirect to Dex login. Dex has three static
+reads work; gated reads (`/artifacts/u/...`) redirect to Dex login. `pub/` is served straight
+from MinIO by default; `ARTIFACTS_PUB_MODE=gate docker compose up -d` sends every `pub/` read
+to the gate's anonymous decision first (the chart's `artifactsGate.anonymousPubThroughGate`),
+and `./e2e.sh` then also checks that path. Dex has three static
 dev users: `test@example.com` / `test-password`, `test2@example.com` / `test2-password` and
 `test3@example.com` / `test3-password` (the extra two let plugins test sharing and refusals),
 with the display names *Test One*, *Test Two* and *Test Three* (the id_token `name` claim that
@@ -295,8 +320,8 @@ Everything is environment-driven; nothing is hardcoded.
 | `HMAC_KEY_B64` / `HMAC_KEY_FILE` | `/secrets/hmac-key` | signs approve/deny tokens |
 | `PUBLIC_HOST` | `artifacts.example.com` | host used in generated links |
 | `SLACK_BOT_TOKEN` | empty | optional DM notification on access requests |
-| `GATE_PUB_PREFIXES` | `pub/` | comma list treated as "any signed-in user" without ACL |
-| `GATE_ANONYMOUS_PUB_ENABLED` | `false` | anonymous reads of `pub/` (plugin authz); must stay false on public hosts |
+| `GATE_PUB_PREFIXES` | `pub/` | comma list of anonymous-read prefixes: a key there without an ACL is open to everyone, anonymous visitors included; each entry ends in `/` (one that does not has no artifact root: denied) |
+| `GATE_ANONYMOUS_PUB_ENABLED` | `false` | anonymous reads of `pub/` (plugin authz and `/_gate/pub-auth`); must stay false on public hosts |
 | `GATE_STATE_PREFIX` | `_gate` | gate state prefix (never served) |
 | `GATE_PLUGIN_PREFIX` | `_plugins` | plugin storage prefix (never served) |
 | `GATE_RATE_LIMIT_MAX` / `GATE_RATE_LIMIT_WINDOW_SECONDS` | `5` / `86400` | access requests per key |
@@ -339,6 +364,7 @@ refuses anything else.
 |---|---|---|
 | `ingressRouteAnnotations` | `{}` | annotations on every IngressRoute (artifacts host and plugin routes), e.g. `kubernetes.io/ingress.class: traefik-internal` |
 | `gate.trustForwardHeader` | `false` | `trustForwardHeader` of the `gate-auth` forwardAuth middleware; `false` makes Traefik set the `X-Forwarded-*` headers the gate decides on from the request itself |
+| `artifactsGate.anonymousPubThroughGate` | `false` | with `artifactsGate.anonymousPubEnabled`: `false` serves `pub/` straight from MinIO (rule 2, `.acl.json` and listings kept off it); `true` makes rule 2 ask the gate's anonymous decision first (middleware `gate-pub-auth`, `/_gate/pub-auth`, `trustForwardHeader` always `false`), so a missing key, a key with an ACL, a listing and an `.acl.json` get the gate's one `404` page and never MinIO's error. `gate-pub-auth` is rendered whenever anonymous `pub/` is on, so turning this on changes routes only; the chart refuses `true` without anonymous `pub/` |
 | `oauth2Proxy.emailDomains` | `[]` | one `--email-domain` per entry; empty renders `--email-domain=*`; an entry `*` is refused |
 | `oauth2Proxy.trustedProxyIPs` | `[]` | one `--trusted-proxy-ip` per IP or CIDR (proxies allowed to set `X-Forwarded-*`); the flag exists from oauth2-proxy v7.15.2 (v7.15.5 or newer recommended; the example `image` is v7.15.6), so keep `image` at such a release |
 | `oauth2Proxy.extraArgs` | `[]` | only `--allowed-group=<id>` (non-empty id, one entry per group), appended last; any other flag is refused (`--email-domain` and `--trusted-proxy-ip` have their own values) |
@@ -364,9 +390,13 @@ their real types).
   - the read-signing user can only `GetObject` outside `_gate/`, `_plugins/` and the
     ACLs, so a replayed signature reads at most the artifact it was issued for.
 - **Edge before MinIO**: query strings and client `x-amz-*` / `x-minio-*` headers never
-  reach MinIO on a gated read (see "How it works"). The anonymous `pub/` rule serves
-  straight from MinIO without the gate: there the anonymous bucket policy is the only
-  authority, and `.acl.json` / trailing-slash paths are refused at the proxy.
+  reach MinIO on a gated read (see "How it works"). By default the anonymous `pub/` rule
+  serves straight from MinIO without the gate: there the anonymous bucket policy is the only
+  authority, `.acl.json` / trailing-slash paths are refused at the proxy, and a missing key
+  answers with MinIO's own `NoSuchKey`, which tells a prober which keys exist. With
+  `artifactsGate.anonymousPubThroughGate: true` every `pub/` read is decided and signed by
+  the gate, with the same edge rules as a gated read and one answer for everything it
+  refuses.
 - **Never MinIO root at runtime**: the gate uses two least-privilege users; root is
   only for the bootstrap.
 - **Request bodies before login**: only the gate's four POST endpoints (`/_gate/request`,

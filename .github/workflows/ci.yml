@@ -78,6 +78,9 @@ jobs:
               --set 'plugins[0].name=canvas' --set 'plugins[0].pathPrefix=/_canvas/' \
               --set 'plugins[0].service=artifact-canvas' --set 'plugins[0].port=8080' \
             | python3 -I tests/check_oauth2_routes.py
+          helm template t helm/artifacts -f helm/artifacts/values.yaml \
+              --set artifactsGate.anonymousPubEnabled=true --set artifactsGate.anonymousPubThroughGate=true \
+            | python3 -I tests/check_oauth2_routes.py
       - name: compose Caddyfile routes only oauth2-proxy's browser endpoints (allow-list)
         run: |
           grep -qF 'vars_regexp {http.request.orig_uri} `^/oauth2/(sign_in|start|callback|sign_out|static/' deploy/compose/Caddyfile
@@ -92,8 +95,18 @@ jobs:
           if grep -qE '^[[:space:]]*@[A-Za-z0-9_-]+[[:space:]]+path[[:space:]][^#]*[[:space:]]!' deploy/compose/Caddyfile; then
             echo "Caddyfile: a '!' entry inside a path matcher (literal path, not a negation)"; exit 1
           fi
+      - name: compose Caddyfile picks the anonymous pub/ route (direct by default, gate opt-in)
+        run: |
+          grep -qE "^[[:space:]]+import pub-[{][\$]ARTIFACTS_PUB_MODE:direct[}]\$" deploy/compose/Caddyfile
+          grep -qE '^\(pub-direct\) \{$' deploy/compose/Caddyfile
+          grep -qE '^\(pub-gate\) \{$' deploy/compose/Caddyfile
+          grep -qE '^[[:space:]]*uri /_gate/pub-auth$' deploy/compose/Caddyfile
+          grep -qE '^[[:space:]]*not path /_gate/pub-auth$' deploy/compose/Caddyfile
+          grep -qF "ARTIFACTS_PUB_MODE: \${ARTIFACTS_PUB_MODE:-direct}" deploy/compose/docker-compose.yml
+      - name: helm template anonymous pub/ through the gate (dormant value, routes, middleware, refusals)
+        run: python3 -I tests/check_pub_routes.py
       - name: oauth2 probe script parses
-        run: python3 -I -m py_compile tests/oauth2_probe.py tests/check_oauth2_routes.py
+        run: python3 -I -m py_compile tests/oauth2_probe.py tests/check_oauth2_routes.py tests/check_pub_routes.py
       - name: helm template wires the read-signing user (gate env + bootstrap Job)
         run: |
           out=$(helm template t helm/artifacts -f helm/artifacts/values.yaml)

@@ -1,10 +1,12 @@
 {{- /* Routes for the artifacts host (ns of the MinIO service, where the TLS secret lives).
        This host is the PRIMARY artifact-read host. Every artifact read is authenticated (OIDC
        login, any user of the IdP) and authorized per artifact by artifact-gate, EXCEPT pub/,
-       which is served anonymously straight from MinIO (rule 2) when
-       artifactsGate.anonymousPubEnabled is true. .acl.json and directory listings are NEVER
-       served anonymously: they fall through to the gated rule, where the gate 404s them.
-       Writes are refused before login on the whole host.
+       which is read anonymously (rule 2) when artifactsGate.anonymousPubEnabled is true:
+       straight from MinIO by default, or through the gate's anonymous decision
+       (gate-pub-auth) when artifactsGate.anonymousPubThroughGate is true. .acl.json and
+       directory listings are NEVER served anonymously: in the first case they fall through to
+       the gated rule, where the gate 404s them; in the second the gate's anonymous decision
+       404s them. Writes are refused before login on the whole host.
 
        Middleware order on the artifact rule is [errors, gate-auth, strip, csp] — see
        gate-middlewares.yaml: errors must be outermost to turn the gate's 401 into a 302
@@ -27,6 +29,15 @@
        flip artifactsGate.anonymousPubEnabled=false by hand before pointing public DNS here. */ -}}
 {{- if and .Values.artifactsGate.anonymousPubEnabled .Values.publicExposure }}
   {{- fail "artifacts-routes: artifactsGate.anonymousPubEnabled=true and publicExposure=true: the anonymous pub/ rule must never coexist with public exposure of the artifacts host. Set artifactsGate.anonymousPubEnabled=false before exposing the host publicly." }}
+{{- end }}
+{{- /* Where rule 2 decides an anonymous pub/ read: straight from MinIO (false, default) or the
+       gate's anonymous decision first (true). Meaningless without anonymous pub/: refused. */ -}}
+{{- $pubViaGate := .Values.artifactsGate.anonymousPubThroughGate | default false }}
+{{- if not (kindIs "bool" $pubViaGate) }}
+  {{- fail (printf "artifactsGate.anonymousPubThroughGate must be a boolean (true or false), got %v" $pubViaGate) }}
+{{- end }}
+{{- if and $pubViaGate (not .Values.artifactsGate.anonymousPubEnabled) }}
+  {{- fail "artifacts-routes: artifactsGate.anonymousPubThroughGate=true needs artifactsGate.anonymousPubEnabled=true (it says where the anonymous pub/ read is decided)." }}
 {{- end }}
 ---
 apiVersion: traefik.io/v1alpha1
@@ -58,7 +69,27 @@ spec:
       so this rule is not rendered. The fail guard at the top of this file refuses to render the
       chart with this rule and publicExposure=true both on.
     */}}
-    {{- if .Values.artifactsGate.anonymousPubEnabled }}
+    {{- if and .Values.artifactsGate.anonymousPubEnabled $pubViaGate }}
+    # 2. Public read: anonymous GET/HEAD on pub/, decided by the gate first (gate-pub-auth ->
+    #    /_gate/pub-auth on the gate's decision listener, no login): it allows only an existing
+    #    object whose pub root has no .acl.json and signs that read (like gate-auth); a missing
+    #    key, a key with an ACL, .acl.json, a listing and every traversal shape get the gate's
+    #    one 404 page, never MinIO's error or a login redirect. No exclusions here: every
+    #    pub/ GET/HEAD shape reaches that decision.
+    #    Writes to pub/ still hit rule 1 (405 from the gate): this rule is GET/HEAD only.
+    #    artifacts-csp is FIRST so the gate's own 404 carries the sandbox CSP too;
+    #    artifacts-strip-to-minio runs after the decision (MinIO's 8 KB header cap).
+    - kind: Rule
+      priority: 550
+      match: >-
+        {{ $hostMatch }} && PathPrefix(`/{{ $m.bucket }}/pub/`) && (Method(`GET`) || Method(`HEAD`)) && {{ $edge }}
+      middlewares:
+        - {name: artifacts-csp, namespace: {{ $sso }}}
+        - {name: gate-pub-auth, namespace: {{ $sso }}}
+        - {name: artifacts-strip-to-minio, namespace: {{ $sso }}}
+      services:
+        - {name: {{ $m.service }}, port: {{ $m.port }}}
+    {{- else if .Values.artifactsGate.anonymousPubEnabled }}
     # 2. Public read: anonymous GET/HEAD on pub/, straight to MinIO (its bucket policy allows
     #    anonymous GetObject on pub/*).
     #    Exclusions (this is the gate host, so the gate's guarantees must survive the shortcut):
@@ -86,7 +117,11 @@ spec:
     #    gate-auth: the gate still sees the session cookie, MinIO does not (8 KB header cap).
     #    Bucket-level paths (`/<bucket>`, `/<bucket>/?list-type=2`) and `.acl.json` never match
     #    a serving rule here: the gate answers 404 for them (no listing, ACLs are never served).
+    {{- if $pubViaGate }}
+    #    pub/ never lands here: rule 2 sends every pub/ GET/HEAD to the gate's anonymous decision.
+    {{- else }}
     #    pub/ .acl.json and pub/ trailing-slash paths land here from rule 2's exclusions and 404.
+    {{- end }}
     #    `_plugins/` and `_gate/` are never served: the gate 404s them (see gate/gate.py _bad_key).
     - kind: Rule
       priority: 500
@@ -106,11 +141,14 @@ spec:
     #    decision endpoint directly. This exclusion is defense-in-depth on top of the
     #    structural port split: the decision endpoints only listen on values.gate.authPort (8081),
     #    which no route here points at, and the gate 404s them on this 8080 listener anyway.
+    {{- if $pubViaGate }}
+    #    /_gate/pub-auth (the anonymous pub/ decision, gate-pub-auth's target) is not routed either.
+    {{- end }}
     - kind: Rule
       priority: 400
       match: >-
         {{ $hostMatch }} && PathPrefix(`/_gate/`) && !Path(`/_gate/auth`) && !Path(`/_gate/healthz`)
-        && !PathPrefix(`/_gate/plugin/`)
+        && !PathPrefix(`/_gate/plugin/`){{ if $pubViaGate }} && !Path(`/_gate/pub-auth`){{ end }}
       services:
         - {name: artifact-gate, namespace: {{ $sso }}, port: 8080}
     # 5. oauth2-proxy browser endpoints for this host: an ALLOW-LIST, nothing else under the

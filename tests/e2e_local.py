@@ -48,6 +48,12 @@ PUTS = []          # (key, If-Match, x-amz-tagging, status) of every PUT
 # more than is sent, then the connection closes: the client gets http.client.IncompleteRead).
 # method is "GET", "GET?tagging" or "PUT"; a cut PUT is still applied, as a store may do.
 TRUNCATE = {}
+# (method, key) -> [action, ...]: each such request pops the next action, before TRUNCATE is
+# looked at. "ok" answers normally; "drop" closes the connection without any answer (a PUT is
+# then NOT applied: the client cannot tell it from a reply lost after the write); "cut" is
+# TRUNCATE's cut reply (a PUT is applied). A PUT may also get "<status>" (that status, NOT
+# applied) or "applied <status>" (applied, then that status). method is "GET" or "PUT".
+PLAN = {}
 
 
 def etag_of(body):
@@ -61,6 +67,14 @@ class MinioHandler(BaseHTTPRequestHandler):
     def _key(self):
         path = urllib.parse.urlsplit(self.path).path
         return urllib.parse.unquote(path[len("/artifacts/"):])
+
+    def _plan(self, method, key):
+        with OBJECTS_LOCK:
+            steps = PLAN.get((method, key))
+            return steps.pop(0) if steps else "ok"
+
+    def _drop(self):
+        self.close_connection = True          # no status line at all: RemoteDisconnected
 
     def _cut(self, method, key):
         with OBJECTS_LOCK:
@@ -94,6 +108,9 @@ class MinioHandler(BaseHTTPRequestHandler):
                 return self._reply_cut(200, xml.encode())
             return self._reply(200, xml.encode())
         key = self._key()
+        step = self._plan("GET", key)
+        if step == "drop":
+            return self._drop()
         with OBJECTS_LOCK:
             body = OBJECTS.get(key)
             hooks = AFTER_GET.get(key)
@@ -102,7 +119,7 @@ class MinioHandler(BaseHTTPRequestHandler):
             hook()
         if body is None:
             return self._reply(404, b"NoSuchKey")
-        if self._cut("GET", key):
+        if step == "cut" or self._cut("GET", key):
             return self._reply_cut(200, body, {"ETag": etag_of(body)})
         self._reply(200, body, {"ETag": etag_of(body)})
 
@@ -120,6 +137,17 @@ class MinioHandler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n)
         key = self._key()
+        step = self._plan("PUT", key)
+        if step == "drop":
+            return self._drop()
+        if step not in ("ok", "cut"):
+            applied, _, code = step.rpartition(" ")
+            with OBJECTS_LOCK:
+                if applied == "applied":
+                    OBJECTS[key] = body
+                PUTS.append((key, self.headers.get("If-Match"), self.headers.get("x-amz-tagging"),
+                             int(code)))
+            return self._reply(int(code), b"InternalError" if code.startswith("5") else b"Refused")
         if_match, tagging = self.headers.get("If-Match"), self.headers.get("x-amz-tagging")
         with OBJECTS_LOCK:
             current = OBJECTS.get(key)
@@ -133,7 +161,7 @@ class MinioHandler(BaseHTTPRequestHandler):
                 else:
                     TAGS.pop(key, None)
             PUTS.append((key, if_match, tagging, status))
-        if self._cut("PUT", key):
+        if step == "cut" or self._cut("PUT", key):
             return self._reply_cut(status, b"")
         self._reply(status, b"" if status == 200 else b"PreconditionFailed")
 
@@ -255,6 +283,7 @@ class E2ETest(unittest.TestCase):
             AFTER_GET.clear()
             PUTS.clear()
             TRUNCATE.clear()
+            PLAN.clear()
         self.gate._acl_cache.clear()
         # pub artifact without ACL; private artifact with ACL (owner + bob's group); ACL for it
         OBJECTS["pub/free/index.html"] = b"<h1>free</h1>"
@@ -714,12 +743,155 @@ class E2ETest(unittest.TestCase):
         line = self._approval_with_a_cut_store_reply("GET?tagging")
         self.assertIn("acl tags unreadable: minio GET u/secret/.acl.json: IncompleteRead", line)
 
-    def test_cut_reply_on_the_acl_write_is_a_failed_grant(self):
-        # the store applied the write but its reply was cut: the next click finds the requester
-        # listed and finishes the approval without writing again
-        line = self._approval_with_a_cut_store_reply("PUT")
-        self.assertIn("put failed: minio PUT u/secret/.acl.json: IncompleteRead", line)
-        self.assertEqual([st for k, _im, _t, st in PUTS if k == "u/secret/.acl.json"], [200])
+    def test_cut_reply_on_an_applied_acl_write_is_confirmed_by_a_re_read(self):
+        # the store applied the write but its reply was cut: one fresh read finds the requester
+        # listed, so the first click already approves, with one write and one message
+        sent = self.record_notifications()
+        log = self.capture_log()
+        acl_key = "u/secret/.acl.json"
+        with OBJECTS_LOCK:
+            TAGS[acl_key] = {"ttl": "7"}
+            TRUNCATE[("PUT", acl_key)] = 1
+        rid, token = self._approve("sam@example.com")
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertIn("<title>Request approved</title>", page)
+        with OBJECTS_LOCK:
+            self.assertEqual(TRUNCATE[("PUT", acl_key)], 0)        # the cut reply was sent
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "approve")
+            self.assertEqual([s for k, _im, _t, s in PUTS if k == acl_key], [200])
+            self.assertEqual(json.loads(OBJECTS[acl_key])["users"].count("sam@example.com"), 1)
+            self.assertEqual(TAGS[acl_key], {"ttl": "7"})
+        self.assertEqual(len(sent), 1)
+        self.assertIn("approved", sent[0][1])
+        self.assertIn("acl_note=added (confirmed by a re-read after a lost reply)", log.getvalue())
+        self.assertNotIn("ACL write failed", log.getvalue())
+
+    # a write whose outcome is unknown (its reply lost, and the re-read does not show the
+    # requester) says so: never "Nothing was changed"; the same link finishes it, and Deny is
+    # not a way back
+    def _assert_unknown_outcome_page(self, page, reopened=True):
+        self.assertIn("<title>Access not confirmed</title>", page)
+        self.assertIn("may or may not have been updated", page)
+        self.assertIn("Deny does not remove access that was already added", page)
+        if reopened:
+            self.assertIn("Use the same link again", page)
+        self.assertNotIn("Nothing was changed", page)
+        self.assertNotIn("Request approved", page)
+
+    def test_lost_reply_on_a_write_the_store_did_not_apply_is_an_unknown_outcome(self):
+        sent = self.record_notifications()
+        log = self.capture_log()
+        acl_key = "u/secret/.acl.json"
+        with OBJECTS_LOCK:
+            PLAN[("PUT", acl_key)] = ["drop"]
+        rid, token = self._approve("uma@example.com")
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self._assert_unknown_outcome_page(page)
+        self.assertEqual(sent, [])
+        with OBJECTS_LOCK:
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+            self.assertNotIn("uma@example.com", json.loads(OBJECTS[acl_key])["users"])
+        lines = [ln for ln in log.getvalue().splitlines() if "ACL write failed" in ln]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("ACL write failed: put failed: minio PUT u/secret/.acl.json:", lines[0])
+        self.assertIn("; not listed on a re-read (requester=uma@example.com", lines[0])
+        self.assertIn("access list may or may not have been updated)", lines[0])
+        st, page, _ = self._post_action("approve", token)          # the store answers again
+        self.assertEqual(st, 200, page)
+        self.assertIn("uma@example.com", json.loads(OBJECTS[acl_key])["users"])
+        self.assertEqual(len(sent), 1)
+
+    def test_lost_reply_and_a_failed_re_read_is_an_unknown_outcome(self):
+        # the write was applied, its reply was cut, and the confirming read fails too: the
+        # requester already has access, so the page must not say nothing changed; a retry of
+        # the same link finds them listed and writes nothing more
+        sent = self.record_notifications()
+        log = self.capture_log()
+        acl_key = "u/secret/.acl.json"
+        with OBJECTS_LOCK:
+            PLAN[("PUT", acl_key)] = ["cut"]
+            PLAN[("GET", acl_key)] = ["ok", "drop"]
+        rid, token = self._approve("vic@example.com")
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self._assert_unknown_outcome_page(page)
+        self.assertEqual(sent, [])
+        with OBJECTS_LOCK:
+            self.assertIn("vic@example.com", json.loads(OBJECTS[acl_key])["users"])
+            self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+        self.assertIn("; the confirming read failed too: minio GET u/secret/.acl.json:",
+                      log.getvalue())
+        self.assertIn("access list may or may not have been updated)", log.getvalue())
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        with OBJECTS_LOCK:
+            self.assertEqual([s for k, _im, _t, s in PUTS if k == acl_key], [200])   # one write
+            self.assertEqual(json.loads(OBJECTS[acl_key])["users"].count("vic@example.com"), 1)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("acl_note=already listed", log.getvalue())
+
+    def test_store_5xx_on_the_acl_write_is_an_unknown_outcome(self):
+        # a store may fail after applying the write: a 5xx gets the confirming re-read and,
+        # unless it shows the requester listed, the unknown-outcome page, never "Nothing was
+        # changed"; the same link finishes it. A 4xx (403) is still a known refusal.
+        acl_key = "u/secret/.acl.json"
+        sent = self.record_notifications()
+        log = self.capture_log()
+        for code in ("500", "503"):
+            rid, token = self._approve(f"yan{code}@example.com")
+            with OBJECTS_LOCK:
+                PLAN[("PUT", acl_key)] = [code]                       # not applied
+            st, page, _ = self._post_action("approve", token)
+            self.assertEqual(st, 503, page)
+            self._assert_unknown_outcome_page(page)
+            self.assertIn(f"ACL write failed: put HTTP {code}; not listed on a re-read", log.getvalue())
+            with OBJECTS_LOCK:
+                self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
+            self.assertEqual(sent, [])
+            st, page, _ = self._post_action("approve", token)         # the same link finishes it
+            self.assertEqual(st, 200, page)
+            self.assertIn(f"yan{code}@example.com", json.loads(OBJECTS[acl_key])["users"])
+            sent.clear()
+        # applied, then a 503: the re-read lists the requester, so the first click approves
+        rid, token = self._approve("zed@example.com")
+        with OBJECTS_LOCK:
+            PLAN[("PUT", acl_key)] = ["applied 503"]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 200, page)
+        self.assertIn("<title>Request approved</title>", page)
+        self.assertIn("acl_note=added (confirmed by a re-read after HTTP 503)", log.getvalue())
+        self.assertEqual(len(sent), 1)
+        # a 403 is a known refusal: "Access not granted", "Nothing was changed"
+        rid, token = self._approve("ann@example.com")
+        with OBJECTS_LOCK:
+            PLAN[("PUT", acl_key)] = ["403"]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("<title>Access not granted</title>", page)
+        self.assertIn("Nothing was changed", page)
+        self.assertNotIn("may or may not", page)
+
+    def test_only_a_known_refusal_says_nothing_was_changed(self):
+        # a write refused with a status code changed nothing and says so; a lost reply never does
+        acl_key = "u/secret/.acl.json"
+        self.record_notifications()
+        _rid, token = self._approve("walt@example.com")
+        with OBJECTS_LOCK:
+            AFTER_GET[acl_key] = [self.other_writer_adds("o1@example.com"),
+                                  self.other_writer_adds("o2@example.com")]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("<title>Access not granted</title>", page)
+        self.assertIn("Nothing was changed", page)
+        self.assertNotIn("may or may not", page)
+        _rid, token = self._approve("xena@example.com")
+        with OBJECTS_LOCK:
+            PLAN[("PUT", acl_key)] = ["drop"]
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self._assert_unknown_outcome_page(page)
 
     def test_unexpected_exception_in_the_grant_is_a_failed_grant(self):
         sent = self.record_notifications()
@@ -729,7 +901,7 @@ class E2ETest(unittest.TestCase):
         with mock.patch.object(self.gate, "grant_access", side_effect=RuntimeError(secretish)):
             st, page, _ = self._post_action("approve", token)
         self.assertEqual(st, 503, page)
-        self.assertIn("Access not granted", page)
+        self._assert_unknown_outcome_page(page)       # raised anywhere: maybe after the write
         self.assertEqual(sent, [])
         with OBJECTS_LOCK:
             self.assertEqual(json.loads(OBJECTS[f"_gate/req/{rid}.json"])["status"], "pending")
@@ -838,6 +1010,51 @@ class E2ETest(unittest.TestCase):
             self.assertIn("not inside a published artifact", body)
         with OBJECTS_LOCK:
             self.assertEqual([k for k in OBJECTS if k.startswith("_gate/req/")], [])
+        self.assertEqual(sent, [])
+
+    def test_pub_takes_no_access_request(self):
+        # pub/ is anonymous-readable by design: a signed-in visitor denied a pub/ key (missing,
+        # or a stray ACL that does not list them) gets the same page with no request form; the
+        # request POST is refused on its path, and an approval of an older pending pub/ request
+        # writes nothing
+        sent = self.record_notifications()
+        USERS["hank"] = ("hank@example.com", "aaaa")
+        acl = json.dumps({"owner": "owner@example.com", "users": ["alice@example.com"]}).encode()
+        with OBJECTS_LOCK:
+            OBJECTS["pub/closed/index.html"] = b"x"
+            OBJECTS["pub/closed/.acl.json"] = acl
+        pages = []
+        for uri in ("/artifacts/pub/closed/index.html", "/artifacts/pub/free/ghost.html"):
+            st, body, _ = self.auth(uri, "hank")
+            self.assertEqual(st, 403, uri)
+            self.assertIn("Access required", body, uri)
+            self.assertIn("cannot be requested", body, uri)
+            self.assertNotIn("Request access", body, uri)
+            self.assertNotIn("name=csrf", body, uri)
+            pages.append(body.replace(uri, "<uri>"))
+        self.assertEqual(pages[0], pages[1])                 # missing and closed: one page
+        for path in ("/artifacts/pub/closed/index.html", "/artifacts/pub/free/index.html"):
+            csrf = self.gate.make_csrf("hank@example.com", path, self.gate._KEY, int(time.time()))
+            st, body, _ = http(self.base + "/_gate/request", method="POST",
+                               data=urllib.parse.urlencode({"csrf": csrf, "artifact": path}),
+                               headers={"Content-Type": "application/x-www-form-urlencoded"},
+                               cookie="sid=hank")
+            self.assertEqual(st, 400, path)
+            self.assertIn("cannot be requested", body)
+        with OBJECTS_LOCK:
+            self.assertEqual([k for k in OBJECTS if k.startswith("_gate/req/")], [])
+        self.assertEqual(sent, [])
+        # a pub/ request recorded before this rule: the approval is refused, nothing written
+        rid = self.gate.REQUESTS.create("hank@example.com", "/artifacts/pub/closed/index.html",
+                                        "owner@example.com", 1_800_000_000)
+        token = self.gate.make_action_token(rid, "approve", self.gate._KEY, int(time.time()))
+        st, page, _ = self._post_action("approve", token)
+        self.assertEqual(st, 503, page)
+        self.assertIn("Access not granted", page)
+        self.assertIn("Nothing was changed", page)
+        with OBJECTS_LOCK:
+            self.assertEqual(OBJECTS["pub/closed/.acl.json"], acl)
+            self.assertEqual([k for k, *_x in PUTS if k.endswith(".acl.json")], [])
         self.assertEqual(sent, [])
 
     def test_request_access_missing_artifact_uniform_response_no_state(self):
@@ -1093,6 +1310,26 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertFalse(ans["allowed"])
         self.assertEqual(ans["reason"], "unauthenticated")
+
+    def test_plugin_authz_anonymous_never_allows_a_key_the_edge_refuses(self):
+        # existing objects whose literal keys carry a character the anonymous edge refuses: the
+        # plugin's anonymous answer is `unauthenticated`, like /_gate/pub-auth's refusal
+        with OBJECTS_LOCK:
+            OBJECTS["pub/a;b/x.html"] = b"x"
+            OBJECTS["pub/%2e%2e/x.html"] = b"x"
+            OBJECTS["pub/50%off.html"] = b"x"
+        st, ans = self.plugin_authz("/artifacts/pub/free/index.html", flag=True)    # control
+        self.assertEqual((st, ans["allowed"], ans["reason"]),
+                         (200, True, "pub: anonymous (anonymous-pub enabled)"))
+        for art in ("/artifacts/pub/a;b/x.html", "/artifacts/pub/a%3Bb/x.html",
+                    "/artifacts/pub/%252e%252e/x.html", "/artifacts/pub/50%25off.html"):
+            st, ans = self.plugin_authz(art, flag=True)
+            self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "unauthenticated"),
+                             art)
+            self.assertEqual(self.pub_auth(art)[0], 404, art)          # the edge agrees
+        # a signed-in caller is decided as before (decide(), literal key)
+        st, ans = self.plugin_authz("/artifacts/pub/a;b/x.html", sid="alice")
+        self.assertEqual((st, ans["allowed"]), (200, True))
 
     def test_plugin_authz_pub_signed_in_allowed(self):
         st, ans = self.plugin_authz("/artifacts/pub/free/index.html", sid="alice")
@@ -1438,6 +1675,170 @@ class E2ETest(unittest.TestCase):
             self.assertIn("Nothing here", body)
             st, _ = self.plugin_authz("/artifacts/u/secret/sub/.acl.json", sid=sid)
             self.assertEqual(st, 400, sid)
+
+    def test_stray_pub_root_acl_closes_every_depth(self):
+        # a stray ACL at a pub root (no publisher writes one) narrows the whole run for signed-in
+        # visitors and closes it to anonymous ones, at every depth; a deeper one is never read
+        USERS["carol"] = ("carol@example.com", "aaaa")
+        with OBJECTS_LOCK:
+            OBJECTS["pub/free/sub/x.html"] = b"x"
+            OBJECTS["pub/free/.acl.json"] = json.dumps(
+                {"owner": "owner@example.com", "users": ["alice@example.com"]}).encode()
+            OBJECTS["pub/free/sub/.acl.json"] = json.dumps(
+                {"owner": "carol@example.com", "users": ["carol@example.com"]}).encode()
+        for uri in ("/artifacts/pub/free/index.html", "/artifacts/pub/free/sub/x.html"):
+            st, _, h = self._auth_h(uri, "carol")
+            self.assertEqual(st, 403, uri)
+            self.assertNotIn("Authorization", h, uri)
+            st, _, h = self._auth_h(uri, "alice")
+            self.assertEqual(st, 200, uri)
+            self.assertIn("Authorization", h, uri)
+            _, ans = self.plugin_authz(uri, flag=True)                      # anonymous
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), uri)
+            _, ans = self.plugin_authz(uri, sid="carol")
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), uri)
+
+    # -- the anonymous pub/ decision: GET /_gate/pub-auth (decision listener) ------------
+    def pub_auth(self, uri, method="GET", headers=None, cookie=None, flag=True, port=None):
+        saved = self.gate.ANONYMOUS_PUB_ENABLED
+        self.gate.ANONYMOUS_PUB_ENABLED = flag
+        self.addCleanup(setattr, self.gate, "ANONYMOUS_PUB_ENABLED", saved)
+        base = self.auth_base if port is None else f"http://127.0.0.1:{port}"
+        h = {"X-Forwarded-Method": method, "X-Forwarded-Uri": uri,
+             "X-Forwarded-Host": "artifacts.test.invalid"}
+        h.update(headers or {})
+        return http(base + "/_gate/pub-auth", headers=h, cookie=cookie)
+
+    @staticmethod
+    def _shape(st, body, h):
+        # status, headers and body of an answer, Date aside (it moves with the clock)
+        return st, body, tuple(sorted((k.lower(), v) for k, v in h.items() if k.lower() != "date"))
+
+    def test_pub_auth_allows_an_existing_pub_key_without_acl_and_signs_it(self):
+        uri = "/artifacts/pub/free/index.html"
+        for method in ("GET", "HEAD"):
+            st, body, h = self.pub_auth(uri, method)          # no cookie: anonymous
+            self.assertEqual((st, body), (200, "ok"), method)
+            want = self.gate.upstream_auth_headers(method, "artifacts.test.invalid", uri,
+                                                   "reader", "reader-secret",
+                                                   amzdate=h["X-Amz-Date"])
+            self.assertEqual(h["Authorization"], want["Authorization"], method)
+            self.assertIn("Credential=reader/", h["Authorization"])
+        # a single-file pub artifact (the MCP's layout) too
+        with OBJECTS_LOCK:
+            OBJECTS["pub/mcp-report-0123abcd.html"] = b"<h1>mcp</h1>"
+        self.assertEqual(self.pub_auth("/artifacts/pub/mcp-report-0123abcd.html")[0], 200)
+        # /_gate/auth stays the signed-in decision: never 200 without a session
+        saved = self.gate.ANONYMOUS_PUB_ENABLED
+        self.gate.ANONYMOUS_PUB_ENABLED = True
+        self.addCleanup(setattr, self.gate, "ANONYMOUS_PUB_ENABLED", saved)
+        for method in ("GET", "HEAD"):
+            st, _, h = self.auth(uri, None, method=method)
+            self.assertEqual(st, 401, method)
+            self.assertNotIn("Authorization", h)
+
+    def test_pub_auth_one_uniform_answer_for_everything_it_refuses(self):
+        # one answer: the same status, headers and body for a missing key, a key whose pub root
+        # has an ACL, a listing, an .acl.json, _gate/, _mcp/, a malformed path, a query, a write
+        # and a client S3 header; GET and HEAD alike; no login redirect, nothing from the store
+        self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html")[0], 200)   # control
+        with OBJECTS_LOCK:
+            OBJECTS["pub/closed/index.html"] = b"x"
+            OBJECTS["pub/closed/.acl.json"] = json.dumps(
+                {"owner": "owner@example.com", "users": ["alice@example.com"]}).encode()
+        cases = [("/artifacts/pub/free/ghost.html", {}), ("/artifacts/pub/closed/index.html", {}),
+                 ("/artifacts/pub/free/", {}), ("/artifacts/pub/free/.acl.json", {}),
+                 ("/artifacts/pub/closed/.acl.json", {}), ("/artifacts/_gate/req/x.json", {}),
+                 ("/artifacts/_mcp/x.json", {}), ("/artifacts/pub/free/index.html#x", {}),
+                 ("/artifacts/pub/free/index.html?x=1", {}), ("//evil/artifacts/pub/free/x", {}),
+                 ("/artifacts/u/secret/report.html", {}),
+                 ("/artifacts/pub/free/index.html", {"X-Amz-Checksum-Mode": "ENABLED"})]
+        shapes = set()
+        for uri, extra in cases:
+            for method in ("GET", "HEAD"):
+                st, body, h = self.pub_auth(uri, method, headers=extra)
+                self.assertEqual(st, 404, (uri, method))
+                self.assertNotIn("Location", h)
+                self.assertNotIn("Authorization", h)
+                self.assertTrue(h["Content-Type"].startswith("text/html"), uri)
+                self.assertNotIn("NoSuchKey", body)
+                self.assertNotIn("<?xml", body)
+                shapes.add(self._shape(st, body, h))
+        for method in ("PUT", "DELETE", "POST"):
+            shapes.add(self._shape(*self.pub_auth("/artifacts/pub/free/index.html", method)))
+        self.assertEqual(len(shapes), 1, shapes)
+
+    def test_pub_auth_never_lets_a_c29_spelling_through(self):
+        # canaries in u/, g/, acl/ and _gate/ without an ACL; each probe spelling is refused
+        # before the store is read, and never carries a signature
+        self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html")[0], 200)   # control
+        with OBJECTS_LOCK:
+            for k in ("u/canary/c.html", "g/team-a/canary/c.html", "acl/canary.html",
+                      "_gate/canary.json"):
+                OBJECTS[k] = b"CANARY"
+        for t in ("u/canary/c.html", "g/team-a/canary/c.html", "acl/canary.html",
+                  "_gate/canary.json"):
+            for s in ("pub/../{}", "pub/%2e%2e/{}", "pub/%252e%252e/{}", "pub//../{}",
+                      "pub/x;/../{}", "pub/free/..%2f..%2f{}", "pub/free/%5c..%5c{}"):
+                uri = "/artifacts/" + s.format(t)
+                st, body, h = self.pub_auth(uri)
+                self.assertEqual(st, 404, uri)
+                self.assertNotIn("CANARY", body)
+                self.assertNotIn("Authorization", h, uri)
+
+    def test_pub_auth_ignores_sessions_and_spoofed_targets(self):
+        # a session changes nothing (no identity is asked), and a forwarded URI aimed at u/ or
+        # g/ gets the uniform answer even from a visitor the ACL lists
+        self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html", cookie="sid=alice")[0],
+                         200)
+        with OBJECTS_LOCK:
+            OBJECTS["g/team-a/run1/index.html"] = b"g"
+            OBJECTS["pub/closed/index.html"] = b"x"
+            OBJECTS["pub/closed/.acl.json"] = json.dumps(
+                {"owner": "alice@example.com", "users": ["alice@example.com"]}).encode()
+        for uri in ("/artifacts/u/secret/report.html", "/artifacts/g/team-a/run1/index.html",
+                    "/artifacts/pub/closed/index.html"):
+            for cookie in (None, "sid=alice", "sid=owner"):
+                st, body, h = self.pub_auth(uri, cookie=cookie)
+                self.assertEqual(st, 404, (uri, cookie))
+                self.assertNotIn("Authorization", h)
+                self.assertIn("Nothing here", body)
+
+    def test_pub_auth_only_on_the_decision_listener_and_only_when_enabled(self):
+        uri = "/artifacts/pub/free/index.html"
+        self.assertEqual(self.pub_auth(uri)[0], 200)                           # control
+        st, _, h = self.pub_auth(uri, port=self.port_of(self.gate_public))
+        self.assertEqual(st, 404)
+        self.assertNotIn("Authorization", h)
+        st, _, h = self.pub_auth(uri, flag=False)
+        self.assertEqual(st, 404)
+        self.assertNotIn("Authorization", h)
+
+    def test_pub_signed_in_reason_says_anonymous_read_by_design(self):
+        st, ans = self.plugin_authz("/artifacts/pub/free/index.html", sid="alice")
+        self.assertEqual((st, ans["allowed"], ans["reason"]),
+                         (200, True, "pub: no ACL (anonymous read by design)"))
+
+    def test_null_acl_at_a_pub_root_fails_closed(self):
+        # a pub/ root ACL whose body is the JSON literal `null` is an unusable ACL, not "no ACL":
+        # the anonymous decision, the plugin's anonymous answer and the signed-in decision all
+        # refuse, as for any other malformed ACL
+        self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html")[0], 200)   # control
+        for body in (b"null", b" null "):
+            self.gate._acl_cache.clear()
+            with OBJECTS_LOCK:
+                OBJECTS["pub/free/.acl.json"] = body
+            st, page, h = self.pub_auth("/artifacts/pub/free/index.html")
+            self.assertEqual(st, 404, body)
+            self.assertIn("Nothing here", page)
+            self.assertNotIn("Authorization", h)
+            _, ans = self.plugin_authz("/artifacts/pub/free/index.html", flag=True)    # anonymous
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), body)
+            _, ans = self.plugin_authz("/artifacts/pub/free/index.html", sid="alice")
+            self.assertEqual((ans["allowed"], ans["reason"]), (False, "denied"), body)
+            st, _, h = self._auth_h("/artifacts/pub/free/index.html", "alice")       # signed in
+            self.assertEqual(st, 403, body)
+            self.assertNotIn("Authorization", h)
 
     def test_keys_without_artifact_root_denied(self):
         # an ACL where the old per-directory lookup would find one lets nobody in

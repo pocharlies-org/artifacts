@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.parse
 
 # gate.py reads env at import time (required vars); give it inert values first.
@@ -376,20 +377,32 @@ class RequestStoreTest(unittest.TestCase):
 class GrantAccessTest(unittest.TestCase):
     def test_appends_requester_once(self):
         acl = {"owner": "own@x.com", "users": ["a@x.com"]}
-        m = FakeMinio({"pub/x/.acl.json": json.dumps(acl).encode()})
-        ok, note = gate.grant_access(m, "/artifacts/pub/x/report.html", "New@X.com")
+        m = FakeMinio({"u/x/.acl.json": json.dumps(acl).encode()})
+        ok, note = gate.grant_access(m, "/artifacts/u/x/report.html", "New@X.com")
         self.assertTrue(ok, note)
-        saved = json.loads(m.objects["pub/x/.acl.json"])
+        saved = json.loads(m.objects["u/x/.acl.json"])
         self.assertEqual(saved["users"], ["a@x.com", "New@X.com"])
         # idempotent: same requester (case-insensitive) not duplicated
-        ok, _ = gate.grant_access(m, "/artifacts/pub/x/report.html", "new@x.com")
+        ok, _ = gate.grant_access(m, "/artifacts/u/x/report.html", "new@x.com")
         self.assertTrue(ok)
-        self.assertEqual(json.loads(m.objects["pub/x/.acl.json"])["users"], ["a@x.com", "New@X.com"])
+        self.assertEqual(json.loads(m.objects["u/x/.acl.json"])["users"], ["a@x.com", "New@X.com"])
 
     def test_missing_acl_refuses(self):
         m = FakeMinio()
-        ok, _ = gate.grant_access(m, "/artifacts/pub/x/report.html", "n@x.com")
+        ok, _ = gate.grant_access(m, "/artifacts/u/x/report.html", "n@x.com")
         self.assertFalse(ok)
+
+    def test_pub_takes_no_grant_whatever_acl_exists(self):
+        # pub/ is anonymous-readable by design: an approval never writes there, not even into
+        # a stray ACL at a pub root, and nothing is read first
+        acl = json.dumps({"owner": "own@x.com", "users": ["a@x.com"]}).encode()
+        m = FakeMinio({"pub/x/.acl.json": acl, "pub/.acl.json": acl})
+        for path in ("/artifacts/pub/x/report.html", "/artifacts/pub/x/a/b.css",
+                     "/artifacts/pub/flat.html"):
+            self.assertEqual(gate.grant_access(m, path, "new@x.com"),
+                             (False, "pub/ takes no access grants"), path)
+        self.assertEqual((m.gets, m.puts), ([], []))
+        self.assertEqual(m.objects["pub/x/.acl.json"], acl)
 
 
 class ConditionalGrantTest(unittest.TestCase):
@@ -427,6 +440,114 @@ class ConditionalGrantTest(unittest.TestCase):
     def setUp(self):
         gate._acl_cache.clear()
         self.addCleanup(gate._acl_cache.clear)
+
+    class LostReplyMinio(FakeMinio):
+        """The ACL write raises ConnectionError like a lost reply: after applying it
+        (applied=True) or without applying it; reads after the write can fail too."""
+
+        def __init__(self, *a, applied=True, reads_after_fail=False, **kw):
+            super().__init__(*a, **kw)
+            self.applied, self.reads_after_fail, self.written = applied, reads_after_fail, False
+
+        def put(self, key, data, ctype=None, if_match=None, tagging=None):
+            if key.endswith(".acl.json"):
+                if self.applied:
+                    super().put(key, data, ctype, if_match=if_match, tagging=tagging)
+                self.written = True
+                raise ConnectionError(f"minio PUT {key}: IncompleteRead")
+            return super().put(key, data, ctype, if_match=if_match, tagging=tagging)
+
+        def get(self, key):
+            if self.written and self.reads_after_fail:
+                raise ConnectionError(f"minio GET {key}: timed out")
+            return super().get(key)
+
+    def test_lost_reply_on_an_applied_write_is_confirmed_by_one_re_read(self):
+        m = self.LostReplyMinio({self.KEY: json.dumps(self.ACL).encode()},
+                                tags={self.KEY: {"ttl": "7"}})
+        self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"),
+                         (True, "added (confirmed by a re-read after a lost reply)"))
+        self.assertEqual(m.gets, [self.KEY, self.KEY])               # the read, then one re-read
+        self.assertEqual(json.loads(m.objects[self.KEY])["users"], ["a@x.com", "new@x.com"])
+        self.assertEqual(m.tags[self.KEY], {"ttl": "7"})
+
+    def test_lost_reply_not_applied_is_an_unknown_outcome(self):
+        m = self.LostReplyMinio({self.KEY: json.dumps(self.ACL).encode()}, applied=False)
+        ok, note = gate.grant_access(m, self.PATH, "new@x.com")
+        self.assertEqual((ok, note), (False, "put failed: minio PUT u/r/.acl.json: IncompleteRead"
+                                             "; not listed on a re-read"))
+        self.assertTrue(gate.grant_outcome_unknown(note))
+        self.assertEqual(m.gets, [self.KEY, self.KEY])
+
+    def test_lost_reply_and_a_failed_re_read_is_an_unknown_outcome(self):
+        m = self.LostReplyMinio({self.KEY: json.dumps(self.ACL).encode()}, reads_after_fail=True)
+        ok, note = gate.grant_access(m, self.PATH, "new@x.com")
+        self.assertEqual((ok, note), (False, "put failed: minio PUT u/r/.acl.json: IncompleteRead"
+                                             "; the confirming read failed too: minio GET "
+                                             "u/r/.acl.json: timed out"))
+        self.assertTrue(gate.grant_outcome_unknown(note))
+        self.assertIn("new@x.com", json.loads(m.objects[self.KEY])["users"])   # it was applied
+
+    class ServerErrorMinio(FakeMinio):
+        """The ACL write answers a 5xx, after applying it (applied=True) or without applying it;
+        reads after the write can fail too."""
+
+        def __init__(self, *a, status=500, applied=False, reads_after_fail=False, **kw):
+            super().__init__(*a, **kw)
+            self.status, self.applied = status, applied
+            self.reads_after_fail, self.written = reads_after_fail, False
+
+        def put(self, key, data, ctype=None, if_match=None, tagging=None):
+            if key.endswith(".acl.json"):
+                if self.applied:
+                    super().put(key, data, ctype, if_match=if_match, tagging=tagging)
+                self.written = True
+                self.put_calls.append((key, if_match, tagging, self.status))
+                return self.status
+            return super().put(key, data, ctype, if_match=if_match, tagging=tagging)
+
+        def get(self, key):
+            if self.written and self.reads_after_fail:
+                raise ConnectionError(f"minio GET {key}: timed out")
+            return super().get(key)
+
+    def test_store_5xx_on_the_write_is_an_unknown_outcome_with_a_re_read(self):
+        for status in (500, 503):
+            # not applied: the re-read does not list the requester, the outcome stays unknown
+            m = self.ServerErrorMinio({self.KEY: json.dumps(self.ACL).encode()}, status=status)
+            ok, note = gate.grant_access(m, self.PATH, "new@x.com")
+            self.assertEqual((ok, note), (False, f"put HTTP {status}; not listed on a re-read"))
+            self.assertTrue(gate.grant_outcome_unknown(note))
+            self.assertEqual(m.gets, [self.KEY, self.KEY])            # the read, then one re-read
+            self.assertEqual(len([c for c in m.put_calls if c[3] == status]), 1)   # no retry
+            # applied, then the 5xx: the re-read lists the requester, so the grant happened
+            m = self.ServerErrorMinio({self.KEY: json.dumps(self.ACL).encode()}, status=status,
+                                      applied=True, tags={self.KEY: {"ttl": "7"}})
+            self.assertEqual(gate.grant_access(m, self.PATH, "new@x.com"),
+                             (True, f"added (confirmed by a re-read after HTTP {status})"))
+            self.assertEqual(json.loads(m.objects[self.KEY])["users"], ["a@x.com", "new@x.com"])
+            # applied, and the re-read fails too: unknown, and the requester is in fact listed
+            m = self.ServerErrorMinio({self.KEY: json.dumps(self.ACL).encode()}, status=status,
+                                      applied=True, reads_after_fail=True)
+            ok, note = gate.grant_access(m, self.PATH, "new@x.com")
+            self.assertEqual((ok, note), (False, f"put HTTP {status}; the confirming read failed "
+                                                 f"too: minio GET u/r/.acl.json: timed out"))
+            self.assertTrue(gate.grant_outcome_unknown(note))
+
+    def test_which_failed_grants_may_have_changed_the_acl(self):
+        # unknown: a lost write reply (after the re-read), an exception raised inside the grant;
+        # known to have changed nothing: every refusal before the write and every status code
+        for note in ("put failed: minio PUT k: IncompleteRead; not listed on a re-read",
+                     "put failed: minio PUT k: timed out; the confirming read failed too: x",
+                     "unexpected RuntimeError", "put HTTP 500; not listed on a re-read",
+                     "put HTTP 503; the confirming read failed too: x", "put HTTP 500"):
+            self.assertTrue(gate.grant_outcome_unknown(note), note)
+        for note in ("put HTTP 412", "put HTTP 403", "put HTTP 400", "put HTTP 404",
+                     "put HTTP 409", "acl unreadable: missing",
+                     "acl unreadable: minio GET k: IncompleteRead", "acl tags unreadable: HTTP 403",
+                     "acl unreadable: users is not a list", "no artifact root", "bad artifact path",
+                     "pub/ takes no access grants", "", None):
+            self.assertFalse(gate.grant_outcome_unknown(note), note)
 
     def test_read_returns_acl_and_etag(self):
         m = FakeMinio({self.KEY: json.dumps(self.ACL).encode()})
@@ -1216,8 +1337,8 @@ class AclCacheBoundTest(unittest.TestCase):
 class AclRootTest(unittest.TestCase):
     """The ACL of an artifact lives at its root (u/<run>/, g/<slug>/<run>/) and governs every
     file of it at any depth. One helper (acl_key_for) derives it for read_acl, grant_access and
-    decide(); a key with no artifact root is denied whatever ACL objects exist; pub/ keeps the
-    ACL of the key's own directory."""
+    decide(); a key with no artifact root is denied whatever ACL objects exist; a pub/ key
+    answers to its pub root (pub/<run>/, or pub/ itself for a single file)."""
 
     ROOT_ACL = {"owner": "own@x.com", "users": ["alice@x.com"]}
 
@@ -1243,13 +1364,51 @@ class AclRootTest(unittest.TestCase):
                     ".acl.json", "U/r/x.html", "public/x.html", ""):
             self.assertIsNone(gate.acl_key_for(key), key)
 
-    def test_pub_keeps_its_own_directory(self):
-        self.assertEqual(gate.acl_key_for("pub/x.html"), "pub/.acl.json")
-        self.assertEqual(gate.acl_key_for("pub/run/index.html"), "pub/run/.acl.json")
-        self.assertEqual(gate.acl_key_for("pub/run/a/b.css"), "pub/run/a/.acl.json")
+    def test_pub_root_follows_how_pub_is_published(self):
+        # the CLI publishes pub/<run>/<file> (a run directory, like u/<run>/), the MCP publishes
+        # pub/<name>-<id>.<ext> (one file directly under the prefix)
+        cases = {
+            "pub/x.html": "pub/.acl.json",
+            "pub/mcp-report-0123abcd.html": "pub/.acl.json",
+            "pub/run/index.html": "pub/run/.acl.json",
+            "pub/run/a/b.css": "pub/run/.acl.json",
+            "pub/run/a/b/c/d.js": "pub/run/.acl.json",
+        }
+        for key, want in cases.items():
+            self.assertEqual(gate.acl_key_for(key), want, key)
         for key in ("pub/x.html", "pub/run/index.html", "pub/run/a/b/c.css"):
-            self.assertEqual(gate.decide("a@x.com", [], key, None, NOW),
-                             (True, "pub: any signed-in tenant user"), key)
+            self.assertTrue(gate.decide("a@x.com", [], key, None, NOW)[0], key)
+
+    def test_pub_keys_without_a_pub_root(self):
+        # an empty <run> or an empty path below it has no root, like u/ and g/
+        for key in ("pub/", "pub//x.html", "pub//", "pub/run/"):
+            self.assertIsNone(gate.acl_key_for(key), key)
+        # every pub prefix ends in "/": one that does not has no root (fails closed)
+        self.assertIsNone(gate.acl_key_for("pub/run/x.html", pub_prefixes=("pub",)))
+        self.assertIsNone(gate.acl_key_for("pubx.html", pub_prefixes=("pub",)))
+        # another prefix, several segments deep: the same two shapes below it
+        deep = ("public/reports/",)
+        self.assertEqual(gate.acl_key_for("public/reports/r1/a/b.html", pub_prefixes=deep),
+                         "public/reports/r1/.acl.json")
+        self.assertEqual(gate.acl_key_for("public/reports/one.html", pub_prefixes=deep),
+                         "public/reports/.acl.json")
+        self.assertIsNone(gate.acl_key_for("public/other/x.html", pub_prefixes=deep))
+
+    def test_stray_pub_root_acl_governs_every_depth(self):
+        # a stray pub/<run>/.acl.json (no publisher writes one) closes its whole run, at any
+        # depth, not only the files next to it; a deeper one is never read
+        stray = {"owner": "own@x.com", "users": ["alice@x.com"]}
+        m = FakeMinio({"pub/open/.acl.json": json.dumps(stray).encode(),
+                       "pub/open/sub/.acl.json": json.dumps({"owner": "carol@x.com"}).encode()})
+        for key in ("pub/open/index.html", "pub/open/sub/x.html", "pub/open/sub/deeper/y.css"):
+            acl, err = gate.read_acl(m, key, NOW, bypass_cache=True)
+            self.assertEqual((acl, err), (stray, None), key)
+            self.assertFalse(gate.decide("carol@x.com", [], key, acl, NOW)[0], key)
+            self.assertFalse(gate.decide("", [], key, acl, NOW)[0], key)          # anonymous
+            self.assertEqual(gate.decide("alice@x.com", [], key, acl, NOW), (True, "user"), key)
+        self.assertEqual(set(m.gets), {"pub/open/.acl.json"})
+        # a single-file pub artifact answers to pub/.acl.json only, never to a run's ACL
+        self.assertEqual(gate.read_acl(m, "pub/flat.html", NOW, bypass_cache=True), (None, None))
 
     def test_decide_denies_a_key_without_root_whatever_the_acl(self):
         permissive = {"owner": "a@x.com", "users": ["a@x.com"], "groups": ["g1"]}
@@ -1341,7 +1500,7 @@ class AclRootTest(unittest.TestCase):
         for path, want in (("/artifacts/u/r/index.html", "/artifacts/u/r/"),
                            ("/artifacts/u/r/a/b/c.css", "/artifacts/u/r/"),
                            ("/artifacts/g/team/r/a/b.js", "/artifacts/g/team/r/"),
-                           ("/artifacts/pub/run/a/x.html", "/artifacts/pub/run/a/"),
+                           ("/artifacts/pub/run/a/x.html", "/artifacts/pub/run/"),
                            ("/artifacts/u/x.html", None), ("/artifacts/acl/r.json", None),
                            ("/elsewhere/u/r/x.html", None)):
             self.assertEqual(gate.artifact_root_path(path), want, path)
@@ -1372,6 +1531,221 @@ class AclRootTest(unittest.TestCase):
         self.assertEqual(ans["artifact"], {"key": "u/x.html", "expires": None, "ttl": None})
         ans = gate.plugin_authz_decision("a@x.com", [], "u/r/a/b.js", acl, NOW, 200)
         self.assertEqual((ans["allowed"], ans["reason"]), (True, "owner"))
+
+
+class PubAuthDecisionTest(unittest.TestCase):
+    """The anonymous pub/ decision (GET /_gate/pub-auth): allowed only for an existing pub/
+    object whose pub root has no ACL; every other request is refused, before any store read
+    when its shape alone is refused (the refused-character list included)."""
+
+    ACL = {"owner": "own@x.com", "users": ["alice@x.com"]}
+
+    def setUp(self):
+        gate._acl_cache.clear()
+        self.addCleanup(gate._acl_cache.clear)
+        self.m = FakeMinio({"pub/run/index.html": b"<h1>run</h1>",
+                            "pub/run/assets/app.css": b"body{}",
+                            "pub/flat-0123abcd.html": b"<h1>flat</h1>",
+                            "pub/closed/index.html": b"x", "pub/closed/sub/y.html": b"y",
+                            "pub/closed/.acl.json": json.dumps(self.ACL).encode(),
+                            "u/canary/c.html": b"CANARY-U", "g/s/canary/c.html": b"CANARY-G",
+                            "acl/canary.html": b"CANARY-ACL", "_gate/canary.json": b"CANARY-GATE"})
+        self.heads = []
+        head = self.m.head
+
+        def counting_head(key):
+            self.heads.append(key)
+            return head(key)
+        self.m.head = counting_head
+
+    def d(self, uri, method="GET", headers=(), enabled=True):
+        return gate.pub_auth_decision(method, uri, self.m, NOW, header_names=headers,
+                                      enabled=enabled)
+
+    def test_existing_pub_object_without_acl_is_allowed(self):
+        for uri, key in (("/artifacts/pub/run/index.html", "pub/run/index.html"),
+                         ("/artifacts/pub/run/assets/app.css", "pub/run/assets/app.css"),
+                         ("/artifacts/pub/flat-0123abcd.html", "pub/flat-0123abcd.html")):
+            for method in ("GET", "HEAD"):
+                self.assertEqual(self.d(uri, method), (True, key, "pub: anonymous, no ACL"),
+                                 (uri, method))
+
+    def test_acl_at_the_pub_root_refuses_and_decide_still_evaluates_it(self):
+        # an ACL'd pub/ key is refused to anonymous callers with the one uniform answer (no
+        # signed-in fallback, which would tell a prober which keys exist behind an ACL); the
+        # signed-in decision stays decide() on /_gate/auth
+        for uri in ("/artifacts/pub/closed/index.html", "/artifacts/pub/closed/sub/y.html"):
+            allowed, _key, reason = self.d(uri)
+            self.assertEqual((allowed, reason), (False, "acl present"), uri)
+        acl, err = gate.read_acl(self.m, "pub/closed/sub/y.html", NOW)
+        self.assertEqual((acl, err), (self.ACL, None))
+        self.assertEqual(gate.decide("alice@x.com", [], "pub/closed/sub/y.html", acl, NOW),
+                         (True, "user"))
+        self.assertEqual(gate.decide("own@x.com", [], "pub/closed/index.html", acl, NOW),
+                         (True, "owner"))
+        self.assertFalse(gate.decide("carol@x.com", [], "pub/closed/index.html", acl, NOW)[0])
+
+    def test_missing_object_refused(self):
+        self.assertEqual(self.d("/artifacts/pub/run/ghost.html")[0::2], (False, "object missing"))
+        self.assertEqual(self.d("/artifacts/pub/ghost-run/x.html")[0::2], (False, "object missing"))
+
+    def test_never_served_shapes_refused_before_any_store_read(self):
+        for uri in ("/artifacts/pub/run/.acl.json", "/artifacts/pub/.acl.json",
+                    "/artifacts/pub/run/", "/artifacts/pub/", "/artifacts/pub",
+                    "/artifacts/_gate/canary.json", "/artifacts/_mcp/x.json",
+                    "/artifacts/_plugins/c/x.bin", "/artifacts/acl/canary.html",
+                    "/artifacts/u/canary/c.html", "/artifacts/g/s/canary/c.html",
+                    "/artifacts/", "/artifacts", "/elsewhere/pub/run/index.html", "/",
+                    "/_gate/pub-auth"):
+            for method in ("GET", "HEAD"):
+                self.assertFalse(self.d(uri, method)[0], (uri, method))
+        self.assertEqual((self.m.gets, self.heads), ([], []))
+
+    def test_c29_list_never_decided(self):
+        # the security probe list, with canaries in u/, g/, acl/ and _gate/, plus the other
+        # refused characters; none reaches the store
+        targets = ("u/canary/c.html", "g/s/canary/c.html", "acl/canary.html", "_gate/canary.json")
+        spellings = ("pub/../{}", "pub/%2e%2e/{}", "pub/%2E%2E/{}", "pub/%252e%252e/{}",
+                     "pub//../{}", "pub/x;/../{}", "pub/run/..%2f..%2f{}", "pub/run%2f..%2f..%2f{}",
+                     "pub/%2e%2e%2f{}", "pub/run/%5c..%5c{}", "pub/.%2e/{}")
+        for t in targets:
+            for s in spellings:
+                uri = "/artifacts/" + s.format(t)
+                self.assertFalse(self.d(uri)[0], uri)
+        for raw in ("pub/run/a%00b.html", "pub/run/a%0ab.html", "pub/run/a%0db.html",
+                    "pub/run/a%09b.html", "pub/run/a%7fb.html", "pub/run/a%c2%85b.html",
+                    "pub/run/a%5cb.html", "pub/run/a%3bb.html", "pub/run/a%23b.html",
+                    "pub/run/a%3fb.html", "pub/run/a%25b.html", "pub/run/a..b.html",
+                    "pub/run//index.html", "pub//run/index.html", "pub/run/%ff.html",
+                    "pub/run/index.html#x", "pub/run/index.html?x=1", "pub/run/index.html?",
+                    "pub/run/in dex.html"):
+            self.assertFalse(self.d("/artifacts/" + raw)[0], raw)
+        self.assertEqual((self.m.gets, self.heads), ([], []))
+
+    def test_spoofed_forwarded_uri_aimed_at_u_or_g_refused(self):
+        # u/ and g/ objects without an ACL: the anonymous endpoint never decides them
+        for uri in ("/artifacts/u/canary/c.html", "/artifacts/g/s/canary/c.html",
+                    "/artifacts/u/canary/../../pub/run/index.html"):
+            self.assertFalse(self.d(uri)[0], uri)
+        self.assertEqual((self.m.gets, self.heads), ([], []))
+
+    def test_writes_client_s3_headers_and_disabled_refused(self):
+        uri = "/artifacts/pub/run/index.html"
+        self.assertTrue(self.d(uri)[0])                                     # control
+        for method in ("PUT", "POST", "DELETE", "PATCH", "OPTIONS", "get", ""):
+            self.assertEqual(self.d(uri, method)[0::2], (False, "method"), method)
+        for h in ("X-Amz-Checksum-Mode", "x-amz-server-side-encryption-customer-algorithm",
+                  "X-Minio-Extract"):
+            self.assertEqual(self.d(uri, headers=["Host", h])[0::2], (False, "client S3 header"), h)
+        self.assertEqual(self.d(uri, enabled=False)[0::2], (False, "anonymous pub/ disabled"))
+        with mock.patch.object(gate, "ANONYMOUS_PUB_ENABLED", False):
+            self.assertFalse(gate.pub_auth_decision("GET", uri, self.m, NOW)[0])
+        with mock.patch.object(gate, "ANONYMOUS_PUB_ENABLED", True):
+            self.assertTrue(gate.pub_auth_decision("GET", uri, self.m, NOW)[0])
+
+    def test_store_failures_fail_closed(self):
+        uri = "/artifacts/pub/run/index.html"
+
+        class Down(FakeMinio):
+            def get(self, key):
+                raise ConnectionError("minio GET x: timed out")
+
+        class Denied(FakeMinio):
+            def get(self, key):
+                return 403, b""
+
+        class HeadDown(FakeMinio):
+            def head(self, key):
+                raise ConnectionError("minio HEAD x: timed out")
+        for cls in (Down, Denied, HeadDown):
+            gate._acl_cache.clear()
+            m = cls({"pub/run/index.html": b"x"})
+            self.assertFalse(gate.pub_auth_decision("GET", uri, m, NOW, enabled=True)[0], cls)
+        gate._acl_cache.clear()
+        m = FakeMinio({"pub/run/index.html": b"x", "pub/run/.acl.json": b"not json"})
+        self.assertEqual(gate.pub_auth_decision("GET", uri, m, NOW, enabled=True)[0::2],
+                         (False, "acl unreadable (malformed JSON)"))
+
+    def test_what_traefik_forwards_is_what_is_decided(self):
+        # the Traefik model of tests/check_oauth2_routes.py gives the path a pub/ read is
+        # forwarded with (X-Forwarded-Uri, trustForwardHeader false) and the path MinIO then
+        # receives: they are one path, so the gate decides the key the store serves. Probe
+        # spellings that Traefik keeps under pub/ are refused or decided as that same key.
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import check_oauth2_routes as routing
+        served = {"/artifacts/pub/run/index.html": "pub/run/index.html",
+                  "/artifacts/pub/%72un/index.html": "pub/run/index.html",
+                  "/artifacts/pub/run/./index.html": "pub/run/index.html",
+                  "/artifacts/pub/x/../run/index.html": "pub/run/index.html"}
+        refused = ["/artifacts/pub/%252e%252e/u/canary/c.html", "/artifacts/pub/x;/../u/canary/c.html",
+                   "/artifacts/pub/x%2f..%2f..%2fu/canary/c.html", "/artifacts/pub/%5c..%5cu/canary/c.html",
+                   "/artifacts/pub/run/index.html%00", "/artifacts/pub/run/index.html%3b",
+                   "/artifacts/pub/run/index.html%23", "/artifacts/pub/run/index.html%3F"]
+        for target, key in served.items():
+            rpath, upstream = routing.traefik(target)
+            self.assertTrue(rpath.startswith("/artifacts/pub/"), target)
+            self.assertEqual(self.d(upstream), (True, key, "pub: anonymous, no ACL"), target)
+        for target in refused:
+            res = routing.traefik(target)
+            if res is None:
+                continue                                  # Traefik answers 400 itself
+            rpath, upstream = res
+            if not rpath.startswith("/artifacts/pub/"):
+                continue                                  # not on the anonymous rule
+            self.assertFalse(self.d(upstream)[0], (target, upstream))
+
+    def test_null_acl_at_the_pub_root_is_refused(self):
+        # an ACL object whose JSON is `null` exists: it is unusable (malformed), never "no ACL"
+        for body in (b"null", b" null ", b"null\n", b"\tnull"):
+            gate._acl_cache.clear()
+            m = FakeMinio({"pub/n/index.html": b"x", "pub/n/.acl.json": body,
+                           "u/n/index.html": b"x", "u/n/.acl.json": body})
+            for key in ("pub/n/index.html", "u/n/index.html"):
+                self.assertEqual(gate.read_acl(m, key, NOW, bypass_cache=True),
+                                 (None, gate.ACL_MALFORMED), (body, key))
+            self.assertEqual(gate.pub_auth_decision("GET", "/artifacts/pub/n/index.html", m, NOW,
+                                                    enabled=True)[0::2],
+                             (False, "acl unreadable (malformed JSON)"), body)
+        # control: the same root without an ACL object is open
+        gate._acl_cache.clear()
+        m = FakeMinio({"pub/n/index.html": b"x"})
+        self.assertTrue(gate.pub_auth_decision("GET", "/artifacts/pub/n/index.html", m, NOW,
+                                               enabled=True)[0])
+
+    def test_pub_key_refused_characters(self):
+        for key in ("pub/a..b", "pub/a//b", "pub/a\\b", "pub/a;b", "pub/a%b", "pub/a#b",
+                    "pub/a?b", "pub/a\x00b", "pub/a\x1fb", "pub/a\x7fb", "pub/a\x85b",
+                    "pub/a\x9fb"):
+            self.assertTrue(gate.pub_key_refused(key), repr(key))
+        for key in ("pub/run/index.html", "pub/a.b-c_d=e/f.css", "pub/café.html",
+                    "pub/a b.html", "pub/.hidden"):
+            self.assertFalse(gate.pub_key_refused(key), repr(key))
+
+
+class BadKeyEmptySegmentTest(unittest.TestCase):
+    """Every route refuses a key with an empty segment or a NUL: the store refuses both, so
+    the gate never decides them under a root."""
+
+    def test_empty_segment_and_nul(self):
+        for key in ("u/r//x.html", "u//r/x.html", "/u/r/x.html", "pub//x.html", "pub/run//x",
+                    "g/s/r//a.css", "u/r/a\x00b.html", "pub/x\x00"):
+            self.assertTrue(gate._bad_key(key), repr(key))
+        for key in ("u/r/x.html", "pub/x.html", "g/s/r/a/b.css"):
+            self.assertFalse(gate._bad_key(key), key)
+
+
+class PubReasonTest(unittest.TestCase):
+    """decide()'s reason and the module docstring say pub/ is anonymous read by design."""
+
+    def test_reason_and_docstring(self):
+        self.assertEqual(gate.decide("a@x.com", [], "pub/run/x.html", None, NOW),
+                         (True, "pub: no ACL (anonymous read by design)"))
+        self.assertEqual(gate.PUB_OPEN_REASON, "pub: no ACL (anonymous read by design)")
+        doc = gate.__doc__
+        self.assertNotIn("any signed-in user of the tenant", doc)
+        self.assertIn("`pub/` is anonymous read by design", doc)
+        self.assertIn("/_gate/pub-auth", doc)
+        self.assertIn("never answers 200 without a valid session", doc)
 
 
 class RefusedIdentityTest(unittest.TestCase):
