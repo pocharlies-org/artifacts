@@ -917,6 +917,38 @@ class E2ETest(unittest.TestCase):
         self.assertIn("reason=denied detail=no-acl: deny by default", lines[0])
         self.assertIn("reason=denied detail=not-listed", lines[1])
 
+    def test_malformed_acl_is_the_uniform_deny_for_a_stranger(self):
+        # an ACL file that is not JSON must not tell a stranger "this artifact has a broken ACL"
+        USERS["rita"] = ("rita@example.com", "99999999-2222-4333-8444-555555555555")
+        uri = "/artifacts/u/secret/report.html"
+        _, listed_not_me = self.plugin_authz(uri, sid="rita")
+        st, page_valid, _ = self.auth(uri, "rita")
+        self.assertEqual(st, 403)
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/.acl.json"] = b'{"owner": "owner@example.com", "users": [broken'
+        self.gate._acl_cache.clear()
+        log = self.capture_log()
+        st, broken = self.plugin_authz(uri, sid="rita")
+        self.assertEqual(st, 200)
+        self.assertEqual(broken, listed_not_me)
+        self.assertEqual((broken["allowed"], broken["reason"]), (False, "denied"))
+        self.assertIn("detail=acl-error (malformed JSON)", log.getvalue())
+        # nobody is let in by an ACL that cannot be read, the owner included: same answer shape
+        _, owner = self.plugin_authz(uri, sid="owner")
+        self.assertEqual((owner["allowed"], owner["reason"]), (False, "denied"))
+        # forwardAuth already answered it with the same deny page as any other refusal
+        st, page_broken, h = self.auth(uri, "rita")
+        self.assertEqual(st, 403)
+        self.assertNotIn("Authorization", h)
+        strip = lambda p: re.sub(r'name=csrf value="[^"]+"', "", p)
+        self.assertEqual(strip(page_broken), strip(page_valid))
+
+    def test_plugin_authz_store_outage_is_still_acl_error(self):
+        # unreadable store (the same for every key): reported as acl-error, fail closed
+        with mock.patch.object(self.gate.MINIO, "get", side_effect=ConnectionError("down")):
+            st, ans = self.plugin_authz("/artifacts/u/secret/report.html", sid="alice")
+        self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "acl-error"))
+
     def test_plugin_authz_deny_expired(self):
         OBJECTS["u/secret/.acl.json"] = json.dumps(
             {"owner": "owner@example.com", "users": ["alice@example.com"],

@@ -1261,7 +1261,18 @@ class GateHandler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps(ans), "application/json")
             email, groups = "", []
         acl, err = read_acl(MINIO, key, now=int(time.time()))
+        malformed = err == ACL_MALFORMED
+        if malformed:
+            # The ACL object exists but is not JSON. Decided like any other unusable ACL
+            # (decide() -> bad-acl: nobody is allowed), so a stranger gets the uniform `denied`
+            # and cannot tell a broken ACL file from one that does not list them. The cause
+            # goes to the log only.
+            LOG.error("plugin-authz acl-error key=%s err=%s — decided as an unusable ACL (deny)",
+                      key, err)
+            acl, err = ACL_MALFORMED, None
         if err:
+            # the store could not be read (an outage): the same for every key, so it reveals
+            # nothing about one artifact
             LOG.error("plugin-authz acl read failed for %s: %s — denying (fail closed)", key, err)
             ans = {"allowed": False, "reason": "acl-error",
                    "user": {"id": email or None,
@@ -1281,6 +1292,8 @@ class GateHandler(BaseHTTPRequestHandler):
         ans, detail = plugin_authz_decision_detail(
             email, groups, key, acl, int(time.time()), head_status, tags, last_modified,
             name=getattr(self, "_display_name", None) if email else None)
+        if malformed:
+            detail = f"acl-error ({ACL_MALFORMED})"
         LOG.info("plugin-authz user=%s key=%s allowed=%s reason=%s detail=%s",
                  email or "-", key, ans["allowed"], ans["reason"], detail)
         return self._send(200, json.dumps(ans), "application/json")
@@ -1549,6 +1562,11 @@ def _acl_cache_put(acl_key, entry, now):
             _acl_cache.popitem(last=False)
 
 
+# read_acl's error for an ACL object that exists but is not valid JSON (an operator error):
+# forwardAuth and plugin authz answer it like any other deny, never with a distinct reason.
+ACL_MALFORMED = "malformed JSON"
+
+
 def read_acl(minio, key, now, bypass_cache=False):
     """Return (acl|None, error|None) for the ACL that governs `key` (acl_key_for). acl=None
     means that object does not exist, or the key has no ACL at all (no artifact root): then
@@ -1568,7 +1586,7 @@ def read_acl(minio, key, now, bypass_cache=False):
             try:
                 acl = json.loads(body)
             except ValueError:
-                err = "malformed JSON"
+                err = ACL_MALFORMED
         elif status != 404:
             err = f"HTTP {status}"
     except ConnectionError as e:
@@ -1611,7 +1629,7 @@ def read_acl_for_write(minio, acl_key):
     try:
         acl = json.loads(body)
     except ValueError:
-        return None, None, "malformed JSON"
+        return None, None, ACL_MALFORMED
     if not isinstance(acl, dict):
         return None, None, "not a JSON object"
     if not etag:
