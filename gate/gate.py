@@ -1266,6 +1266,36 @@ class GateHandler(BaseHTTPRequestHandler):
         return self._send(status, self._page(HTTPStatus(status).phrase,
                                              f"<p>{html.escape(text)}</p>"))
 
+    def send_error(self, code, message=None, explain=None):
+        """The answers the HTTP layer writes itself (an unsupported method, a malformed request
+        line or header, a request line or header block too long) carry the same headers as
+        every gate page: no framing, no caching, no Python version. (http.server answers a
+        request line whose version it cannot read the HTTP/0.9 way, without any header.)
+        The status line keeps the standard reason phrase; the detail (which can echo the
+        client's request line) is escaped into the page only. The connection is closed."""
+        try:
+            phrase, long_text = self.responses[code]
+        except KeyError:
+            phrase, long_text = "Error", ""
+        message = phrase if message is None else message
+        explain = long_text if explain is None else explain
+        self.log_error("code %d, message %s", code, message)
+        self.send_response(code)
+        self.send_header("Connection", "close")
+        body = b""
+        if code >= 200 and code not in (HTTPStatus.NO_CONTENT, HTTPStatus.RESET_CONTENT,
+                                        HTTPStatus.NOT_MODIFIED):
+            body = self._page(phrase, f"<p>{html.escape(message)}</p>"
+                                      f"<p class=muted>{html.escape(explain)}</p>").encode()
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", PAGE_CSP)
+        self.send_header("X-Frame-Options", "DENY")
+        self.end_headers()
+        if self.command != "HEAD" and body:
+            self.wfile.write(body)
+
     def _body_framing(self):
         """How the request delimits its body: ("transfer-encoding", None) for any
         Transfer-Encoding, ("none", 0) without Content-Length, ("invalid", None) for a repeated
@@ -1275,9 +1305,11 @@ class GateHandler(BaseHTTPRequestHandler):
         values = self.headers.get_all("Content-Length")
         if not values:
             return "none", 0
-        if len(values) != 1 or not _CONTENT_LENGTH_RE.fullmatch(values[0].strip()):
+        # only space and tab around the digits (RFC 9110 OWS): str.strip() would also take
+        # Unicode whitespace such as NBSP, which no HTTP parser in front of the gate accepts
+        if len(values) != 1 or not _CONTENT_LENGTH_RE.fullmatch(values[0].strip(" \t")):
             return "invalid", None
-        return "length", int(values[0].strip())
+        return "length", int(values[0].strip(" \t"))
 
     def _has_body(self):
         return self._body_framing() not in (("none", 0), ("length", 0))
@@ -1545,7 +1577,10 @@ class GateHandler(BaseHTTPRequestHandler):
                                   "application/json")
         else:
             artifact = self._form().get("artifact", "")
-        path = urllib.parse.urlsplit(artifact).path
+        try:
+            path = urllib.parse.urlsplit(artifact).path
+        except ValueError:
+            path = ""                     # client text urlsplit cannot read: not a bucket path
         key = key_from_path(path)
         if key is None:
             return self._send(400, json.dumps(
@@ -1620,7 +1655,14 @@ class GateHandler(BaseHTTPRequestHandler):
     def _handle_request_access(self):
         form = self._form()
         artifact = form.get("artifact") or ""
-        path = urllib.parse.urlsplit(artifact).path
+        try:
+            path = urllib.parse.urlsplit(artifact).path
+        except ValueError:
+            # client text urlsplit cannot read (`//[x`): not a path inside an artifact
+            LOG.warning("request-access refused: the artifact value is not a path")
+            return self._send(400, self._page("Bad request",
+                                              "<p>This address is not inside a published "
+                                              "artifact.</p>"))
         key = key_from_path(path)
         if key is None:
             return self._send(400, self._page("Bad request", "<p>Missing artifact.</p>"))
@@ -1901,7 +1943,12 @@ class GateHandler(BaseHTTPRequestHandler):
 
     def _route(self, method):
         self._body, self._drop_body = b"", False
-        path = urllib.parse.urlsplit(self.path).path
+        try:
+            path = urllib.parse.urlsplit(self.path).path
+        except ValueError:
+            # a request target urlsplit cannot read (`http://[x/`): nothing is routed for it,
+            # and its body (if any) is not read
+            return self._refuse(400, "Bad request target.")
         # Which listener this request arrived on (see module docstring). A server without an
         # explicit gate_mode is treated as PUBLIC: fail-closed for the decision endpoint.
         mode = getattr(self.server, "gate_mode", "public")

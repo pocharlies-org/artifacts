@@ -423,8 +423,13 @@ their real types).
   arrive within 30 s (on a kept-alive connection counted from the previous answer, so an
   idle connection is also closed after 30 s; closed without an answer), and a POST body
   within 10 s of its headers (`408`, then the connection is closed).
-- **Gate pages and logs**: the gate's own pages send `frame-ancestors 'none'` and
-  `X-Frame-Options: DENY` (they cannot be framed) and no Python version in `Server`. The access
+- **Gate pages and logs**: every answer with a header block that the gate writes, its own
+  pages and the error pages of its HTTP layer (an unsupported method such as `PROPFIND`, a
+  malformed request line, a request line or header block too long) alike, sends
+  `frame-ancestors 'none'` and `X-Frame-Options: DENY` (it cannot be framed),
+  `Cache-Control: no-store` and no Python version in `Server`. The one exception is a request
+  line whose HTTP version cannot be read (or `HTTP/2.0`): Python's `http.server` answers it
+  the HTTP/0.9 way, with no header block at all. The access
   log carries paths without query strings, so approve/deny tokens never reach a log line, and
   control characters in any logged value are written as escapes (no forged lines). The
   approve link of a visitor without a session still passes through oauth2-proxy's sign-in as

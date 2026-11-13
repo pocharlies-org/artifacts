@@ -1843,6 +1843,85 @@ class E2ETest(unittest.TestCase):
                 time.sleep(1.0)
         self.assertEqual(self.gate.REQUEST_HEAD_SECONDS, 30)
 
+    def test_targets_urlsplit_cannot_read_answer_400(self):
+        # urlsplit raises ValueError on some client text (`//[x`, `http://[x/`): each handler
+        # that parses one answers 400 instead of dropping the connection unanswered
+        for bad in ("//[x", "http://[x/", "//[::1/artifacts/u/secret/report.html"):
+            st, body, _ = http(self.base + "/_gate/request", method="POST",
+                               data=urllib.parse.urlencode({"csrf": "x", "artifact": bad}),
+                               headers={"Content-Type": "application/x-www-form-urlencoded"},
+                               cookie="sid=alice")
+            self.assertEqual(st, 400, bad)
+            self.assertIn("not inside a published artifact", body, bad)
+            st, ans = self.plugin_authz(bad, sid="alice")
+            self.assertEqual(st, 400, bad)
+            self.assertIn("error", ans, bad)
+        for port in (self.port_of(self.gate_public), self.port_of(self.gate_auth)):
+            for target in (b"http://[x/", b"http://[x/_gate/healthz"):
+                st, h, sock = self.raw(port, b"GET " + target + b" HTTP/1.1\r\nHost: x\r\n\r\n")
+                sock.close()
+                self.assertEqual((st, h.get("connection")), (400, "close"), (port, target))
+        # the listeners still answer afterwards
+        self.assertEqual(http(self.base + "/_gate/healthz")[:2], (200, "ok"))
+
+    def test_http_layer_error_pages_cannot_be_framed(self):
+        # answers the HTTP layer writes itself (send_error: an unsupported method, a malformed
+        # request line, a line or header block too long) carry the same headers as every gate
+        # page. (A request line whose version cannot be read, or HTTP/2.0, is answered the
+        # HTTP/0.9 way by http.server, with no header block at all.)
+        long_line = b"GET /" + b"a" * 70000 + b" HTTP/1.1\r\n\r\n"
+        many_headers = b"GET /_gate/healthz HTTP/1.1\r\n" + b"".join(
+            b"X-H%d: v\r\n" % i for i in range(120)) + b"\r\n"
+        cases = ((b"PROPFIND /artifacts/x HTTP/1.1\r\nHost: x\r\n\r\n", 501),
+                 (b"GET / extra HTTP/1.1\r\n\r\n", 400),
+
+                 (long_line, 414),
+                 (many_headers, 431))
+        for port in (self.port_of(self.gate_public), self.port_of(self.gate_auth)):
+            for data, want in cases:
+                st, h, sock = self.raw(port, data)
+                sock.close()
+                self.assertEqual(st, want, data[:40])
+                self.assertEqual(h.get("x-frame-options"), "DENY", data[:40])
+                self.assertIn("frame-ancestors 'none'", h.get("content-security-policy", ""), data[:40])
+                self.assertIn("default-src 'none'", h.get("content-security-policy", ""), data[:40])
+                self.assertEqual(h.get("cache-control"), "no-store", data[:40])
+                self.assertEqual(h.get("server"), "artifact-gate/1.0", data[:40])
+                self.assertEqual(h.get("connection"), "close", data[:40])
+                self.assertEqual(h.get("content-type"), "text/html; charset=utf-8", data[:40])
+        # the echoed request text is escaped, never markup
+        st, h, sock = self.raw(self.port_of(self.gate_public),
+                               b"<script>x</script> / HTTP/1.1\r\n\r\n", timeout=3)
+        rest = b""
+        try:
+            while True:
+                piece = sock.recv(65536)
+                if not piece:
+                    break
+                rest += piece
+        except OSError:
+            pass
+        sock.close()
+        self.assertEqual(st, 501)
+        self.assertNotIn(b"<script>", rest)
+
+    def test_content_length_takes_only_space_and_tab_around_it(self):
+        # str.strip() also removes Unicode whitespace (NBSP, U+001C..U+001F): such a length
+        # is malformed (400), while spaces and tabs around the digits stay accepted
+        pub = self.port_of(self.gate_public)
+        for hdr in (b"Content-Length: \xa05\r\n", b"Content-Length: 5\xa0\r\n",
+                    b"Content-Length: 5\x1c\r\n", b"Content-Length: \x1f5\r\n",
+                    b"Content-Length: 5\x85\r\n"):
+            st, h, sock = self.raw(pub, b"POST /_gate/request HTTP/1.1\r\nHost: x\r\n" + hdr
+                                   + b"\r\ncsrf=", timeout=3)
+            sock.close()
+            self.assertEqual((st, h.get("connection")), (400, "close"), hdr)
+        body = b"artifact=/artifacts/u/secret/report.html"
+        st, h, sock = self.raw(pub, b"POST /_gate/request HTTP/1.1\r\nHost: x\r\n"
+                               b"Content-Length: \t%d \t\r\n\r\n" % len(body) + body, timeout=3)
+        sock.close()
+        self.assertEqual((st, h.get("connection")), (401, None))   # read, parsed, no session
+
     def test_forwarded_uri_read_two_ways_is_refused(self):
         # L1: "#frag" was decided as pub/free/index.html and signed as ".../index.html#frag";
         # "//host/..." and "http://host/..." put a host into one reading of the path
