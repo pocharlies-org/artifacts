@@ -1,7 +1,9 @@
 name: ci
 on:
   push:
-    branches: [main, "feat/**", "feature/**", "fix/**"]
+    # every branch: CI only reads (permissions below), so a branch of any name gets its run
+    # before a pull request exists. Publishing stays in publish.yml, on main only.
+    branches: ["**"]
   pull_request:
 
 # Read-only token for every job. Nothing here publishes: images are pushed only by
