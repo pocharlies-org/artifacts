@@ -27,7 +27,8 @@
 #     and only the listed emails can open it (gate ACL). Emails are not resolved against
 #     any directory: the gate matches them against the login claim.
 # -g: group slug from ARTIFACTS_GROUPS (its id goes into the gate ACL), or pub for
-#     anonymous reads. -u and -g are mutually exclusive.
+#     anonymous reads. A slug is lowercase letters, digits and inner '-' only.
+#     -u and -g are mutually exclusive.
 # Requires: curl >= 8 (sigv4), python3; 'markdown' for .md input.
 set -euo pipefail
 
@@ -67,6 +68,13 @@ if [[ -n "$GROUP" && -n "$USERS" ]]; then
 fi
 if [[ -z "$GROUP" && -z "$USERS" ]]; then
   echo "missing -u <email[,email...]> or -g <slug|pub>" >&2; exit 2
+fi
+# The slug is one segment of g/<slug>/<run>/, the artifact root whose .acl.json the gate reads:
+# a '/' would move the ACL a level down (unreadable artifact), a dot segment is never served.
+# Same charset as the chart's names (DNS-1123 label: lowercase letters, digits, inner '-'),
+# checked by python3's re so no locale can widen [a-z].
+if [[ -n "$GROUP" ]] && ! python3 -c 'import re,sys; sys.exit(0 if re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?", sys.argv[1]) else 1)' "$GROUP"; then
+  echo "invalid group slug '$GROUP' (lowercase letters, digits and inner '-' only)" >&2; exit 2
 fi
 for f in "$@"; do [[ -f "$f" ]] || { echo "no such file: $f" >&2; exit 2; }; done
 [[ -n "${ARTIFACTS_ACCESS_KEY:-}" && -n "${ARTIFACTS_SECRET_KEY:-}" ]] || {
@@ -116,7 +124,8 @@ else
   done
   [[ -n "$GID" ]] || { echo "unknown group slug '$GROUP' (set ARTIFACTS_GROUPS='slug=<id>;...'; 'pub' is always valid)" >&2; exit 1; }
   PREFIX="${ARTIFACTS_BUCKET}/g/${GROUP}/${RUN}"; AUDIENCE="$GROUP"; USERS_JSON="[]"
-  GATE_GROUPS_JSON="[$GID]"
+  # a JSON string: a group object id (a GUID) is not a JSON value by itself
+  GATE_GROUPS_JSON="$(python3 -c 'import json,sys; print(json.dumps([sys.argv[1]]))' "$GID")"
 fi
 
 # ---- gate ACL (format of gate/gate.py decide()) -----------------------------------------

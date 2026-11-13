@@ -267,6 +267,9 @@ publish.sh -g pub -t 7 examples/report.html                                 # an
 publish.sh -g <group-slug> -t 7 examples/report.html                        # group-gated
 ```
 
+A group slug (a key of `ARTIFACTS_GROUPS`) is one path segment, `g/<slug>/<run>/`:
+lowercase letters, digits and inner `-` only; the CLI refuses anything else before it writes.
+
 **MCP** — `mcp/server.py` (Python, `mcp` SDK, stdio) for agent sessions:
 `publish_html`, `publish_file`, `list_artifacts`, `delete_artifact`. Same ACL-before-
 object ordering, same plugin links.
