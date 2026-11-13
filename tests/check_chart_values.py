@@ -10,11 +10,13 @@ oauth2Proxy.trustedProxyIPs and oauth2Proxy.extraArgs (login proxy flags; no
 --email-domain=* once a domain list is set; extraArgs accepts only a non-empty
 --allowed-group), the artifacts-csp response headers, the
 container resources of the gate, the login proxy and the bootstrap Job (ephemeral-storage
-from values), and the route that keeps /_gate/plugin/ off the public gate listener. Every
-refusal the chart makes for these values is exercised too. Stdlib only.
+from values), the route that keeps /_gate/plugin/ off the public gate listener, and the
+example login-proxy image (digest-pinned, v7.15.5 or newer, the same image the compose stack
+runs). Every refusal the chart makes for these values is exercised too. Stdlib only.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,6 +28,7 @@ import check_oauth2_routes as routing  # noqa: E402  (Traefik rule parser and ev
 ROOT = os.path.dirname(HERE)
 CHART = os.path.join(ROOT, "helm", "artifacts")
 VALUES = os.path.join(CHART, "values.yaml")
+COMPOSE = os.path.join(ROOT, "deploy", "compose", "docker-compose.yml")
 HELM = os.environ.get("HELM", "helm")
 TMP = tempfile.mkdtemp(prefix="chart-values-")
 
@@ -153,8 +156,19 @@ args = proxy_args(default)
 check([a for a in args if a.startswith("--email-domain")] == ["--email-domain=*"],
       "default: login proxy keeps --email-domain=* (no domain list)")
 check(not [a for a in args if a.startswith(("--trusted-proxy-ip", "--trusted-ip"))],
-      "default: no --trusted-proxy-ip and no --trusted-ip (runs on the v7.7.1 example image)")
+      "default: no --trusted-proxy-ip and no --trusted-ip (trusted proxies are set by value only)")
 check(args[-1] == "--silence-ping-logging=true", "default: no extra args after the chart's flags")
+# the example image: the release that has --trusted-proxy-ip and the fixes emailDomains and
+# trustedProxyIPs rely on (README, "Forwarded headers"), by digest; compose runs the same one
+img = next(ln.split("image: ", 1)[1] for ln in docs[("Deployment", "oauth2-proxy-artifacts")].splitlines()
+           if ln.strip().startswith("image: "))
+m = re.fullmatch(r"quay\.io/oauth2-proxy/oauth2-proxy:v(\d+)\.(\d+)\.(\d+)@sha256:[0-9a-f]{64}", img)
+check(m is not None and tuple(map(int, m.groups())) >= (7, 15, 5),
+      "default: login proxy image is oauth2-proxy v7.15.5 or newer, pinned by digest (%s)" % img)
+with open(COMPOSE) as f:
+    compose_imgs = [ln.split("image: ", 1)[1].split("#")[0].strip()
+                    for ln in f if ln.strip().startswith("image: quay.io/oauth2-proxy/")]
+check(compose_imgs == [img], "compose stack runs the chart's login proxy image")
 check(resources(docs[("Deployment", "artifact-gate")]) == GATE_RES,
       "default: gate resources unchanged (25m/64Mi requests, 200m/128Mi limits)")
 check(resources(docs[("Deployment", "oauth2-proxy-artifacts")]) == GATE_RES,

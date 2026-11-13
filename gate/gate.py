@@ -790,7 +790,7 @@ class GateHandler(BaseHTTPRequestHandler):
 
     # -- identity ------------------------------------------------------------------
     # Contract with oauth2-proxy . The proxy image is pinned in
-    # helm/artifacts/values.yaml (`image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1`) and the artifacts
+    # helm/artifacts/values.yaml (`image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6`) and the artifacts
     # proxy runs it with --proxy-prefix=/oauth2-artifacts --upstream=static://202
     # --set-xauthrequest=true --oidc-email-claim=preferred_username --oidc-groups-claim=groups
     # (helm/artifacts/templates/oauth2-proxy-artifacts.yaml). The gate calls

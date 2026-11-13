@@ -304,7 +304,7 @@ anything else.
 | `ingressRouteAnnotations` | `{}` | annotations on every IngressRoute (artifacts host and plugin routes), e.g. `kubernetes.io/ingress.class: traefik-internal` |
 | `gate.trustForwardHeader` | `false` | `trustForwardHeader` of the `gate-auth` forwardAuth middleware; `false` makes Traefik set the `X-Forwarded-*` headers the gate decides on from the request itself |
 | `oauth2Proxy.emailDomains` | `[]` | one `--email-domain` per entry; empty renders `--email-domain=*`; an entry `*` is refused |
-| `oauth2Proxy.trustedProxyIPs` | `[]` | one `--trusted-proxy-ip` per IP or CIDR (proxies allowed to set `X-Forwarded-*`); the flag exists from oauth2-proxy v7.15.2 (v7.15.5 or newer recommended), so set `image` to such a release first (the example `image`, v7.7.1, does not start with it) |
+| `oauth2Proxy.trustedProxyIPs` | `[]` | one `--trusted-proxy-ip` per IP or CIDR (proxies allowed to set `X-Forwarded-*`); the flag exists from oauth2-proxy v7.15.2 (v7.15.5 or newer recommended; the example `image` is v7.15.6), so keep `image` at such a release |
 | `oauth2Proxy.extraArgs` | `[]` | only `--allowed-group=<id>` (non-empty id, one entry per group), appended last; any other flag is refused (`--email-domain` and `--trusted-proxy-ip` have their own values) |
 | `gate.resources`, `oauth2Proxy.resources`, `bootstrap.resources` | today's requests and limits | container resources; add `ephemeral-storage` under `requests` and `limits` to bound local disk |
 
@@ -338,10 +338,10 @@ their real types).
   `X-Forwarded-Uri`. The login proxy runs with `--reverse-proxy=true`; list your ingress
   proxies in `oauth2Proxy.trustedProxyIPs` so only they can set `X-Forwarded-*` there (unset,
   oauth2-proxy trusts every source; the flag needs oauth2-proxy v7.15.2, v7.15.5 or newer
-  recommended). `oauth2Proxy.emailDomains` and `oauth2Proxy.trustedProxyIPs` are a boundary
-  only on such an image: malformed email claims pass `--email-domain` before v7.15.2
-  (GHSA-c5c4-8r6x-56w3), and spoofed client-IP headers bypass authentication before v7.15.5
-  (GHSA-wr5q-7wxw-x568).
+  recommended, and the example `image` is v7.15.6). `oauth2Proxy.emailDomains` and
+  `oauth2Proxy.trustedProxyIPs` are a boundary only on such an image: malformed email claims
+  pass `--email-domain` before v7.15.2 (GHSA-c5c4-8r6x-56w3), and spoofed client-IP headers
+  bypass authentication before v7.15.5 (GHSA-wr5q-7wxw-x568).
 
 ## Plugins
 

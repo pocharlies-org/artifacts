@@ -3,4 +3,4 @@ name: artifacts
 description: Self-hostable artifact hosting — OIDC login, per-artifact ACL gate, anonymous pub/ prefix, plugin routes
 type: application
 version: 0.1.0
-appVersion: "v7.7.1"
+appVersion: "v7.15.6"
