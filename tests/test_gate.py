@@ -702,6 +702,17 @@ class ConditionalGrantTest(unittest.TestCase):
                          (False, "acl tags unreadable: HTTP 403"))
         self.assertEqual(m.put_calls, [])
 
+    def test_acl_field_of_the_wrong_type_takes_no_grant(self):
+        # the write path reads the ACL like the decision does: unusable, nothing written
+        for field, value in (("owner", 5), ("owner", ["o@x.com"]), ("users", "a@x.com"),
+                             ("users", {"a@x.com": 1}), ("groups", 5), ("groups", {"g": 1})):
+            acl = {"owner": "o@x.com", "users": [], "groups": []}
+            acl[field] = value
+            m = FakeMinio({"u/x/.acl.json": json.dumps(acl).encode()})
+            self.assertEqual(gate.grant_access(m, "/artifacts/u/x/a.html", "n@x.com"),
+                             (False, "acl unreadable: malformed JSON"), (field, value))
+            self.assertEqual(m.puts, [], (field, value))
+
     def test_no_etag_means_no_write(self):
         class NoEtag(FakeMinio):
             def get_with_etag(self, key):
@@ -1525,6 +1536,27 @@ class AclRootTest(unittest.TestCase):
                                  (False, "no-artifact-root: deny"), (key, acl))
         # the same ACL at an artifact root lets the owner in, at any depth
         self.assertEqual(gate.decide("a@x.com", [], "u/r/a/b.js", permissive, NOW), (True, "owner"))
+
+    def test_read_acl_refuses_fields_of_the_wrong_type(self):
+        # set but not a string (owner) or not a list (users, groups): (None, ACL_MALFORMED),
+        # like an ACL that is not JSON; unset or empty values still mean "none"
+        bad = [("owner", 5), ("owner", True), ("owner", 1.5), ("owner", ["o@x.com"]),
+               ("owner", {"id": "o@x.com"}), ("users", 5), ("users", True), ("users", 1.5),
+               ("users", "a@x.com"), ("users", {"a@x.com": True}), ("groups", 5),
+               ("groups", True), ("groups", "g"), ("groups", {"g": True})]
+        good = [("owner", None), ("owner", ""), ("owner", 0), ("users", None), ("users", []),
+                ("users", [5, None, "a@x.com"]), ("groups", None), ("groups", []),
+                ("groups", [5, "g"])]
+        for (field, value), want_bad in [(c, True) for c in bad] + [(c, False) for c in good]:
+            acl = {"owner": "o@x.com", "users": ["a@x.com"], "groups": ["g"]}
+            acl[field] = value
+            m = FakeMinio({"u/r/.acl.json": json.dumps(acl).encode()})
+            got = gate.read_acl(m, "u/r/x.html", NOW, bypass_cache=True)
+            if want_bad:
+                self.assertEqual(got, (None, gate.ACL_MALFORMED), (field, value))
+            else:
+                self.assertEqual(got, (acl, None), (field, value))
+                gate.decide("a@x.com", ["g"], "u/r/x.html", got[0], NOW)     # never raises
 
     def test_read_acl_reads_the_root_never_a_nested_acl(self):
         m = FakeMinio({"u/r/.acl.json": json.dumps(self.ROOT_ACL).encode(),
