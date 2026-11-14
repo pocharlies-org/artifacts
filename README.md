@@ -31,7 +31,8 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   Dex id_token), never the chart, which refuses that flag.
 - **Authorization**: one `decide()` in `gate/gate.py` — one ACL file per artifact, at its
   root: `u/<run>/.acl.json`, `g/<slug>/<run>/.acl.json` (`owner`, `users`, `groups`,
-  `expires`). Every file of the artifact, at any depth, answers to it (a zip with
+  `expires`; an ACL whose `owner` is set but not a string, or whose `users` or `groups` is
+  set but not a list, is unusable like one that is not JSON: it lets nobody in). Every file of the artifact, at any depth, answers to it (a zip with
   subfolders is one artifact); an `.acl.json` below the root is never read or served, and
   an approval only ever updates the root one. Denied whatever ACL objects exist: a key
   directly under `u/` or `g/<slug>/` (no artifact root), `acl/…`, and anything outside

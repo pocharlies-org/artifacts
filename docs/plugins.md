@@ -88,8 +88,10 @@ Always JSON. `200` with a decision, or an error status (§ table below).
     refused identity, see below; the detail is written to the gate's log only), `expired` and
     `object-missing` (see below), `unauthenticated` (no session, and not an anonymous `pub/`
     read), `acl-error` (the ACL store could not be read, e.g. an outage: fail closed). An ACL
-    object that exists but is not valid JSON is `denied` like any other unusable ACL, so a
-    stranger cannot tell a broken ACL file from one that does not list them.
+    object that exists but is not valid JSON, or that sets `owner` to something other than a
+    string or `users` / `groups` to something other than a list, is `denied` like any other
+    unusable ACL, for everyone it names too, so a stranger cannot tell a broken ACL file from
+    one that does not list them.
 - **Which ACL**: the same lookup as forwardAuth. A key `u/<run>/<path>` answers to
   `u/<run>/.acl.json` and `g/<slug>/<run>/<path>` to `g/<slug>/<run>/.acl.json`, whatever the
   depth of `<path>`; an `.acl.json` below that root is never read. A key with no artifact

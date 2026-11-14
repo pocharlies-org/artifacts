@@ -1578,6 +1578,99 @@ class E2ETest(unittest.TestCase):
         strip = lambda p: re.sub(r'name=csrf value="[^"]+"', "", p)
         self.assertEqual(strip(page_broken), strip(page_valid))
 
+    # An ACL that sets `owner` to something other than a string, or `users` / `groups` to
+    # something other than a list, is unusable like one that is not JSON: every endpoint gives
+    # its uniform answer (never a dropped connection) and nobody is let in by it
+    BAD_ACL_FIELDS = [("owner", 5), ("owner", True), ("owner", 1.5),
+                      ("owner", ["owner@example.com"]), ("owner", {"id": "owner@example.com"}),
+                      ("users", 5), ("users", True), ("users", "alice@example.com"),
+                      ("users", {"alice@example.com": True}),
+                      ("groups", 5), ("groups", True),
+                      ("groups", "11111111-2222-4333-8444-555555555555"),
+                      ("groups", {"11111111-2222-4333-8444-555555555555": True})]
+
+    def _acl_with(self, field, value, expires=None):
+        acl = {"owner": "owner@example.com", "users": ["alice@example.com"],
+               "groups": ["11111111-2222-4333-8444-555555555555"], "expires": expires}
+        acl[field] = value
+        with OBJECTS_LOCK:
+            OBJECTS["u/secret/.acl.json"] = json.dumps(acl).encode()
+        self.gate._acl_cache.clear()
+
+    def _auth_or_dropped(self, uri, sid):
+        try:
+            return self.auth(uri, sid)
+        except (OSError, http_client.HTTPException):
+            return None, "", {}
+
+    def test_acl_field_of_the_wrong_type_gets_the_uniform_answers(self):
+        sent = self.record_notifications()
+        uri = "/artifacts/u/secret/report.html"
+        USERS["sid"] = ("sid@example.com", "99999999-2222-4333-8444-555555555555")
+        strip = lambda p: re.sub(r'name=csrf value="[^"]+"', "", p)
+        st, page_valid, _ = self.auth(uri, "sid")
+        self.assertEqual(st, 403)
+        _, plugin_valid = self.plugin_authz(uri, sid="sid")
+        st, sent_page = self._request_access("sid", uri)
+        self.assertEqual(st, 200)
+        with OBJECTS_LOCK:
+            for k in [k for k in OBJECTS if k.startswith("_gate/")]:
+                del OBJECTS[k]
+        sent.clear()
+        cases = [(f, v, None) for f, v in self.BAD_ACL_FIELDS] + [
+            (f, v, "2020-01-01") for f, v in self.BAD_ACL_FIELDS if f == "owner"]
+        with mock.patch.object(self.gate.RATE_LIMITER, "max_n", 1000), \
+                mock.patch.object(self.gate.REQUESTER_LIMITER, "max_n", 1000):
+            for field, value, expires in cases:
+                case = (field, value, expires)
+                with self.subTest(field=field, value=value, expires=expires):
+                    self._acl_with(field, value, expires)
+                    # forwardAuth: the stranger gets the same 403 form as on a valid ACL, and the
+                    # people the ACL names (owner, listed user, group member) get it too
+                    st, page, h = self._auth_or_dropped(uri, "sid")
+                    self.assertEqual(st, 403, case)
+                    self.assertEqual(strip(page), strip(page_valid), case)
+                    self.assertNotIn("Authorization", h, case)
+                    for who in ("owner", "alice", "bob"):
+                        self.assertEqual(self._auth_or_dropped(uri, who)[0], 403, (case, who))
+                    # the form's POST: the same 200 page as any other request, nothing recorded
+                    form = re.search(r'name=csrf value="([^"]+)"', page)
+                    self.assertIsNotNone(form, case)
+                    csrf = form.group(1)
+                    try:
+                        st, body, _ = http(self.base + "/_gate/request", method="POST",
+                                           data=urllib.parse.urlencode({"csrf": csrf, "artifact": uri}),
+                                           headers={"Content-Type": "application/x-www-form-urlencoded"},
+                                           cookie="sid=sid")
+                    except (OSError, http_client.HTTPException):
+                        st, body = None, ""
+                    self.assertEqual((st, body), (200, sent_page), case)
+                    with OBJECTS_LOCK:
+                        self.assertEqual([k for k in OBJECTS if k.startswith(("_gate/req/",
+                                                                              "_gate/owner/"))],
+                                         [], case)
+                    # the plugin: `denied`, the same answer as for a stranger on a valid ACL, and
+                    # `denied` for the people the ACL names too
+                    st, ans = self.plugin_authz(uri, sid="sid")
+                    self.assertEqual((st, ans), (200, plugin_valid), case)
+                    for who in ("owner", "alice", "bob"):
+                        st, ans = self.plugin_authz(uri, sid=who)
+                        self.assertEqual((st, ans["allowed"], ans["reason"]), (200, False, "denied"),
+                                         (case, who))
+        self.assertEqual(sent, [])
+
+    def test_acl_fields_unset_or_empty_still_mean_none(self):
+        # null, "", [] and 0 are "no owner / nobody listed", as before: not malformed
+        uri = "/artifacts/u/secret/report.html"
+        for field, value in (("owner", None), ("owner", ""), ("users", None), ("users", []),
+                             ("groups", None), ("groups", [])):
+            self._acl_with(field, value)
+            st, ans = self.plugin_authz(uri, sid="alice" if field != "users" else "bob")
+            self.assertEqual((st, ans["allowed"]), (200, True), (field, value))
+        # entries of the wrong type inside the lists are skipped as before
+        self._acl_with("users", [5, None, {"a": 1}, "alice@example.com"])
+        self.assertTrue(self.plugin_authz(uri, sid="alice")[1]["allowed"])
+
     def test_plugin_authz_store_outage_is_still_acl_error(self):
         # unreadable store (the same for every key): reported as acl-error, fail closed
         with mock.patch.object(self.gate.MINIO, "get", side_effect=ConnectionError("down")):
