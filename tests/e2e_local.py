@@ -1578,9 +1578,10 @@ class E2ETest(unittest.TestCase):
         strip = lambda p: re.sub(r'name=csrf value="[^"]+"', "", p)
         self.assertEqual(strip(page_broken), strip(page_valid))
 
-    # An ACL that sets `owner` to something other than a string, or `users` / `groups` to
-    # something other than a list, is unusable like one that is not JSON: every endpoint gives
-    # its uniform answer (never a dropped connection) and nobody is let in by it
+    # An ACL that sets `owner` to something other than a string, `users` / `groups` to
+    # something other than a list, or `expires` to something that is not a date the gate can
+    # read, is unusable like one that is not JSON: every endpoint gives its uniform answer
+    # (never a dropped connection) and nobody is let in by it
     BAD_ACL_FIELDS = [("owner", 5), ("owner", True), ("owner", 1.5),
                       ("owner", ["owner@example.com"]), ("owner", {"id": "owner@example.com"}),
                       ("users", 5), ("users", True), ("users", "alice@example.com"),
@@ -1588,6 +1589,12 @@ class E2ETest(unittest.TestCase):
                       ("groups", 5), ("groups", True),
                       ("groups", "11111111-2222-4333-8444-555555555555"),
                       ("groups", {"11111111-2222-4333-8444-555555555555": True})]
+    # set but unreadable, so far ignored as "no expiry" (the artifact stayed open): one value
+    # of each JSON type, and strings in another format
+    BAD_ACL_EXPIRES = [("expires", 1577836800), ("expires", 1577836800.5), ("expires", True),
+                       ("expires", ["2020-01-01"]), ("expires", {"date": "2020-01-01"}),
+                       ("expires", "garbage"), ("expires", "2020/01/01"),
+                       ("expires", "01-01-2020")]
 
     def _acl_with(self, field, value, expires=None):
         acl = {"owner": "owner@example.com", "users": ["alice@example.com"],
@@ -1617,7 +1624,7 @@ class E2ETest(unittest.TestCase):
             for k in [k for k in OBJECTS if k.startswith("_gate/")]:
                 del OBJECTS[k]
         sent.clear()
-        cases = [(f, v, None) for f, v in self.BAD_ACL_FIELDS] + [
+        cases = [(f, v, None) for f, v in self.BAD_ACL_FIELDS + self.BAD_ACL_EXPIRES] + [
             (f, v, "2020-01-01") for f, v in self.BAD_ACL_FIELDS if f == "owner"]
         with mock.patch.object(self.gate.RATE_LIMITER, "max_n", 1000), \
                 mock.patch.object(self.gate.REQUESTER_LIMITER, "max_n", 1000):
@@ -1660,10 +1667,13 @@ class E2ETest(unittest.TestCase):
         self.assertEqual(sent, [])
 
     def test_acl_fields_unset_or_empty_still_mean_none(self):
-        # null, "", [] and 0 are "no owner / nobody listed", as before: not malformed
+        # null, "", [] and 0 are "no owner / nobody listed / no expiry", as before: not
+        # malformed; an `expires` the gate can read still works as before
         uri = "/artifacts/u/secret/report.html"
         for field, value in (("owner", None), ("owner", ""), ("users", None), ("users", []),
-                             ("groups", None), ("groups", [])):
+                             ("groups", None), ("groups", []), ("expires", None),
+                             ("expires", ""), ("expires", 0), ("expires", False),
+                             ("expires", "2999-12-31"), ("expires", "2999-12-31T10:00:00+02:00")):
             self._acl_with(field, value)
             st, ans = self.plugin_authz(uri, sid="alice" if field != "users" else "bob")
             self.assertEqual((st, ans["allowed"]), (200, True), (field, value))

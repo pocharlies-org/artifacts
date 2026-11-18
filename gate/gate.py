@@ -2077,27 +2077,33 @@ ACL_MALFORMED = "malformed JSON"
 
 
 def acl_fields_malformed(acl):
-    """True when an ACL object sets a field to a type the gate cannot read: `owner` set but
-    not a string, `users` or `groups` set but not a list. Such an ACL is unusable like one that
-    is not JSON (read_acl and read_acl_for_write give ACL_MALFORMED): nobody is let in by it and
-    no request is recorded for it. Fail closed on purpose: reading such a field anyway either
-    breaks the request (`.lower()` on a number) or reads it another way than the publisher meant
-    (the keys of an object as `users`). An unset or empty value (null, "", 0, []) still means
-    "none", and entries of the wrong type inside `users` and `groups` are skipped as before."""
+    """True when an ACL object sets a field to a type or value the gate cannot read: `owner`
+    set but not a string, `users` or `groups` set but not a list, `expires` set but not a date
+    _parse_expires can read (a number, a boolean, a list, an object, or a string such as
+    "2020/01/01"). Such an ACL is unusable like one that is not JSON (read_acl and
+    read_acl_for_write give ACL_MALFORMED): nobody is let in by it and no request is recorded
+    for it. Fail closed on purpose: reading such a field anyway either breaks the request
+    (`.lower()` on a number) or reads it another way than the publisher meant (the keys of an
+    object as `users`; an `expires` that cannot be read as no expiry at all, which leaves open
+    an artifact its publisher meant to close). An unset or empty value (null, "", 0, []) still
+    means "none", and entries of the wrong type inside `users` and `groups` are skipped as
+    before."""
     if not isinstance(acl, dict):
         return False
     owner, users, groups = acl.get("owner"), acl.get("users"), acl.get("groups")
+    expires = acl.get("expires")
     return bool((owner and not isinstance(owner, str))
                 or (users and not isinstance(users, list))
-                or (groups and not isinstance(groups, list)))
+                or (groups and not isinstance(groups, list))
+                or (expires and _parse_expires(expires) is None))
 
 
 def read_acl(minio, key, now, bypass_cache=False):
     """Return (acl|None, error|None) for the ACL that governs `key` (acl_key_for). acl=None
     with no error means that object does not exist, or the key has no ACL at all (no artifact
-    root): then nothing is read and decide() denies. An object that is not JSON, whose JSON
-    is `null`, or that sets a field to a type the gate cannot read (acl_fields_malformed), is
-    (None, ACL_MALFORMED)."""
+    root): then nothing is read and decide() denies. An object that is not JSON (nested too
+    deep for the parser included), whose JSON is `null`, or that sets a field to a type or
+    value the gate cannot read (acl_fields_malformed), is (None, ACL_MALFORMED)."""
     acl_key = acl_key_for(key)
     if acl_key is None:
         return None, None
@@ -2112,14 +2118,17 @@ def read_acl(minio, key, now, bypass_cache=False):
         if status == 200:
             try:
                 acl = json.loads(body)
-            except ValueError:
+            except (ValueError, RecursionError):
+                # RecursionError: a body nested deeper than the parser goes is not JSON the gate
+                # can read either (not a ValueError, so it would otherwise end the request)
                 err = ACL_MALFORMED
             if acl is None and err is None:
                 # an object that exists and says `null` is not "no ACL": refuse it like any
                 # other unusable ACL (it would otherwise open a pub/ root it was meant to close)
                 err = ACL_MALFORMED
             if err is None and acl_fields_malformed(acl):
-                # e.g. `owner` set but not a string: unusable like any malformed ACL
+                # e.g. `owner` set but not a string, or an `expires` that is not a date:
+                # unusable like any malformed ACL
                 acl, err = None, ACL_MALFORMED
         elif status != 404:
             err = f"HTTP {status}"
@@ -2162,7 +2171,7 @@ def read_acl_for_write(minio, acl_key):
         return None, None, f"HTTP {status}"
     try:
         acl = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):            # too deep to parse: as read_acl
         return None, None, ACL_MALFORMED
     if not isinstance(acl, dict):
         return None, None, "not a JSON object"
