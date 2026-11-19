@@ -123,11 +123,11 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   `Sec-Fetch-Mode: navigate`) to an `.html`/`.htm` artifact under `u/`, `g/` or `pub/` on
   `PUBLIC_HOST`, with no query, gets a `302` to that plugin's page for the artifact
   (`https://<PUBLIC_HOST><prefix><bucket>/<key>`) instead of the file, while the plugin answers
-  `GET <prefix>healthz` on its Service (checked at most every 5 s, 1 s deadline, never waited
-  for; down or unknown means the plain page). Iframes, subresources, `HEAD`, clients without
-  `Sec-Fetch-*`, other files and anonymous visitors are served as before, every refusal is the
-  same answer as without it, and `?raw=1` opens the plain page. `pub/` served straight from
-  MinIO never reaches the gate, so it opens plain.
+  `GET <prefix>healthz` on its Service (probed every 5 s by a background thread, 1 s deadline;
+  a request only reads the last result; down or unknown means the plain page). Iframes,
+  subresources, `HEAD`, clients without `Sec-Fetch-*`, other files and anonymous visitors are
+  served as before, every refusal is the same answer as without it, and `?raw=1` opens the
+  plain page. `pub/` served straight from MinIO never reaches the gate, so it opens plain.
 
 ## Quick start (laptop, Docker Compose)
 
@@ -363,7 +363,7 @@ Everything is environment-driven; nothing is hardcoded.
 | `GATE_ACL_CACHE_MAX_ENTRIES` | `10000` | ACL cache: most entries kept (least recently used evicted first) |
 | `GATE_PORT` / `GATE_AUTH_PORT` | `8080` / `8081` | public / decision listeners |
 | `GATE_DEFAULT_VIEW_PREFIX` | empty (off) | route prefix of the default plugin view (docs/plugins.md §6), e.g. `/_canvas/`: `^/_[a-z0-9_-]+(/[a-z0-9_-]+)*/$`, never `/_gate/`, `/_plugins/` or `/oauth2-artifacts/`; with it set, `PUBLIC_HOST` must be a lowercase host name with an optional port (the gate refuses to start otherwise) |
-| `GATE_DEFAULT_VIEW_HEALTH_URL` | empty | the default view's plugin health URL, required with `GATE_DEFAULT_VIEW_PREFIX` and refused without it: exactly `http://<DNS name>:<port><prefix>healthz` (no IP literal, no userinfo, no query); the gate redirects only while it answers 2xx (docs/plugins.md §6) |
+| `GATE_DEFAULT_VIEW_HEALTH_URL` | empty | the default view's plugin health URL, required with `GATE_DEFAULT_VIEW_PREFIX` and refused without it: exactly `http://<DNS name>:<port><prefix>healthz` (no IP literal, no userinfo, no query); probed every 5 s from start, and the gate redirects only while its last answer, under 15 s old, was 2xx (docs/plugins.md §6) |
 | `GATE_PUBLIC_SCHEME` | `https` | scheme of the default view's redirect: `https` or `http` (a plain-HTTP local stack only) |
 
 ### Publisher CLI (`cli/publish.sh`)

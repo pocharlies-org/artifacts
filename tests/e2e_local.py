@@ -195,11 +195,15 @@ USERS = {"alice": ("alice@example.com", ""),            # no groups claim (overa
          "prefonly": ("prefonly@example.com", "", False)}
 
 
+PROXY_CALLS = [0]   # /auth requests the fake proxy answered (any outcome)
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
     def do_GET(self):
+        PROXY_CALLS[0] += 1
         if not self.path.startswith("/oauth2-artifacts/auth"):
             self.send_error(404)
             return
@@ -2834,39 +2838,36 @@ class E2ETest(unittest.TestCase):
         self.assertTrue(cond())
 
     def test_default_view_follows_the_plugin_health(self):
-        # the real health check against a stub plugin: unknown first (plain page), up (302),
-        # down or redirecting (plain page again), up again (302); every plain answer is the
-        # signed read, exactly as with no default view
+        # the real health check, its refresher running, against a stub plugin: unknown before
+        # the first result (plain page), up (302), down or redirecting (plain page), up again,
+        # gone (plain page); every plain answer is the signed read, as with no default view
         plugin = self.PluginStub()
         self.addCleanup(plugin.close)
         health = self.gate.DefaultViewHealth("127.0.0.1", plugin.port, "/_canvas/healthz",
-                                             ttl=0.2, deadline=0.5, max_age=5.0)
+                                             ttl=0.1, deadline=0.5, max_age=5.0)
+        self.addCleanup(health.stop)
         uri, key = "/artifacts/u/secret/report.html", "u/secret/report.html"
-        self._assert_signed(self.nav(uri, "alice", health=health), uri)    # unknown: plain
-        self._wait(lambda: health.state() is not None)
+        self._assert_signed(self.nav(uri, "alice", health=health), uri)    # not started: plain
+        self.assertEqual(health.probes, 0)                    # a request never probes
+        health.start()
+        self._wait(health.available)
         self._assert_redirect(self.nav(uri, "alice", health=health), key)
         for mode in ("down", "redirect", "up"):
             plugin.mode = mode
-            done = health._done
-            time.sleep(0.25)                                  # past the TTL
-            self.nav(uri, "alice", health=health)             # starts the next probe
-            self._wait(lambda: health._done > done)
+            self._wait(lambda: health.available() == (mode == "up"))
             ans = self.nav(uri, "alice", health=health)
             if mode == "up":
                 self._assert_redirect(ans, key)
             else:
                 self._assert_signed(ans, uri)
-        # the plugin gone altogether (connection refused): plain page
-        plugin.close()
-        done = health._done
-        time.sleep(0.25)
-        self.nav(uri, "alice", health=health)
-        self._wait(lambda: health._done > done)
+        plugin.close()                                        # gone: connection refused
+        self._wait(lambda: not health.available())
         self._assert_signed(self.nav(uri, "alice", health=health), uri)
 
-    def test_default_view_health_is_asked_last(self):
-        # nothing that is refused, or that would not redirect anyway, makes the gate ask the
-        # plugin; on the anonymous pub/ route the session is asked first
+    def test_default_view_health_order(self):
+        # /_gate/auth: nothing refused, or that would not redirect anyway, asks the health
+        # check. /_gate/pub-auth: the health check (a free read) comes before the session, so a
+        # plugin that is down costs no login-proxy call; both only after the read was allowed
         self._view_objects()
         USERS["carol6"] = ("carol6@example.com", "aaaa")
         uri = "/artifacts/u/secret/report.html"
@@ -2889,16 +2890,23 @@ class E2ETest(unittest.TestCase):
         pub = dict(endpoint="/_gate/pub-auth", flag=True)
         pub_uri = "/artifacts/pub/free/index.html"
         USERS["guest6"] = ("guest6_example.org#EXT#@tenant.example", "")
-        for sid in (None, "nobody", "guest6"):
-            spy = self.FixedHealth()
+        # plugin down: plain page and no login-proxy call, whatever the visitor sends
+        for sid in (None, "nobody", "guest6", "alice"):
+            down, before = self.FixedHealth(up=False), PROXY_CALLS[0]
+            self._assert_signed(self.nav(pub_uri, sid, health=down, **pub), pub_uri)
+            self.assertEqual((down.calls, PROXY_CALLS[0] - before), (1, 0), sid)
+        # plugin up: the session decides; a visitor with no cookie still costs no proxy call
+        for sid, calls in ((None, 0), ("nobody", 1), ("guest6", 1)):
+            spy, before = self.FixedHealth(), PROXY_CALLS[0]
             self._assert_signed(self.nav(pub_uri, sid, health=spy, **pub), pub_uri)
-            self.assertEqual(spy.calls, 0, sid)
-        spy = self.FixedHealth()
+            self.assertEqual((spy.calls, PROXY_CALLS[0] - before), (1, calls), sid)
+        spy, before = self.FixedHealth(), PROXY_CALLS[0]
         self._assert_redirect(self.nav(pub_uri, "alice", health=spy, **pub), "pub/free/index.html")
-        self.assertEqual(spy.calls, 1)
-        down = self.FixedHealth(up=False)
-        self._assert_signed(self.nav(pub_uri, "alice", health=down, **pub), pub_uri)
-        self.assertEqual(down.calls, 1)
+        self.assertEqual((spy.calls, PROXY_CALLS[0] - before), (1, 1))
+        # a refused pub/ read never gets as far as the health check or the proxy
+        spy, before = self.FixedHealth(), PROXY_CALLS[0]
+        self.assertEqual(self.nav("/artifacts/pub/free/ghost.html", "alice", health=spy, **pub)[0], 404)
+        self.assertEqual((spy.calls, PROXY_CALLS[0] - before), (0, 0))
 
     def test_default_view_pub_route_does_not_wait_on_a_hung_login_proxy(self):
         # a login proxy that accepts the connection and never answers: the anonymous pub/ read
@@ -2930,7 +2938,7 @@ class E2ETest(unittest.TestCase):
             ans = self.nav(uri, "alice", endpoint="/_gate/pub-auth", flag=True, health=spy)
             took = time.monotonic() - t0
         self._assert_signed(ans, uri)
-        self.assertEqual(spy.calls, 0)
+        self.assertEqual(spy.calls, 1)                        # the plugin is up
         self.assertTrue(held)                                 # the proxy was asked
         self.assertLess(took, 3.0, took)
         self.assertGreater(took, 1.5, took)                   # and the 2 s timeout ended it

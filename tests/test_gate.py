@@ -2270,9 +2270,10 @@ def _wait_for(cond, timeout=4.0):
 
 
 class DefaultViewHealthTest(unittest.TestCase):
-    """The default view's health check (DefaultViewHealth, docs/plugins.md §6): URL from
-    configuration only, fixed GET, no redirect followed, status only, a total deadline, single
-    flight, nobody waits, unknown means down, a log line only on a change of state."""
+    """The default view's health check (DefaultViewHealth, docs/plugins.md §6): one refresher
+    thread probes every TTL whatever the traffic; available() only reads its last result. URL
+    from configuration only, fixed GET, no redirect followed, status only, a total deadline,
+    a log line only on a change of state, max_age as the guard against a dead refresher."""
 
     PATH = "/_canvas/healthz"
 
@@ -2284,26 +2285,25 @@ class DefaultViewHealthTest(unittest.TestCase):
     def health(self, stub_or_port, **kw):
         port = stub_or_port if isinstance(stub_or_port, int) else stub_or_port.port
         kw.setdefault("deadline", 1.0)
-        return gate.DefaultViewHealth("127.0.0.1", port, self.PATH, **kw)
+        h = gate.DefaultViewHealth("127.0.0.1", port, self.PATH, **kw)
+        self.addCleanup(h.stop)
+        return h
 
-    def settle(self, h, probes):
-        self.assertTrue(_wait_for(lambda: h._done >= probes), "probe did not finish")
+    def refreshers(self):
+        return [t for t in threading.enumerate()
+                if t.name == "default-view-health-refresh" and t.is_alive()]
 
-    def test_up(self):
+    # -- one probe ---------------------------------------------------------------------
+    def test_up_and_the_request_it_sends(self):
         s = self.stub("up")
         h = self.health(s)
-        self.assertEqual(h.probes, 0)                       # nothing probed until asked
-        t0 = time.monotonic()
-        self.assertFalse(h.available())                     # unknown: the plain page
-        self.assertLess(time.monotonic() - t0, 0.1)         # and nobody waited
-        self.settle(h, 1)
-        self.assertTrue(h.available())
-        self.assertEqual((h.probes, len(s.requests)), (1, 1))
-        # the request: GET of the configured path, nothing of the visitor's
+        self.assertEqual((h.probes, h.state()), (0, None))   # nothing probed until started
+        self.assertFalse(h.available())                       # unknown: the plain page
+        self.assertEqual(h.probe_once(), (True, "HTTP 200"))
         method, path, headers = s.requests[0]
-        self.assertEqual((method, path), ("GET", self.PATH))
+        self.assertEqual((method, path), ("GET", self.PATH))  # GET of the configured path only
         self.assertEqual(sorted(k.lower() for k in headers),
-                         ["accept-encoding", "host", "user-agent"])
+                         ["accept-encoding", "host", "user-agent"])   # nothing of a visitor
         self.assertEqual(headers["Host"], f"127.0.0.1:{s.port}")
 
     def test_down_answers(self):
@@ -2311,116 +2311,158 @@ class DefaultViewHealthTest(unittest.TestCase):
         free.bind(("127.0.0.1", 0))
         closed_port = free.getsockname()[1]
         free.close()
-        for target, why in ((self.stub("down"), "HTTP 503"), (closed_port, "ConnectionRefusedError")):
-            with self.subTest(why=why), self.assertLogs("artifact-gate", "INFO") as logs:
-                h = self.health(target)
-                self.assertFalse(h.available())
-                self.settle(h, 1)
-                self.assertFalse(h.available())
-                self.assertEqual(h.state()[0], False)
-            self.assertEqual(len(logs.records), 1)
-            self.assertIn("down (" + why, logs.output[0])
+        self.assertEqual(self.health(self.stub("down")).probe_once(), (False, "HTTP 503"))
+        self.assertEqual(self.health(closed_port).probe_once(), (False, "ConnectionRefusedError"))
+        h = gate.DefaultViewHealth("no-such-host.invalid", 8080, self.PATH, deadline=0.5)
+        self.assertFalse(h.probe_once()[0])                   # a name that does not resolve
 
     def test_redirect_is_down_and_never_followed(self):
         other = self.stub("up")
         s = self.stub("redirect", location=f"http://127.0.0.1:{other.port}{self.PATH}")
-        h = self.health(s)
-        h.available()
-        self.settle(h, 1)
-        self.assertFalse(h.available())
-        self.assertEqual(h.state()[0], False)
-        self.assertEqual((len(s.requests), len(other.requests)), (1, 0))   # the target saw nothing
+        self.assertEqual(self.health(s).probe_once(), (False, "HTTP 302"))
+        self.assertEqual((len(s.requests), len(other.requests)), (1, 0))   # target saw nothing
 
     def test_slow_drip_is_cut_at_the_total_deadline(self):
         s = self.stub("drip")
         h = self.health(s, deadline=1.0)
-        recorded, record = [], h._record
-        h._record = lambda *a: (recorded.append(time.monotonic()), record(*a))
         t0 = time.monotonic()
-        self.assertFalse(h.available())
-        for _ in range(20):                                 # callers never wait meanwhile
-            t1 = time.monotonic()
-            self.assertFalse(h.available())
-            self.assertLess(time.monotonic() - t1, 0.05)
-            time.sleep(0.02)
-        self.settle(h, 1)
-        took = recorded[0] - t0
-        self.assertEqual(h.state()[0], False)
-        self.assertLess(took, 1.5, took)                    # 1 s in total, not per read
+        self.assertEqual(h.probe_once(), (False, "no answer within 1 s"))
+        self.assertLess(time.monotonic() - t0, 1.3)           # 1 s in total, not per read
         # the connection is cut, so the stub's handler ends and no worker is left behind
         self.assertTrue(_wait_for(lambda: s.ended and h._workers == 0, 3.0))
         self.assertLess(s.ended[0] - t0, 2.5)
 
     def test_a_2xx_is_up_without_reading_the_body(self):
-        s = self.stub("endless-body")
-        h = self.health(s)
+        h = self.health(self.stub("endless-body"))
         t0 = time.monotonic()
-        h.available()
-        self.settle(h, 1)
+        self.assertEqual(h.probe_once(), (True, "HTTP 200"))
         self.assertLess(time.monotonic() - t0, 0.8)
-        self.assertTrue(h.available())
 
-    def test_single_flight_and_ttl(self):
-        clock = [1000.0]
-        s = self.stub("slow-up")                            # 0.3 s: the 50 callers come first
-        h = self.health(s, ttl=5.0, max_age=15.0, clock=lambda: clock[0])
-        results = []
-        threads = [threading.Thread(target=lambda: results.append(h.available())) for _ in range(50)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        self.assertEqual(results, [False] * 50)             # unknown for everyone, nobody waits
-        self.settle(h, 1)
-        for _ in range(50):
-            self.assertTrue(h.available())
-        clock[0] += 4.9
-        self.assertTrue(h.available())
-        self.assertEqual((h.probes, len(s.requests)), (1, 1))    # one probe per TTL
-        with self.assertLogs("artifact-gate", "INFO") as logs:
-            s.mode = "down"
-            clock[0] += 0.2                                 # past the TTL: one new probe
-            self.assertTrue(h.available())                  # the last result meanwhile
-            self.assertTrue(h.available())
-            self.settle(h, 2)
-            self.assertFalse(h.available())
-            clock[0] += 5.0
-            h.available()
-            self.settle(h, 3)                               # still down: not logged again
-            s.mode = "up"
-            clock[0] += 5.0
-            h.available()
-            self.settle(h, 4)
-            self.assertTrue(h.available())
-        self.assertEqual(h.probes, 4)
-        self.assertEqual(["up" if " up (" in m else "down" for m in logs.output], ["down", "up"])
-        self.assertTrue(all("http://127.0.0.1:%d%s" % (s.port, self.PATH) in m for m in logs.output))
-        self.assertTrue(all('"ok"' not in m and "not ready" not in m for m in logs.output))  # no body
-        # a result older than max_age is unknown, whatever it said
-        s.mode = "drip"
-        clock[0] += 15.5
-        self.assertFalse(h.available())
-
-    def test_stuck_probes_are_bounded(self):
+    def test_stuck_probes_are_bounded_and_nothing_raises(self):
         s = self.stub("up")
         h = self.health(s, max_workers=2)
         with h._lock:
-            h._workers = 2                                  # two probes still alive
-        with self.assertLogs("artifact-gate", "INFO") as logs:
-            self.assertFalse(h.available())
-        self.assertEqual((h.probes, len(s.requests)), (0, 0))   # no third one started
-        self.assertIn("down (earlier probes still running)", logs.output[0])
-
-    def test_never_raises(self):
-        h = gate.DefaultViewHealth("no-such-host.invalid", 8080, self.PATH, deadline=0.5)
-        self.assertFalse(h.available())
-        self.assertTrue(_wait_for(lambda: h._done >= 1, 4.0))
-        self.assertFalse(h.available())
-        # no thread to start a probe: down, nothing raised, no worker counted
-        h = self.health(self.stub("up"))
+            h._workers = 2                                    # two probes still alive
+        self.assertEqual(h.probe_once(), (False, "earlier probes still running"))
+        self.assertEqual((h.probes, len(s.requests)), (0, 0)) # no third one started
+        with h._lock:
+            h._workers = 0
         with mock.patch.object(gate.threading.Thread, "start", side_effect=RuntimeError("x")):
-            self.assertFalse(h.available())
-        self.assertEqual((h._workers, h.state()[0]), (0, False))
+            self.assertEqual(h.probe_once(), (False, "RuntimeError"))
+        self.assertEqual(h._workers, 0)
+
+    # -- the refresher -------------------------------------------------------------------
+    def test_refresher_probes_on_a_timer_without_any_request(self):
+        s = self.stub("up")
+        h = self.health(s, ttl=0.2)
+        h.start()
+        h.start()                                             # once: one thread
+        self.assertTrue(_wait_for(lambda: h.probes > 3, 1.5), h.probes)
+        self.assertEqual(len(self.refreshers()), 1)
+        self.assertTrue(h.available())                        # the first candidate redirects
+        h.stop()
+        self.assertTrue(_wait_for(lambda: not self.refreshers(), 2.0))
+
+    def test_idle_longer_than_max_age_still_redirects(self):
+        # the gate has been idle for minutes: the refresher kept the result fresh, so a
+        # candidate after 60 s with no other request finds the plugin up (fake clock, real thread)
+        clock = [1000.0]
+        s = self.stub("up")
+        h = self.health(s, ttl=0.02, max_age=15.0, clock=lambda: clock[0])
+        h.start()
+        self.assertTrue(_wait_for(lambda: h.results >= 1))
+        for _ in range(6):
+            clock[0] += 60.0
+            n = h.results
+            self.assertTrue(_wait_for(lambda: h.results >= n + 2))   # a pass after the jump
+            self.assertTrue(h.available())
+
+    def test_down_is_seen_within_a_ttl_and_up_again(self):
+        s = self.stub("up")
+        h = self.health(s, ttl=0.2, deadline=0.5)
+        with self.assertLogs("artifact-gate", "INFO") as logs:
+            h.start()
+            self.assertTrue(_wait_for(h.available))
+            s.mode = "down"
+            t0 = time.monotonic()
+            self.assertTrue(_wait_for(lambda: not h.available(), 2.0))
+            self.assertLess(time.monotonic() - t0, 0.2 + 0.5 + 0.3)   # ttl + deadline
+            n = h.results
+            self.assertTrue(_wait_for(lambda: h.results >= n + 3))    # still down: not logged again
+            s.mode = "up"
+            self.assertTrue(_wait_for(h.available, 2.0))
+            n = h.results
+            self.assertTrue(_wait_for(lambda: h.results >= n + 3))
+        self.assertEqual(["up" if " up (" in m else "down" for m in logs.output], ["up", "down", "up"])
+        self.assertTrue(all("http://127.0.0.1:%d%s" % (s.port, self.PATH) in m for m in logs.output))
+        self.assertTrue(all('"ok"' not in m and "not ready" not in m for m in logs.output))  # no body
+
+    def test_dead_refresher_goes_stale_then_plain(self):
+        clock = [1000.0]
+        s = self.stub("up")
+        h = self.health(s, ttl=0.02, max_age=15.0, clock=lambda: clock[0])
+        h.start()
+        self.assertTrue(_wait_for(h.available))
+        h.stop()
+        self.assertTrue(_wait_for(lambda: not self.refreshers(), 2.0))
+        n = h.results
+        clock[0] += 10.0
+        self.assertTrue(h.available())                        # stale, still within max_age
+        self.assertEqual(h.state(), (True, h.state()[1]))
+        clock[0] += 5.5
+        self.assertFalse(h.available())                       # older than max_age: plain
+        self.assertEqual(h.results, n)                        # nothing probed meanwhile
+
+    def test_refresher_survives_exceptions(self):
+        s = self.stub("up")
+        h = self.health(s, ttl=0.05)
+        calls, real = [], h.probe_once
+
+        def flaky():
+            calls.append(1)
+            if len(calls) <= 2:
+                raise ValueError("boom")
+            return real()
+        h.probe_once = flaky
+        with self.assertLogs("artifact-gate", "INFO") as logs:
+            h.start()
+            self.assertTrue(_wait_for(h.available, 2.0))
+        self.assertEqual(len(self.refreshers()), 1)           # still running
+        self.assertEqual(len(logs.output), 2, logs.output)    # down once, then up once
+        self.assertIn("down (ValueError)", logs.output[0])
+        self.assertIn("up (HTTP 200)", logs.output[1])
+
+
+class MainStartsTheRefresherTest(unittest.TestCase):
+    """main() starts the default view's refresher once, before it serves, and only when a default
+    view is configured; importing the module starts nothing."""
+
+    def run_main(self, health):
+        class Server:
+            gate_mode, served = None, 0
+
+            def serve_forever(self):
+                self.served += 1
+
+        servers = (Server(), Server())
+        with mock.patch.object(gate, "_build_servers", return_value=servers), \
+                mock.patch.object(gate, "DEFAULT_VIEW_HEALTH", health), \
+                mock.patch.object(gate.logging, "basicConfig"):
+            gate.main()
+        return servers
+
+    def test_started_only_when_configured(self):
+        health = mock.Mock(spec=gate.DefaultViewHealth)
+        health.target.return_value = "http://canvas:8080/_canvas/healthz"
+        servers = self.run_main(health)
+        self.assertEqual(health.start.call_count, 1)
+        self.assertEqual(servers[0].served, 1)
+        self.assertIsNone(gate.DEFAULT_VIEW_HEALTH)           # off in this suite: nothing to start
+        self.run_main(None)                                   # and main() runs without one
+        mod = ReadSigningUserTest._load(self, GATE_DEFAULT_VIEW_PREFIX="/_canvas/",
+                                        GATE_DEFAULT_VIEW_HEALTH_URL="http://canvas:8080/_canvas/healthz")
+        self.assertEqual((mod.DEFAULT_VIEW_HEALTH.probes, mod.DEFAULT_VIEW_HEALTH._refresher),
+                         (0, None))                           # import alone starts nothing
 
 
 class BucketNameTest(unittest.TestCase):
