@@ -62,7 +62,8 @@ metadata:
     app.kubernetes.io/part-of: artifacts
 spec:
   forwardAuth:
-    # the anonymous pub/ decision: no identity is asked, so no session is needed
+    # the anonymous pub/ decision needs no session; the gate asks the login proxy only for the
+    # default plugin view's redirect of an allowed read (docs/plugins.md §6), never to decide
     address: http://artifact-gate.{{ $sso }}.svc.cluster.local:{{ .Values.gate.authPort }}/_gate/pub-auth
     # always false (not gate.trustForwardHeader): Traefik sets X-Forwarded-Method/-Uri/-Host
     # from the request it received, whatever the client sent

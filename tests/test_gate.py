@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+import socket
 import sys
 import tempfile
 import threading
@@ -1986,16 +1987,25 @@ class DefaultViewTest(unittest.TestCase):
                                           prefix=prefix)
 
     # -- configuration -----------------------------------------------------------------
+    HEALTH = "http://artifact-canvas.sso.svc.cluster.local:8080/_canvas/healthz"
+
     def test_off_by_default(self):
         self.assertEqual((gate.DEFAULT_VIEW_PREFIX, gate.PUBLIC_SCHEME), ("", "https"))
+        self.assertEqual((gate.DEFAULT_VIEW_HEALTH_TARGET, gate.DEFAULT_VIEW_HEALTH), (None, None))
+        self.assertFalse(gate.default_view_available())
         self.assertIsNone(gate.default_view_location(
             "GET", "/artifacts/u/run/index.html", "u/run/index.html", self.hdrs()))
 
     def test_config_is_read_and_checked_at_start(self):
-        mod = self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/")
+        mod = self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/", GATE_DEFAULT_VIEW_HEALTH_URL=self.HEALTH)
         self.assertEqual((mod.DEFAULT_VIEW_PREFIX, mod.PUBLIC_SCHEME), ("/_canvas/", "https"))
+        self.assertEqual(mod.DEFAULT_VIEW_HEALTH_TARGET,
+                         ("artifact-canvas.sso.svc.cluster.local", 8080, "/_canvas/healthz"))
+        self.assertEqual(mod.DEFAULT_VIEW_HEALTH.target(), self.HEALTH)
+        self.assertEqual(mod.DEFAULT_VIEW_HEALTH.probes, 0)            # nothing probed at start
         mod = self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/v2/", GATE_PUBLIC_SCHEME="http",
-                         PUBLIC_HOST="127.0.0.1:8080")
+                         PUBLIC_HOST="127.0.0.1:8080",
+                         GATE_DEFAULT_VIEW_HEALTH_URL="http://canvas:8080/_canvas/v2/healthz")
         self.assertEqual((mod.DEFAULT_VIEW_PREFIX, mod.PUBLIC_SCHEME), ("/_canvas/v2/", "http"))
         self.assertEqual(mod.default_view_location(
             "GET", "/artifacts/u/run/index.html", "u/run/index.html",
@@ -2008,7 +2018,7 @@ class DefaultViewTest(unittest.TestCase):
                     "/_canvas//", "//evil.example/", "/_canvas/\n", " /_canvas/", "/_can.vas/",
                     "https://evil.example/_canvas/", "/_canvas/?x=", "/_canvas/#", "/_c%61nvas/"):
             with self.subTest(prefix=bad), self.assertRaises(RuntimeError):
-                self._load(GATE_DEFAULT_VIEW_PREFIX=bad)
+                self._load(GATE_DEFAULT_VIEW_PREFIX=bad, GATE_DEFAULT_VIEW_HEALTH_URL=self.HEALTH)
         for bad in ("", "ftp", "HTTPS", "https:", "javascript", "https://evil.example"):
             with self.subTest(scheme=bad), self.assertRaises(RuntimeError):
                 self._load(GATE_PUBLIC_SCHEME=bad)
@@ -2016,7 +2026,35 @@ class DefaultViewTest(unittest.TestCase):
                     "artifacts.example.com.", "-a.example.com", "a.example.com:", "[::1]",
                     "a.example.com:123456"):
             with self.subTest(host=bad), self.assertRaises(RuntimeError):
-                self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/", PUBLIC_HOST=bad)
+                self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/", PUBLIC_HOST=bad,
+                           GATE_DEFAULT_VIEW_HEALTH_URL=self.HEALTH)
+
+    def test_health_url_is_checked_at_start(self):
+        # http://<DNS name>:<port><prefix>healthz exactly: never an IP literal, userinfo, another
+        # path (/readyz), a query, a fragment, another scheme or a missing port
+        ok = ("http://canvas:8080/_canvas/healthz", "http://a-b.c-d.svc.cluster.local:1/_canvas/healthz",
+              "http://canvas.example:65535/_canvas/healthz")
+        for url in ok:
+            self.assertEqual(self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/",
+                                        GATE_DEFAULT_VIEW_HEALTH_URL=url).DEFAULT_VIEW_HEALTH.target(), url)
+        for bad in ("", "https://canvas:8080/_canvas/healthz", "HTTP://canvas:8080/_canvas/healthz",
+                    "http://canvas/_canvas/healthz", "http://canvas:/_canvas/healthz",
+                    "http://canvas:0/_canvas/healthz", "http://canvas:65536/_canvas/healthz",
+                    "http://canvas:123456/_canvas/healthz", "http://10.0.0.1:8080/_canvas/healthz",
+                    "http://127.0.0.1:8080/_canvas/healthz", "http://[::1]:8080/_canvas/healthz",
+                    "http://u:p@canvas:8080/_canvas/healthz", "http://u@canvas:8080/_canvas/healthz",
+                    "http://Canvas:8080/_canvas/healthz", "http://canvas.:8080/_canvas/healthz",
+                    "http://-canvas:8080/_canvas/healthz", "http://canvas:8080/_canvas/readyz",
+                    "http://canvas:8080/healthz", "http://canvas:8080/_canvas/healthz/",
+                    "http://canvas:8080/_other/healthz", "http://canvas:8080/_canvas/healthz?x=1",
+                    "http://canvas:8080/_canvas/healthz#x", "http://canvas:8080/_canvas/../healthz",
+                    "http://canvas:8080/_canvas/healthz\n", " http://canvas:8080/_canvas/healthz",
+                    "http://evil.example@canvas:8080/_canvas/healthz", "//canvas:8080/_canvas/healthz",
+                    "file:///_canvas/healthz"):
+            with self.subTest(url=bad), self.assertRaises(RuntimeError):
+                self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/", GATE_DEFAULT_VIEW_HEALTH_URL=bad)
+        with self.assertRaises(RuntimeError):            # a health URL without a default view
+            self._load(GATE_DEFAULT_VIEW_HEALTH_URL="http://canvas:8080/_canvas/healthz")
 
     # -- when it redirects ---------------------------------------------------------------
     def test_redirects_an_html_artifact_under_u_g_and_pub(self):
@@ -2100,39 +2138,299 @@ class DefaultViewTest(unittest.TestCase):
                                  + gate.canonical_artifact_path("/artifacts/" + urllib.parse.quote(key)))
 
     # -- the opt-out: ?raw=1 -------------------------------------------------------------
-    def test_raw_query_signed_only_with_a_default_view(self):
+    def test_raw_query_is_the_one_signed_query_whatever_the_flag(self):
+        # `raw=1`, exactly, is signed with or without a default view (a plugin's link to the
+        # plain page must keep working in any rollout order); nothing else is, either way
         uri = "/artifacts/u/run/index.html?raw=1"
-        self.assertIsNone(gate._allowed_query_pairs("raw=1"))                    # off: refused
-        self.assertIsNone(gate.upstream_auth_headers("GET", "h", uri, "AK", "SK"))
-        with mock.patch.object(gate, "DEFAULT_VIEW_PREFIX", "/_canvas/"):
-            self.assertEqual(gate._allowed_query_pairs("raw=1"), [("raw", "1")])
-            h = gate.upstream_auth_headers("GET", "h", uri, "AK", "SK", amzdate="20260101T000000Z")
-            want = gate.sigv4_headers("GET", "h", "/artifacts/u/run/index.html", [("raw", "1")],
-                                      None, b"", "AK", "SK", amzdate="20260101T000000Z")
-            bare = gate.sigv4_headers("GET", "h", "/artifacts/u/run/index.html", [], None, b"",
-                                      "AK", "SK", amzdate="20260101T000000Z")
-            self.assertEqual(h["Authorization"], want["Authorization"])
-            self.assertNotEqual(h["Authorization"], bare["Authorization"])
-            for q in ("raw=0", "raw=2", "raw=", "raw", "RAW=1", "Raw=1", "raw=01", "raw=1 ",
-                      "raw=%31", "%72aw=1", "raw=1&raw=1", "raw=1&acl", "acl&raw=1", "raw=1;",
-                      "raw=1&", "&raw=1", "raw=1#", "raw=true", "raw=1&lambdaArn=x", ""):
-                self.assertIsNone(gate._allowed_query_pairs(q), repr(q))
-                self.assertIsNone(gate.upstream_auth_headers(
-                    "GET", "h", "/artifacts/u/run/index.html?" + q, "AK", "SK"), repr(q))
-            self.assertEqual(gate._ALLOWED_QUERY_KEYS, frozenset())   # no key allowed besides
+        for prefix in ("", "/_canvas/"):
+            with self.subTest(default_view=prefix), \
+                    mock.patch.object(gate, "DEFAULT_VIEW_PREFIX", prefix):
+                self.assertEqual(gate._allowed_query_pairs("raw=1"), [("raw", "1")])
+                h = gate.upstream_auth_headers("GET", "h", uri, "AK", "SK", amzdate="20260101T000000Z")
+                want = gate.sigv4_headers("GET", "h", "/artifacts/u/run/index.html", [("raw", "1")],
+                                          None, b"", "AK", "SK", amzdate="20260101T000000Z")
+                bare = gate.sigv4_headers("GET", "h", "/artifacts/u/run/index.html", [], None, b"",
+                                          "AK", "SK", amzdate="20260101T000000Z")
+                self.assertEqual(h["Authorization"], want["Authorization"])
+                self.assertNotEqual(h["Authorization"], bare["Authorization"])
+                for q in ("raw=0", "raw=2", "raw=", "raw", "RAW=1", "Raw=1", "raw=01", "raw=1 ",
+                          "raw=%31", "%72aw=1", "raw=1&raw=1", "raw=1&acl", "acl&raw=1", "raw=1;",
+                          "raw=1&", "&raw=1", "raw=1#", "raw=true", "raw=1&lambdaArn=x", "",
+                          "raw= 1", "raw=1%26a", "raw=1;x", "response-content-type=text/plain",
+                          "raw=1&response-content-type=text/plain", "X-Amz-Expires=60"):
+                    self.assertIsNone(gate._allowed_query_pairs(q), repr(q))
+                    self.assertIsNone(gate.upstream_auth_headers(
+                        "GET", "h", "/artifacts/u/run/index.html?" + q, "AK", "SK"), repr(q))
+                self.assertEqual(gate._ALLOWED_QUERY_KEYS, frozenset())   # no key allowed besides
 
-    def test_anonymous_pub_decision_takes_raw_only_with_a_default_view(self):
+    def test_anonymous_pub_decision_takes_raw_whatever_the_flag(self):
         m = FakeMinio({"pub/run/index.html": b"x"})
         gate._acl_cache.clear()
         self.addCleanup(gate._acl_cache.clear)
         d = lambda uri: gate.pub_auth_decision("GET", uri, m, NOW, enabled=True)[0::2]
         self.assertEqual(d("/artifacts/pub/run/index.html"), (True, "pub: anonymous, no ACL"))
-        self.assertEqual(d("/artifacts/pub/run/index.html?raw=1"),
-                         (False, "malformed URI or a query"))
-        with mock.patch.object(gate, "DEFAULT_VIEW_PREFIX", "/_canvas/"):
-            self.assertEqual(d("/artifacts/pub/run/index.html?raw=1"),
-                             (True, "pub: anonymous, no ACL"))
-            for q in ("raw=2", "raw=1&raw=1", "x=1", "", "RAW=1"):
-                self.assertEqual(d("/artifacts/pub/run/index.html?" + q),
-                                 (False, "malformed URI or a query"), q)
-            self.assertEqual(d("/artifacts/pub/run/missing.html?raw=1"), (False, "object missing"))
+        for prefix in ("", "/_canvas/"):
+            with self.subTest(default_view=prefix), \
+                    mock.patch.object(gate, "DEFAULT_VIEW_PREFIX", prefix):
+                self.assertEqual(d("/artifacts/pub/run/index.html?raw=1"),
+                                 (True, "pub: anonymous, no ACL"))
+                for q in ("raw=2", "raw=1&raw=1", "x=1", "", "RAW=1", "raw=%31", "&raw=1",
+                          "raw=1&acl", "raw"):
+                    self.assertEqual(d("/artifacts/pub/run/index.html?" + q),
+                                     (False, "malformed URI or a query"), q)
+                self.assertEqual(d("/artifacts/pub/run/missing.html?raw=1"),
+                                 (False, "object missing"))
+
+
+class _StubPlugin:
+    """A local stand-in for the default view's plugin Service: answers GET <path> the way `mode`
+    says and records every request it gets (method, path, headers)."""
+
+    def __init__(self, mode="up", location=None):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.mode, self.location, self.requests, self.ended = mode, location, [], []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):  # noqa: N802
+                outer.requests.append((self.command, self.path, dict(self.headers)))
+                try:
+                    getattr(outer, "_" + outer.mode.replace("-", "_"))(self)
+                except OSError:
+                    pass
+                finally:
+                    outer.ended.append(time.monotonic())
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def handle_error(self, request, client_address):
+                pass                      # a probe that hangs up is expected here
+
+        self.server = Server(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    @staticmethod
+    def _reply(h, status, extra=(), body=b'{"ok":true}'):
+        h.send_response(status)
+        for k, v in extra:
+            h.send_header(k, v)
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    def _up(self, h):
+        h.close_connection = True
+        self._reply(h, 200)
+
+    def _slow_up(self, h):
+        time.sleep(0.3)
+        self._up(h)
+
+    def _down(self, h):
+        self._reply(h, 503, body=b"not ready")
+
+    def _redirect(self, h):
+        self._reply(h, 302, extra=(("Location", self.location),), body=b"")
+
+    def _drip(self, h):
+        # a status line, then one header line every 0.3 s for up to 10 s, never the end
+        h.wfile.write(b"HTTP/1.1 200 OK\r\n")
+        for _ in range(33):
+            h.wfile.write(b"X-Drip: 1\r\n")
+            time.sleep(0.3)
+
+    def _endless_body(self, h):
+        # a 2xx whose body would take minutes: the probe must not wait for it
+        h.send_response(200)
+        h.send_header("Content-Length", str(10 ** 9))
+        h.end_headers()
+        for _ in range(100):
+            h.wfile.write(b"x" * 64)
+            time.sleep(0.1)
+
+
+def _wait_for(cond, timeout=4.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+class DefaultViewHealthTest(unittest.TestCase):
+    """The default view's health check (DefaultViewHealth, docs/plugins.md §6): URL from
+    configuration only, fixed GET, no redirect followed, status only, a total deadline, single
+    flight, nobody waits, unknown means down, a log line only on a change of state."""
+
+    PATH = "/_canvas/healthz"
+
+    def stub(self, mode="up", **kw):
+        s = _StubPlugin(mode, **kw)
+        self.addCleanup(s.close)
+        return s
+
+    def health(self, stub_or_port, **kw):
+        port = stub_or_port if isinstance(stub_or_port, int) else stub_or_port.port
+        kw.setdefault("deadline", 1.0)
+        return gate.DefaultViewHealth("127.0.0.1", port, self.PATH, **kw)
+
+    def settle(self, h, probes):
+        self.assertTrue(_wait_for(lambda: h._done >= probes), "probe did not finish")
+
+    def test_up(self):
+        s = self.stub("up")
+        h = self.health(s)
+        self.assertEqual(h.probes, 0)                       # nothing probed until asked
+        t0 = time.monotonic()
+        self.assertFalse(h.available())                     # unknown: the plain page
+        self.assertLess(time.monotonic() - t0, 0.1)         # and nobody waited
+        self.settle(h, 1)
+        self.assertTrue(h.available())
+        self.assertEqual((h.probes, len(s.requests)), (1, 1))
+        # the request: GET of the configured path, nothing of the visitor's
+        method, path, headers = s.requests[0]
+        self.assertEqual((method, path), ("GET", self.PATH))
+        self.assertEqual(sorted(k.lower() for k in headers),
+                         ["accept-encoding", "host", "user-agent"])
+        self.assertEqual(headers["Host"], f"127.0.0.1:{s.port}")
+
+    def test_down_answers(self):
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        closed_port = free.getsockname()[1]
+        free.close()
+        for target, why in ((self.stub("down"), "HTTP 503"), (closed_port, "ConnectionRefusedError")):
+            with self.subTest(why=why), self.assertLogs("artifact-gate", "INFO") as logs:
+                h = self.health(target)
+                self.assertFalse(h.available())
+                self.settle(h, 1)
+                self.assertFalse(h.available())
+                self.assertEqual(h.state()[0], False)
+            self.assertEqual(len(logs.records), 1)
+            self.assertIn("down (" + why, logs.output[0])
+
+    def test_redirect_is_down_and_never_followed(self):
+        other = self.stub("up")
+        s = self.stub("redirect", location=f"http://127.0.0.1:{other.port}{self.PATH}")
+        h = self.health(s)
+        h.available()
+        self.settle(h, 1)
+        self.assertFalse(h.available())
+        self.assertEqual(h.state()[0], False)
+        self.assertEqual((len(s.requests), len(other.requests)), (1, 0))   # the target saw nothing
+
+    def test_slow_drip_is_cut_at_the_total_deadline(self):
+        s = self.stub("drip")
+        h = self.health(s, deadline=1.0)
+        recorded, record = [], h._record
+        h._record = lambda *a: (recorded.append(time.monotonic()), record(*a))
+        t0 = time.monotonic()
+        self.assertFalse(h.available())
+        for _ in range(20):                                 # callers never wait meanwhile
+            t1 = time.monotonic()
+            self.assertFalse(h.available())
+            self.assertLess(time.monotonic() - t1, 0.05)
+            time.sleep(0.02)
+        self.settle(h, 1)
+        took = recorded[0] - t0
+        self.assertEqual(h.state()[0], False)
+        self.assertLess(took, 1.5, took)                    # 1 s in total, not per read
+        # the connection is cut, so the stub's handler ends and no worker is left behind
+        self.assertTrue(_wait_for(lambda: s.ended and h._workers == 0, 3.0))
+        self.assertLess(s.ended[0] - t0, 2.5)
+
+    def test_a_2xx_is_up_without_reading_the_body(self):
+        s = self.stub("endless-body")
+        h = self.health(s)
+        t0 = time.monotonic()
+        h.available()
+        self.settle(h, 1)
+        self.assertLess(time.monotonic() - t0, 0.8)
+        self.assertTrue(h.available())
+
+    def test_single_flight_and_ttl(self):
+        clock = [1000.0]
+        s = self.stub("slow-up")                            # 0.3 s: the 50 callers come first
+        h = self.health(s, ttl=5.0, max_age=15.0, clock=lambda: clock[0])
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(h.available())) for _ in range(50)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results, [False] * 50)             # unknown for everyone, nobody waits
+        self.settle(h, 1)
+        for _ in range(50):
+            self.assertTrue(h.available())
+        clock[0] += 4.9
+        self.assertTrue(h.available())
+        self.assertEqual((h.probes, len(s.requests)), (1, 1))    # one probe per TTL
+        with self.assertLogs("artifact-gate", "INFO") as logs:
+            s.mode = "down"
+            clock[0] += 0.2                                 # past the TTL: one new probe
+            self.assertTrue(h.available())                  # the last result meanwhile
+            self.assertTrue(h.available())
+            self.settle(h, 2)
+            self.assertFalse(h.available())
+            clock[0] += 5.0
+            h.available()
+            self.settle(h, 3)                               # still down: not logged again
+            s.mode = "up"
+            clock[0] += 5.0
+            h.available()
+            self.settle(h, 4)
+            self.assertTrue(h.available())
+        self.assertEqual(h.probes, 4)
+        self.assertEqual(["up" if " up (" in m else "down" for m in logs.output], ["down", "up"])
+        self.assertTrue(all("http://127.0.0.1:%d%s" % (s.port, self.PATH) in m for m in logs.output))
+        self.assertTrue(all('"ok"' not in m and "not ready" not in m for m in logs.output))  # no body
+        # a result older than max_age is unknown, whatever it said
+        s.mode = "drip"
+        clock[0] += 15.5
+        self.assertFalse(h.available())
+
+    def test_stuck_probes_are_bounded(self):
+        s = self.stub("up")
+        h = self.health(s, max_workers=2)
+        with h._lock:
+            h._workers = 2                                  # two probes still alive
+        with self.assertLogs("artifact-gate", "INFO") as logs:
+            self.assertFalse(h.available())
+        self.assertEqual((h.probes, len(s.requests)), (0, 0))   # no third one started
+        self.assertIn("down (earlier probes still running)", logs.output[0])
+
+    def test_never_raises(self):
+        h = gate.DefaultViewHealth("no-such-host.invalid", 8080, self.PATH, deadline=0.5)
+        self.assertFalse(h.available())
+        self.assertTrue(_wait_for(lambda: h._done >= 1, 4.0))
+        self.assertFalse(h.available())
+        # no thread to start a probe: down, nothing raised, no worker counted
+        h = self.health(self.stub("up"))
+        with mock.patch.object(gate.threading.Thread, "start", side_effect=RuntimeError("x")):
+            self.assertFalse(h.available())
+        self.assertEqual((h._workers, h.state()[0]), (0, False))
+
+
+class BucketNameTest(unittest.TestCase):
+    """GATE_BUCKET is an S3 bucket name, as the chart requires; the gate refuses anything else."""
+
+    def test_checked_at_start(self):
+        for ok in ("artifacts", "team-reports.v2", "abc", "a" * 63, "1artifacts9"):
+            self.assertEqual(ReadSigningUserTest._load(self, GATE_BUCKET=ok).BUCKET, ok)
+        for bad in ("", "ab", "a" * 64, "Artifacts", "-artifacts", "artifacts-", ".artifacts",
+                    "art_ifacts", "art ifacts", "artifacts/x", "artifacts/", "/artifacts",
+                    "artifacts\n", "artifacts`) || PathPrefix(`/"):
+            with self.subTest(bucket=bad), self.assertRaises(RuntimeError):
+                ReadSigningUserTest._load(self, GATE_BUCKET=bad)

@@ -240,10 +240,13 @@ plugins:
     defaultView: true     # a boolean, false when absent; true on at most one plugin
 ```
 
-The chart turns it into the gate's `GATE_DEFAULT_VIEW_PREFIX` (the compose stack:
-`ARTIFACTS_DEFAULT_VIEW_PREFIX`), and refuses a value that is not a boolean or a second plugin
-with `true`. Absent or `false` everywhere, the default: the gate renders and answers exactly as
-before.
+The chart turns it into the gate's `GATE_DEFAULT_VIEW_PREFIX` and
+`GATE_DEFAULT_VIEW_HEALTH_URL` (`http://<service>.<namespace>.svc.cluster.local:<port><prefix>healthz`,
+from the same entry; the compose stack: `ARTIFACTS_DEFAULT_VIEW_PREFIX` and
+`ARTIFACTS_DEFAULT_VIEW_HEALTH_URL`), and refuses a value that is not a boolean or a second
+plugin with `true`. Absent or `false` everywhere, the default: the chart renders as before, and
+the gate answers as before with one exception, the opt-out below: an allowed read with exactly
+`?raw=1` serves the same bytes as the bare read.
 
 **When the gate redirects.** The gate answers an artifact read with `302` and
 `Location: https://<PUBLIC_HOST><prefix><bucket>/<key>`, instead of signing it, only when all
@@ -253,16 +256,18 @@ of these hold:
    decided after the ACL, never instead of it;
 2. the visitor has a valid session. An allowed read on the forwardAuth decision
    (`/_gate/auth`) always has one. On the anonymous `pub/` decision (`/_gate/pub-auth`, when
-   `pub/` goes through the gate) the gate asks the login proxy, and only once every other
-   condition holds; without a session, with a refused one or while the proxy fails, the page
-   is served plain;
+   `pub/` goes through the gate) the gate asks the login proxy, only once every other
+   condition holds and for at most 2 s; without a session, with a refused one, or while the
+   proxy fails or is slow, the page is served plain. The `pub/` redirect is best effort;
 3. the method is `GET`;
 4. the request is a top-level navigation: exactly one `Sec-Fetch-Dest: document` and exactly
    one `Sec-Fetch-Mode: navigate`;
 5. the key is under `u/`, `g/` or a pub prefix, inside an artifact root, and its last segment
    ends in `.html` or `.htm` (any case);
 6. the request has no query string;
-7. the request's host (`X-Forwarded-Host`, else `Host`) is `PUBLIC_HOST`.
+7. the request's host (`X-Forwarded-Host`, else `Host`) is `PUBLIC_HOST`;
+8. the plugin answered its health check (below). This is asked last, after every other
+   condition, and on `/_gate/pub-auth` after the session.
 
 **Unchanged:** `HEAD`, iframes (`Sec-Fetch-Dest: iframe`, the plugin's own frame of the
 artifact), subresources, fetches, clients that send no `Sec-Fetch-*` (curl, scripts), every
@@ -271,10 +276,28 @@ plain page, since the plugin would ask them to sign in), and every refusal: a de
 malformed or refused read gets the answer it gets without a default view, status, headers and
 body alike. So the redirect never tells anyone that an artifact exists unless they may read it.
 
-**Opt-out: `?raw=1`.** While a default view is set, the query string `raw=1`, exactly that text
-and nothing beside it, is signed and passed to the store (which ignores it), and the read is
-served as the plain page. Every other query is still refused (`404`); with no default view
-`raw=1` is refused too. A plugin links to `<artifact link>?raw=1` to offer the original.
+**Opt-out: `?raw=1`.** The query string `raw=1`, exactly that text and nothing beside it, is
+signed and passed to the store (which ignores it), and the read is served as the plain page.
+It is accepted with or without a default view, so a plugin's link to the plain page works in any
+rollout order and after the default view is turned off. Every other query is still refused
+(`404`). A plugin links to `<artifact link>?raw=1` to offer the original. That the store ignores
+`raw` is a property of the store build: check it again when the store changes (bare against
+`?raw=1`: same status, headers and body).
+
+**Health check.** Before it redirects, the gate checks that the plugin answers
+`GET <prefix>healthz` on its Service (`GATE_DEFAULT_VIEW_HEALTH_URL`, from configuration only):
+
+- a fixed request: `GET`, no cookie, no `Authorization`, no visitor header of any kind;
+- 2xx is up; any other status, a redirect (never followed), an error, or no status line within
+  1 s in total is down. Only the status is used: the body is never read or logged;
+- one probe per 5 s per gate, started by a request that would redirect, in the background:
+  no request waits for it. Until the first result, and while the last one is down or older
+  than 15 s, the read is served plain;
+- the gate logs the first result and every change between up and down.
+
+The check proves the plugin is **reachable, not that it is authentic**: a service that answers
+2xx there is trusted exactly as much as without the check. After the plugin goes down, a few
+seconds of redirects to it can still happen (one probe interval).
 
 **The `Location`** is absolute, because Traefik's forwardAuth resolves a relative one against
 the gate's own address. Its scheme (`GATE_PUBLIC_SCHEME`, `https`; the compose stack sets
@@ -293,6 +316,8 @@ Metadata send none: those visitors get the plain page.
 
 **What the plugin must do.**
 
+- Answer 2xx on `GET <prefix>healthz` only while it can serve its pages, quickly and without
+  calling anything slow; never redirect there.
 - Serve `<prefix><bucket>/<key>` for every HTML artifact a visitor may read, authorizing it
   through §1 like any other request.
 - Show the artifact in an iframe of `/<bucket>/<key>` (never redirected: `Sec-Fetch-Dest:
@@ -311,5 +336,6 @@ Metadata send none: those visitors get the plain page.
 5. Do not serve artifact content yourself; the core already does, with the CSP sandbox.
 6. Do not trust client-supplied identity headers; identity exists only as far as the
    gate's answer says.
-7. As the default view (§6), serve the artifact in an iframe or your own frame route, and link
-   to `?raw=1` for the plain page; never navigate the top-level window to the bare link.
+7. As the default view (§6), answer `GET <prefix>healthz`, serve the artifact in an iframe or
+   your own frame route, and link to `?raw=1` for the plain page; never navigate the top-level
+   window to the bare link.

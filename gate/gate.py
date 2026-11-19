@@ -57,8 +57,10 @@ Default plugin view (off unless GATE_DEFAULT_VIEW_PREFIX names a plugin route, d
 once a read is allowed, a signed-in visitor's top-level navigation (GET, Sec-Fetch-Dest: document,
 Sec-Fetch-Mode: navigate) to an .html/.htm artifact under u/, g/ or pub/, on PUBLIC_HOST, with no
 query, is answered 302 to <scheme>://PUBLIC_HOST<prefix><bucket>/<key> instead of being signed
-(default_view_location). Iframes, subresources, HEAD, clients without Sec-Fetch-*, other files and
-`?raw=1` (then signed and served) are unchanged, and so is every refusal.
+(default_view_location), while that plugin answers GET <prefix>healthz on its Service
+(DefaultViewHealth: 1 s, cached 5 s; down or unknown means the plain page). Iframes, subresources,
+HEAD, clients without Sec-Fetch-*, other files and every refusal are unchanged. `?raw=1`, exactly,
+is signed and served as the plain page, with or without a default view.
 
 The gate also serves the request-access flow (all state in MinIO under `_gate/`, written with the
 gate's own least-privilege S3 user):
@@ -167,6 +169,10 @@ def _positive_int_env(name, default):
 
 
 BUCKET = _env("GATE_BUCKET", "artifacts")
+# An S3 bucket name, as the chart requires (minio.bucket): it is written into every path the gate
+# reads, signs and redirects to, so the gate refuses to start on anything else.
+if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", BUCKET or ""):
+    raise RuntimeError(f"GATE_BUCKET must be an S3 bucket name ([a-z0-9][a-z0-9.-]{{1,61}}[a-z0-9]), got {BUCKET!r}")
 BUCKET_PATH = "/" + BUCKET.strip("/") + "/"  # bucket public path prefix (path-style links)
 MINIO_ENDPOINT = _env("MINIO_ENDPOINT", "http://minio-s3.minio.svc.cluster.local:9000")
 MINIO_ACCESS_KEY = _env("MINIO_ACCESS_KEY", required=True)   # gate user: ACL/state work
@@ -201,23 +207,33 @@ MCP_PREFIX = "_mcp"
 # artifacts by default (the chart's plugins[].defaultView), e.g. "/_canvas/". Empty (the
 # default): off, and nothing below changes. Set: a signed-in visitor's top-level navigation to
 # an HTML artifact they may read is answered with a redirect to that plugin's page for the same
-# artifact (default_view_location), and `?raw=1` on an artifact read is served as the plain
-# page. GATE_PUBLIC_SCHEME is the scheme of that redirect (`https`; `http` only for a local
+# artifact (default_view_location), as long as that plugin answers its health check
+# (GATE_DEFAULT_VIEW_HEALTH_URL, see DefaultViewHealth); otherwise the read is served plain.
+# GATE_PUBLIC_SCHEME is the scheme of that redirect (`https`; `http` only for a local
 # plain-HTTP stack). Checked at start (_default_view_config): the gate refuses to start on a
-# prefix that is not a plugin route prefix, a scheme other than http/https, or (with a prefix
-# set) a PUBLIC_HOST that is not a lowercase host name with an optional port.
+# prefix that is not a plugin route prefix, a scheme other than http/https, and, with a prefix
+# set, a PUBLIC_HOST that is not a lowercase host name with an optional port or a health URL
+# that is not exactly http://<DNS name>:<port><prefix>healthz (a health URL without a prefix
+# is refused too).
 _PLUGIN_ROUTE_PREFIX_RE = re.compile(r"/_[a-z0-9_-]+(/[a-z0-9_-]+)*/")
 _RESERVED_ROUTE_PREFIXES = ("/_gate/", "/_plugins/", "/oauth2-artifacts/")
 _PUBLIC_HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?")
+# http://<DNS name>:<port><path>: lowercase labels, the last one with a letter (so never an IP
+# literal), an explicit port, no userinfo, no query, no fragment
+_HEALTH_URL_RE = re.compile(r"http://(?P<host>[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*)"
+                            r":(?P<port>[0-9]{1,5})(?P<path>/[!-~]*)")
 
 
-def _default_view_config(prefix, scheme, public_host):
-    """(prefix, scheme) of the default plugin view; prefix "" means off. Raises RuntimeError
-    (the gate does not start) on any value it would not use as given."""
+def _default_view_config(prefix, scheme, public_host, health_url=""):
+    """(prefix, scheme, (host, port, path) of the health check or None) of the default plugin
+    view; prefix "" means off. Raises RuntimeError (the gate does not start) on any value it
+    would not use as given."""
     if scheme not in ("https", "http"):
         raise RuntimeError(f"GATE_PUBLIC_SCHEME must be https or http, got {scheme!r}")
     if not prefix:
-        return "", scheme
+        if health_url:
+            raise RuntimeError("GATE_DEFAULT_VIEW_HEALTH_URL is set without GATE_DEFAULT_VIEW_PREFIX")
+        return "", scheme, None
     if (not _PLUGIN_ROUTE_PREFIX_RE.fullmatch(prefix)
             or any(prefix.startswith(r) or r.startswith(prefix) for r in _RESERVED_ROUTE_PREFIXES)):
         raise RuntimeError("GATE_DEFAULT_VIEW_PREFIX must be a plugin route prefix "
@@ -225,11 +241,17 @@ def _default_view_config(prefix, scheme, public_host):
     if not _PUBLIC_HOST_RE.fullmatch(public_host or ""):
         raise RuntimeError("PUBLIC_HOST must be a lowercase host name (optional :port) when "
                            f"GATE_DEFAULT_VIEW_PREFIX is set, got {public_host!r}")
-    return prefix, scheme
+    m = _HEALTH_URL_RE.fullmatch(health_url or "")
+    if (m is None or not re.search(r"[a-z]", m.group("host").rsplit(".", 1)[-1])
+            or not 1 <= int(m.group("port")) <= 65535 or m.group("path") != prefix + "healthz"):
+        raise RuntimeError("GATE_DEFAULT_VIEW_HEALTH_URL must be http://<DNS name>:<port>"
+                           f"{prefix}healthz when GATE_DEFAULT_VIEW_PREFIX is set, got {health_url!r}")
+    return prefix, scheme, (m.group("host"), int(m.group("port")), m.group("path"))
 
 
-DEFAULT_VIEW_PREFIX, PUBLIC_SCHEME = _default_view_config(
-    _env("GATE_DEFAULT_VIEW_PREFIX", ""), _env("GATE_PUBLIC_SCHEME", "https"), PUBLIC_HOST)
+DEFAULT_VIEW_PREFIX, PUBLIC_SCHEME, DEFAULT_VIEW_HEALTH_TARGET = _default_view_config(
+    _env("GATE_DEFAULT_VIEW_PREFIX", ""), _env("GATE_PUBLIC_SCHEME", "https"), PUBLIC_HOST,
+    _env("GATE_DEFAULT_VIEW_HEALTH_URL", ""))
 
 RATE_LIMIT_MAX = int(_env("GATE_RATE_LIMIT_MAX", "5"))     # access requests per requester + file
 RATE_LIMIT_WINDOW = int(_env("GATE_RATE_LIMIT_WINDOW_SECONDS", "86400"))
@@ -703,11 +725,13 @@ def _bad_key(key):
 # refused with the same 404 as a never-served key. To allow a key later, add its exact raw form
 # here; the parser below still refuses percent-escapes, duplicates and ';' in every key.
 _ALLOWED_QUERY_KEYS = frozenset()
-# The one exception: the opt-out of the default plugin view. While a default view is set
-# (GATE_DEFAULT_VIEW_PREFIX), the query string `raw=1`, exactly this text and nothing else (no
-# other key next to it, no other value, no other spelling), is signed and passed to the store,
-# which ignores it (no S3 or MinIO handler reads a `raw` key); the read is served as the plain
-# page. With no default view it is refused like every other query.
+# The one exception: the opt-out of the default plugin view. The query string `raw=1`, exactly
+# this text and nothing else (no other key next to it, no other value, no other spelling: one
+# comparison of the whole query, never a parse), is signed and passed to the store, which
+# ignores it (no S3 or MinIO handler reads a `raw` key); the read is served as the plain page.
+# It is accepted whether or not a default view is set, so a plugin's link to the plain page
+# keeps working in every rollout order and after the default view is turned off. That the store
+# ignores it is a property of the store build: check it again when the store changes.
 RAW_VIEW_QUERY = "raw=1"
 
 
@@ -717,10 +741,10 @@ def _allowed_query_pairs(raw_query):
     Fail-closed parsing: keys are compared byte-for-byte as sent (no case folding, no
     percent-decoding: `%61cl`, `acl%00`, `%20acl`, `ACL` are all simply "not allowed"), a key may
     appear once, and ';' (a separator for some parsers) is refused outright. RAW_VIEW_QUERY is
-    the one whole query string accepted besides, and only while a default view is set."""
+    the one whole query string accepted besides."""
     if raw_query == "" or ";" in raw_query:
         return None
-    if DEFAULT_VIEW_PREFIX and raw_query == RAW_VIEW_QUERY:
+    if raw_query == RAW_VIEW_QUERY:
         return [("raw", "1")]
     pairs, seen = [], set()
     for part in raw_query.split("&"):
@@ -813,8 +837,8 @@ def pub_auth_decision(method, uri, minio, now, header_names=(), enabled=None):
     """(allowed, key, reason) of one anonymous read, as /_gate/pub-auth decides it.
 
     Allowed only while anonymous pub/ is enabled (GATE_ANONYMOUS_PUB_ENABLED, or `enabled`),
-    for a GET or HEAD of /<bucket>/<pub prefix>... with no query (or, while a default plugin
-    view is set, exactly RAW_VIEW_QUERY) and no client x-amz-*/x-minio-*
+    for a GET or HEAD of /<bucket>/<pub prefix>... with no query (or exactly RAW_VIEW_QUERY,
+    the plain-page opt-out of the default plugin view) and no client x-amz-*/x-minio-*
     header (header_names), whose key, decoded once, is a key the gate serves (_bad_key) and
     passes pub_key_refused, whose pub root (acl_key_for) holds NO ACL object, and whose object
     exists. Nothing else is asked: no identity (a session cookie changes nothing here; the
@@ -828,8 +852,7 @@ def pub_auth_decision(method, uri, minio, now, header_names=(), enabled=None):
     if any(str(h).lower().startswith(_REFUSED_HEADER_PREFIXES) for h in header_names):
         return False, None, "client S3 header"
     target = split_forwarded_uri(uri)
-    if target is None or (target[1] is not None
-                          and not (DEFAULT_VIEW_PREFIX and target[1] == RAW_VIEW_QUERY)):
+    if target is None or (target[1] is not None and target[1] != RAW_VIEW_QUERY):
         return False, None, "malformed URI or a query"
     path = target[0]
     if not path.startswith(BUCKET_PATH):
@@ -942,6 +965,166 @@ def default_view_location(method, uri, key, headers, prefix=None):
     if any(not "!" <= ch <= "~" for ch in loc):
         return None                                   # unreachable: quote() leaves none
     return loc
+
+
+# Health of the default view's plugin (docs/plugins.md §6). Times in seconds.
+DEFAULT_VIEW_HEALTH_TTL = 5.0        # a result is used this long before a new probe starts
+DEFAULT_VIEW_HEALTH_DEADLINE = 1.0   # total time one probe may take, connect to status line
+DEFAULT_VIEW_HEALTH_MAX_AGE = 15.0   # a result older than this is unknown (the plain page)
+DEFAULT_VIEW_HEALTH_MAX_WORKERS = 4  # probe threads alive at once; above it: down
+# How long the default view waits for the login proxy on /_gate/pub-auth (_signed_in): shorter
+# than a decision's 10 s, because the read it would redirect needs no session at all.
+SIGNED_IN_TIMEOUT = 2
+
+
+class DefaultViewHealth:
+    """Whether the default view's plugin answers its health check: a cached answer, never a wait.
+
+    available() answers from the last probe result and, when that result is older than `ttl`,
+    starts one new probe in the background: at most one probe per `ttl` (single flight; a caller
+    that cannot take the lock at once, or finds a probe started less than `ttl` ago, starts
+    nothing and uses the last result). With no result yet (the first requests after start-up),
+    or a result older than `max_age`, the answer is False: unknown means the plain page. No
+    request ever waits for a probe, and nothing is probed until a request would redirect.
+
+    One probe is `GET <path>` to http://<host>:<port>, all three from configuration
+    (GATE_DEFAULT_VIEW_HEALTH_URL), nothing from a request: no Cookie, Authorization,
+    X-Forwarded-* or other visitor header, only Host, Accept-Encoding and a fixed User-Agent.
+    http.client follows no redirect and uses no proxy from the environment, so a 3xx is simply
+    not a 2xx. Only the status line and headers are read; the body never is, and is never
+    logged. 2xx is up; any other status, any exception, and no status within `deadline` seconds
+    IN TOTAL are down: the request runs in a worker thread the prober joins for `deadline`,
+    then the prober shuts the socket down, so a server that drips one byte at a time cannot hold
+    it longer. At most `max_workers` worker threads are alive at once; above that the answer is
+    down until they end. The first result and every change of state are logged (up or down,
+    with the status code or the exception class); nothing else is.
+
+    This proves the plugin is reachable, not that it is authentic: a service that answers 2xx
+    there is trusted exactly as much as with no health check."""
+
+    def __init__(self, host, port, path, ttl=None, deadline=None, max_age=None,
+                 max_workers=None, clock=time.monotonic):
+        self._host, self._port, self._path = host, port, path
+        self._ttl = DEFAULT_VIEW_HEALTH_TTL if ttl is None else ttl
+        self._deadline = DEFAULT_VIEW_HEALTH_DEADLINE if deadline is None else deadline
+        self._max_age = DEFAULT_VIEW_HEALTH_MAX_AGE if max_age is None else max_age
+        self._max_workers = DEFAULT_VIEW_HEALTH_MAX_WORKERS if max_workers is None else max_workers
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._state = None          # (up, monotonic start time of the probe that found it)
+        self._started = None        # start time of the last probe
+        self._seq = self._done = 0  # last probe started / last probe whose result was kept
+        self._workers = 0
+        self.probes = 0             # probes started (for tests and debugging)
+
+    def target(self):
+        return f"http://{self._host}:{self._port}{self._path}"
+
+    def state(self):
+        """The last result as (up, age in seconds), or None before the first one."""
+        st = self._state
+        return None if st is None else (st[0], self._clock() - st[1])
+
+    def available(self):
+        now = self._clock()
+        st = self._state
+        if st is None or now - st[1] >= self._ttl:
+            self._maybe_start(now)
+        return bool(st is not None and st[0] and now - st[1] < self._max_age)
+
+    def _maybe_start(self, now):
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            if self._started is not None and now - self._started < self._ttl:
+                return
+            self._started = now
+            self._seq += 1
+            seq = self._seq
+            stuck = self._workers >= self._max_workers
+            if not stuck:
+                self._workers += 1
+                self.probes += 1
+        finally:
+            self._lock.release()
+        if stuck:
+            self._record(seq, now, False, "earlier probes still running")
+            return
+        try:
+            threading.Thread(target=self._probe, args=(seq, now), name="default-view-health",
+                             daemon=True).start()
+        except RuntimeError as e:                    # no thread to spare: down, never raise
+            self._worker_done()
+            self._record(seq, now, False, type(e).__name__)
+
+    def _worker_done(self):
+        with self._lock:
+            self._workers -= 1
+
+    def _probe(self, seq, started):
+        box = {}
+        conn = http.client.HTTPConnection(self._host, self._port, timeout=self._deadline)
+
+        def work():
+            try:
+                conn.request("GET", self._path, headers={"User-Agent": "artifact-gate"})
+                box["status"] = conn.getresponse().status       # the body is never read
+            except Exception as e:  # noqa: BLE001 - every failure means down
+                box["error"] = type(e).__name__
+            finally:
+                conn.close()
+                self._worker_done()
+
+        worker = threading.Thread(target=work, name="default-view-health-io", daemon=True)
+        try:
+            worker.start()
+        except RuntimeError as e:
+            self._worker_done()
+            self._record(seq, started, False, type(e).__name__)
+            return
+        worker.join(self._deadline)
+        if worker.is_alive():
+            self._record(seq, started, False, f"no answer within {self._deadline:g} s")
+            self._shutdown(conn)
+            worker.join(self._deadline)      # a connect still under way ends by its own timeout
+            self._shutdown(conn)
+            return
+        if "status" in box:
+            self._record(seq, started, 200 <= box["status"] < 300, f"HTTP {box['status']}")
+        else:
+            self._record(seq, started, False, box.get("error", "error"))
+
+    @staticmethod
+    def _shutdown(conn):
+        sock = getattr(conn, "sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _record(self, seq, started, up, why):
+        with self._lock:
+            if seq <= self._done:
+                return                                   # a newer probe already answered
+            self._done = seq
+            before = self._state
+            self._state = (up, started)
+        if before is None or before[0] != up:
+            (LOG.info if up else LOG.warning)("default view target %s %s (%s)", self.target(),
+                                              "up" if up else "down", why)
+
+
+DEFAULT_VIEW_HEALTH = (DefaultViewHealth(*DEFAULT_VIEW_HEALTH_TARGET)
+                       if DEFAULT_VIEW_HEALTH_TARGET else None)
+
+
+def default_view_available():
+    """True when the default view's plugin answered its health check recently (see
+    DefaultViewHealth); False when there is no default view, while it is down, and while
+    unknown. Called last, only for a read that would otherwise be redirected."""
+    health = DEFAULT_VIEW_HEALTH
+    return health is not None and health.available()
 
 
 # The one `reason` a denied visitor is told (docs/plugins.md §1), whatever decide() said:
@@ -1511,7 +1694,7 @@ class GateHandler(BaseHTTPRequestHandler):
     # `Authorization: Bearer <id_token>`: its `name` claim becomes the DISPLAY name plugins show
     # (display_name_from_auth_headers). It never feeds identity or an ACL decision, and the
     # public route to the proxy's /auth endpoint is blocked (the gate reaches it in-cluster).
-    def _authenticate(self):
+    def _authenticate(self, timeout=10):
         """Ask oauth2-proxy about the visitor's cookie. Returns (email, groups, status).
         status: None = authenticated, 401 = no session, 403 = a session whose identity the gate
         refuses (refused_identity: email None, every caller answers 403), 500 = proxy
@@ -1536,7 +1719,7 @@ class GateHandler(BaseHTTPRequestHandler):
             headers["Authorization"] = bearer
         req = urllib.request.Request(OAUTH2_AUTH_URL, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 status, hdrs = r.status, r.headers
         except urllib.error.HTTPError as e:
             status, hdrs = e.code, e.headers
@@ -1564,11 +1747,13 @@ class GateHandler(BaseHTTPRequestHandler):
     def _signed_in(self):
         """True when the request carries a session (or bearer token) the proxy accepts, for an
         identity the gate does not refuse. Without a Cookie or Authorization header the proxy is
-        not asked; no session, a refused identity and a proxy error are all False. Used only by
-        the default plugin view on /_gate/pub-auth, never for a decision."""
+        not asked; no session, a refused identity, a proxy error and a proxy that does not
+        answer within SIGNED_IN_TIMEOUT seconds are all False. Used only by the default plugin
+        view on /_gate/pub-auth, never for a decision: the anonymous read it guards needs no
+        session, so it waits on the proxy for less than a decision does."""
         if not (self.headers.get("Cookie") or self.headers.get("Authorization")):
             return False
-        return self._authenticate()[2] is None
+        return self._authenticate(timeout=SIGNED_IN_TIMEOUT)[2] is None
 
     # -- pages ---------------------------------------------------------------------
     def _page(self, title, body, status=200):
@@ -1662,9 +1847,11 @@ class GateHandler(BaseHTTPRequestHandler):
         if verdict == "allow":
             # the default plugin view (default_view_location): asked only now, after the read was
             # allowed for this signed-in visitor, so every refusal below is the same answer as
-            # with no default view. The redirect carries no signature.
+            # with no default view; its plugin's health last (default_view_available), and
+            # while it is down or unknown the read is served plain. The redirect carries no
+            # signature.
             loc = default_view_location(method, uri, key, self.headers)
-            if loc is not None:
+            if loc is not None and default_view_available():
                 LOG.info("authz user=%s key=%s default view -> %s", self._email, key, loc)
                 return self._send(302, b"", "text/plain", extra={"Location": loc})
             # the proxy's upstream read is signed by the gate (see upstream_auth_headers); the
@@ -1702,9 +1889,11 @@ class GateHandler(BaseHTTPRequestHandler):
 
         The one other answer is the default plugin view (default_view_location) of an ALLOWED
         read: a 302 to the plugin's page, only for a visitor whose session is valid (_signed_in,
-        asked only once every other condition holds). The decision itself still asks no
-        identity: a visitor without a session, with a session the proxy refuses or while the
-        proxy fails gets the plain page, as before."""
+        asked only once every other condition holds, at most SIGNED_IN_TIMEOUT seconds) and only
+        while the plugin answers its health check (asked last). The decision itself still asks
+        no identity: a visitor without a session, with a session the proxy refuses, while the
+        proxy fails or is slow, and while the plugin is down get the plain page, as before. The
+        redirect is best effort."""
         allowed, key, reason = pub_auth_decision(method, uri, MINIO, int(time.time()),
                                                  header_names=list(self.headers.keys()))
         if allowed:
@@ -1713,7 +1902,7 @@ class GateHandler(BaseHTTPRequestHandler):
             sig = upstream_auth_headers(method, host, uri, READ_ACCESS_KEY, READ_SECRET_KEY)
             if sig is not None:
                 loc = default_view_location(method, uri, key, self.headers)
-                if loc is not None and self._signed_in():
+                if loc is not None and self._signed_in() and default_view_available():
                     LOG.info("pub-auth key=%s allowed=True default view (signed in) -> %s",
                              key, loc)
                     return self._send(302, b"", "text/plain", extra={"Location": loc})
