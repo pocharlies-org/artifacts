@@ -16,6 +16,9 @@
 #                            (the gate's anonymous decision first; e2e.sh checks either)
 #   ARTIFACTS_DEFAULT_VIEW_PREFIX  the route prefix of the plugin that opens HTML artifacts by
 #                            default (e.g. /_canvas/; empty = off), docs/plugins.md §6
+#   ARTIFACTS_DEFAULT_VIEW_HEALTH_URL  that plugin's health URL, set with the prefix:
+#                            http://<service>:<port><prefix>healthz (e.g.
+#                            http://canvas:8080/_canvas/healthz)
 name: artifacts
 services:
   minio:
@@ -129,6 +132,7 @@ services:
       GATE_ACL_CACHE_SECONDS: ${GATE_ACL_CACHE_SECONDS:-15}
       # default plugin view (off when empty); this stack is plain HTTP, so its redirect is http://
       GATE_DEFAULT_VIEW_PREFIX: ${ARTIFACTS_DEFAULT_VIEW_PREFIX:-}
+      GATE_DEFAULT_VIEW_HEALTH_URL: ${ARTIFACTS_DEFAULT_VIEW_HEALTH_URL:-}
       GATE_PUBLIC_SCHEME: http
       HMAC_KEY_FILE: /secrets/hmac-key
     volumes:

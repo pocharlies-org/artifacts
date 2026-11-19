@@ -2386,8 +2386,8 @@ class E2ETest(unittest.TestCase):
                 self.assertNotIn("Authorization", h, uri)
 
     def test_pub_auth_ignores_sessions_and_spoofed_targets(self):
-        # a session changes nothing (no identity is asked), and a forwarded URI aimed at u/ or
-        # g/ gets the uniform answer even from a visitor the ACL lists
+        # a session changes nothing (with no default view no identity is asked), and a forwarded
+        # URI aimed at u/ or g/ gets the uniform answer even from a visitor the ACL lists
         self.assertEqual(self.pub_auth("/artifacts/pub/free/index.html", cookie="sid=alice")[0],
                          200)
         with OBJECTS_LOCK:
@@ -2544,17 +2544,32 @@ class E2ETest(unittest.TestCase):
     VIEW_HOST = "artifacts.test.invalid"      # PUBLIC_HOST of this suite
     VIEW_BASE = "https://artifacts.test.invalid/_canvas/artifacts/"
 
+    class FixedHealth:
+        """Stands in for the plugin's health check: always `up`, counting the calls."""
+
+        def __init__(self, up=True):
+            self.up, self.calls = up, 0
+
+        def available(self):
+            self.calls += 1
+            return self.up
+
     def nav(self, uri, sid=None, dest="document", mode="navigate", method="GET",
-            host=VIEW_HOST, endpoint="/_gate/auth", extra=None, view="/_canvas/", flag=None):
+            host=VIEW_HOST, endpoint="/_gate/auth", extra=None, view="/_canvas/", flag=None,
+            health=None):
         """One forwardAuth call as Traefik makes it for a browser request (the visitor's
         Sec-Fetch-* and Cookie headers passed along), with the default view set to `view`
-        ("" = off). http.client, so a 302 is returned as is and never followed."""
-        saved = (self.gate.DEFAULT_VIEW_PREFIX, self.gate.ANONYMOUS_PUB_ENABLED)
+        ("" = off) and its plugin's health check `health` (default: always up). http.client,
+        so a 302 is returned as is and never followed."""
+        saved = (self.gate.DEFAULT_VIEW_PREFIX, self.gate.ANONYMOUS_PUB_ENABLED,
+                 self.gate.DEFAULT_VIEW_HEALTH)
         self.gate.DEFAULT_VIEW_PREFIX = view
+        self.gate.DEFAULT_VIEW_HEALTH = self.FixedHealth() if health is None else health
         if flag is not None:
             self.gate.ANONYMOUS_PUB_ENABLED = flag
         self.addCleanup(setattr, self.gate, "DEFAULT_VIEW_PREFIX", saved[0])
         self.addCleanup(setattr, self.gate, "ANONYMOUS_PUB_ENABLED", saved[1])
+        self.addCleanup(setattr, self.gate, "DEFAULT_VIEW_HEALTH", saved[2])
         h = {"X-Forwarded-Method": method, "X-Forwarded-Uri": uri}
         for name, value in (("X-Forwarded-Host", host), ("Sec-Fetch-Dest", dest),
                             ("Sec-Fetch-Mode", mode), ("Cookie", f"sid={sid}" if sid else None)):
@@ -2614,10 +2629,9 @@ class E2ETest(unittest.TestCase):
                          ("/artifacts/g/team-a/run1/index.html", "bob"),
                          ("/artifacts/pub/free/index.html", "alice")):
             self._assert_signed(self.nav(uri, sid, view=""), uri)
-        # and the opt-out query is just another refused query
-        st, _, h = self.nav("/artifacts/u/secret/report.html?raw=1", "alice", view="")
-        self.assertEqual(st, 404)
-        self.assertNotIn("Authorization", h)
+        # the one exception: the opt-out query is served (the plain page) with or without it
+        self._assert_signed(self.nav("/artifacts/u/secret/report.html?raw=1", "alice", view=""),
+                            "/artifacts/u/secret/report.html?raw=1", pairs=[("raw", "1")])
 
     def test_default_view_leaves_every_other_allowed_read_as_it_was(self):
         self._view_objects()
@@ -2646,18 +2660,21 @@ class E2ETest(unittest.TestCase):
 
     def test_default_view_raw_opt_out(self):
         uri = "/artifacts/u/secret/report.html"
-        self._assert_signed(self.nav(uri + "?raw=1", "alice"), uri + "?raw=1",
-                            pairs=[("raw", "1")])
+        for view in ("/_canvas/", ""):                          # whatever the setting
+            self._assert_signed(self.nav(uri + "?raw=1", "alice", view=view), uri + "?raw=1",
+                                pairs=[("raw", "1")])
         self._assert_signed(self.nav(uri + "?raw=1", "alice", method="HEAD"), uri + "?raw=1",
                             method="HEAD", pairs=[("raw", "1")])
         self._assert_signed(self.nav(uri + "?raw=1", "alice", dest="iframe"), uri + "?raw=1",
                             pairs=[("raw", "1")])
-        for q in ("raw=2", "raw=1&raw=1", "RAW=1", "raw", "raw=%31", "raw=1&acl", "x=1", ""):
-            st, body, h = self.nav(uri + "?" + q, "alice")
-            self.assertEqual(st, 404, q)
-            self.assertIn("Nothing here", body, q)
-            self.assertNotIn("Authorization", h, q)
-            self.assertNotIn("Location", h, q)
+        for q in ("raw=2", "raw=1&raw=1", "RAW=1", "raw", "raw=%31", "raw=1&acl", "x=1", "",
+                  "&raw=1", "raw=1&response-content-type=text/plain"):
+            for view in ("/_canvas/", ""):
+                st, body, h = self.nav(uri + "?" + q, "alice", view=view)
+                self.assertEqual(st, 404, (q, view))
+                self.assertIn("Nothing here", body, q)
+                self.assertNotIn("Authorization", h, q)
+                self.assertNotIn("Location", h, q)
         # the opt-out never opens a read the visitor could not make
         USERS["carol5"] = ("carol5@example.com", "aaaa")
         st, body, h = self.nav(uri + "?raw=1", "carol5")
@@ -2754,9 +2771,9 @@ class E2ETest(unittest.TestCase):
                             pairs=[("raw", "1")])
         self._assert_signed(self.nav(uri + "?raw=1", None, **pub), uri + "?raw=1",
                             pairs=[("raw", "1")])
-        # off: the default view's query is refused like any other, a session changes nothing
-        st, _, h = self.nav(uri + "?raw=1", "alice", view="", **pub)
-        self.assertEqual(st, 404)
+        # off: a session changes nothing, and `?raw=1` is still the plain page
+        self._assert_signed(self.nav(uri + "?raw=1", "alice", view="", **pub), uri + "?raw=1",
+                            pairs=[("raw", "1")])
         self._assert_signed(self.nav(uri, "alice", view="", **pub), uri)
         # the proxy is not asked for a visitor without a cookie, and its failure serves the page
         with mock.patch.object(self.gate.GateHandler, "_authenticate",
@@ -2778,6 +2795,145 @@ class E2ETest(unittest.TestCase):
                     self.assertEqual(ans[0], 404, (bad, sid, view))
                     shapes.add(self._shape(*ans))
         self.assertEqual(len(shapes), 1, shapes)
+
+
+    # -- the default view's health check and the login-proxy wait (docs/plugins.md §6) --------
+    class PluginStub:
+        """The plugin's Service: `GET /_canvas/healthz` answers as `mode` says (up, down,
+        redirect); counts the requests it gets."""
+
+        def __init__(self):
+            self.mode, self.hits = "up", 0
+            outer = self
+
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *a):
+                    pass
+
+                def do_GET(self):  # noqa: N802
+                    outer.hits += 1
+                    status = {"up": 200, "down": 503, "redirect": 302}[outer.mode]
+                    self.send_response(status)
+                    if status == 302:
+                        self.send_header("Location", "http://127.0.0.1:9/elsewhere")
+                    self.send_header("Content-Length", "0")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+
+            self.server = serve(Handler)
+            self.port = self.server.server_address[1]
+
+        def close(self):
+            self.server.shutdown()
+            self.server.server_close()
+
+    def _wait(self, cond, timeout=4.0):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end and not cond():
+            time.sleep(0.01)
+        self.assertTrue(cond())
+
+    def test_default_view_follows_the_plugin_health(self):
+        # the real health check against a stub plugin: unknown first (plain page), up (302),
+        # down or redirecting (plain page again), up again (302); every plain answer is the
+        # signed read, exactly as with no default view
+        plugin = self.PluginStub()
+        self.addCleanup(plugin.close)
+        health = self.gate.DefaultViewHealth("127.0.0.1", plugin.port, "/_canvas/healthz",
+                                             ttl=0.2, deadline=0.5, max_age=5.0)
+        uri, key = "/artifacts/u/secret/report.html", "u/secret/report.html"
+        self._assert_signed(self.nav(uri, "alice", health=health), uri)    # unknown: plain
+        self._wait(lambda: health.state() is not None)
+        self._assert_redirect(self.nav(uri, "alice", health=health), key)
+        for mode in ("down", "redirect", "up"):
+            plugin.mode = mode
+            done = health._done
+            time.sleep(0.25)                                  # past the TTL
+            self.nav(uri, "alice", health=health)             # starts the next probe
+            self._wait(lambda: health._done > done)
+            ans = self.nav(uri, "alice", health=health)
+            if mode == "up":
+                self._assert_redirect(ans, key)
+            else:
+                self._assert_signed(ans, uri)
+        # the plugin gone altogether (connection refused): plain page
+        plugin.close()
+        done = health._done
+        time.sleep(0.25)
+        self.nav(uri, "alice", health=health)
+        self._wait(lambda: health._done > done)
+        self._assert_signed(self.nav(uri, "alice", health=health), uri)
+
+    def test_default_view_health_is_asked_last(self):
+        # nothing that is refused, or that would not redirect anyway, makes the gate ask the
+        # plugin; on the anonymous pub/ route the session is asked first
+        self._view_objects()
+        USERS["carol6"] = ("carol6@example.com", "aaaa")
+        uri = "/artifacts/u/secret/report.html"
+        for args, kw in (((uri, None), {}), ((uri, "carol6"), {}),
+                         (("/artifacts/u/secret/ghost.html", "alice"), {}),
+                         ((uri, "alice"), dict(dest="iframe")), ((uri, "alice"), dict(method="HEAD")),
+                         ((uri, "alice"), dict(dest=None, mode=None)),
+                         (("/artifacts/u/secret/data.json", "alice"), {}),
+                         ((uri + "?raw=1", "alice"), {}), ((uri, "alice"), dict(host="other.example")),
+                         ((uri, "alice"), dict(view=""))):
+            spy = self.FixedHealth()
+            self.nav(*args, health=spy, **kw)
+            self.assertEqual(spy.calls, 0, (args, kw))
+        spy = self.FixedHealth()
+        self._assert_redirect(self.nav(uri, "alice", health=spy), "u/secret/report.html")
+        self.assertEqual(spy.calls, 1)
+        down = self.FixedHealth(up=False)
+        self._assert_signed(self.nav(uri, "alice", health=down), uri)       # down: plain page
+        self.assertEqual(down.calls, 1)
+        pub = dict(endpoint="/_gate/pub-auth", flag=True)
+        pub_uri = "/artifacts/pub/free/index.html"
+        USERS["guest6"] = ("guest6_example.org#EXT#@tenant.example", "")
+        for sid in (None, "nobody", "guest6"):
+            spy = self.FixedHealth()
+            self._assert_signed(self.nav(pub_uri, sid, health=spy, **pub), pub_uri)
+            self.assertEqual(spy.calls, 0, sid)
+        spy = self.FixedHealth()
+        self._assert_redirect(self.nav(pub_uri, "alice", health=spy, **pub), "pub/free/index.html")
+        self.assertEqual(spy.calls, 1)
+        down = self.FixedHealth(up=False)
+        self._assert_signed(self.nav(pub_uri, "alice", health=down, **pub), pub_uri)
+        self.assertEqual(down.calls, 1)
+
+    def test_default_view_pub_route_does_not_wait_on_a_hung_login_proxy(self):
+        # a login proxy that accepts the connection and never answers: the anonymous pub/ read
+        # is served plain after SIGNED_IN_TIMEOUT (2 s), not after a decision's 10 s
+        hung = socket.socket()
+        hung.bind(("127.0.0.1", 0))
+        hung.listen(16)
+        held = []
+
+        def accept():
+            while True:
+                try:
+                    held.append(hung.accept()[0])
+                except OSError:
+                    return
+        threading.Thread(target=accept, daemon=True).start()
+
+        def cleanup():
+            hung.close()
+            for c in held:
+                c.close()
+        self.addCleanup(cleanup)
+        self.assertEqual(self.gate.SIGNED_IN_TIMEOUT, 2)
+        uri = "/artifacts/pub/free/index.html"
+        spy = self.FixedHealth()
+        with mock.patch.object(self.gate, "OAUTH2_AUTH_URL",
+                               f"http://127.0.0.1:{hung.getsockname()[1]}/oauth2-artifacts/auth"):
+            t0 = time.monotonic()
+            ans = self.nav(uri, "alice", endpoint="/_gate/pub-auth", flag=True, health=spy)
+            took = time.monotonic() - t0
+        self._assert_signed(ans, uri)
+        self.assertEqual(spy.calls, 0)
+        self.assertTrue(held)                                 # the proxy was asked
+        self.assertLess(took, 3.0, took)
+        self.assertGreater(took, 1.5, took)                   # and the 2 s timeout ended it
 
 
 if __name__ == "__main__":

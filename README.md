@@ -58,8 +58,9 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   forwarded read; neither is MinIO root.
 - **No query strings, no client S3 headers**: the query allow-list is empty, so any `?` on
   an artifact read (`?acl`, `?lambdaArn=`, `?versionId`, `response-*`, even `?v=2` or a bare
-  `?`) answers 404 and is never signed. The one exception is `?raw=1`, exactly, and only while a
-  default plugin view is set (below). A forwarded read carrying any `x-amz-*` or
+  `?`) answers 404 and is never signed. The one exception is `?raw=1`, exactly: it is signed
+  and served as the plain page (the opt-out of the default plugin view, below, accepted with or
+  without one; the store ignores it). A forwarded read carrying any `x-amz-*` or
   `x-minio-*` request header is refused with 400 before the gate signs anything.
 - **Request access**: a denied visitor can ask the artifact's owner, who gets a one-click
   approve/deny link (Slack DM). An approval covers the whole artifact, not only the file that
@@ -121,10 +122,12 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
   read is allowed, a signed-in visitor's top-level navigation (`GET`, `Sec-Fetch-Dest: document`,
   `Sec-Fetch-Mode: navigate`) to an `.html`/`.htm` artifact under `u/`, `g/` or `pub/` on
   `PUBLIC_HOST`, with no query, gets a `302` to that plugin's page for the artifact
-  (`https://<PUBLIC_HOST><prefix><bucket>/<key>`) instead of the file. Iframes, subresources,
-  `HEAD`, clients without `Sec-Fetch-*`, other files and anonymous visitors are served as
-  before, every refusal is the same answer as without it, and `?raw=1` opens the plain page.
-  `pub/` served straight from MinIO never reaches the gate, so it opens plain.
+  (`https://<PUBLIC_HOST><prefix><bucket>/<key>`) instead of the file, while the plugin answers
+  `GET <prefix>healthz` on its Service (checked at most every 5 s, 1 s deadline, never waited
+  for; down or unknown means the plain page). Iframes, subresources, `HEAD`, clients without
+  `Sec-Fetch-*`, other files and anonymous visitors are served as before, every refusal is the
+  same answer as without it, and `?raw=1` opens the plain page. `pub/` served straight from
+  MinIO never reaches the gate, so it opens plain.
 
 ## Quick start (laptop, Docker Compose)
 
@@ -177,6 +180,7 @@ variables (empty by default):
 | `ARTIFACTS_PLUGIN_USERS` | `<name>:<secret>[,…]` — `bootstrap.sh` creates S3 user `plugin-<name>` with the policy of docs/plugins.md §3 (`_plugins/<name>/*` only) |
 | `GATE_ACL_CACHE_SECONDS` | the gate's ACL cache (default 15 s); lower it to see revocations quickly |
 | `ARTIFACTS_DEFAULT_VIEW_PREFIX` | the route prefix of the plugin that opens HTML artifacts by default (`/_<name>/`; empty = off), docs/plugins.md §6; the redirect is `http://` on this stack |
+| `ARTIFACTS_DEFAULT_VIEW_HEALTH_URL` | that plugin's health URL, required with the prefix: `http://<service>:<port><prefix>healthz` (e.g. `http://canvas:8080/_canvas/healthz`) |
 
 The plugin asks the real gate (`http://gate:8081/_gate/plugin/authz`) and uses the real
 MinIO (`http://minio:9000`). `e2e.sh` keeps passing with plugins enabled (run it from this
@@ -339,7 +343,7 @@ Everything is environment-driven; nothing is hardcoded.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GATE_BUCKET` | `artifacts` | bucket served |
+| `GATE_BUCKET` | `artifacts` | bucket served; an S3 bucket name (`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`), the gate refuses to start otherwise |
 | `MINIO_ENDPOINT` | — | S3 endpoint (path-style) |
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | required | least-privilege gate user (ACL + `_gate/` state work) |
 | `GATE_READ_ACCESS_KEY` / `GATE_READ_SECRET_KEY` | required | read-signing user: signs forwarded reads only; must differ from the gate user (the gate refuses to start otherwise) |
@@ -359,6 +363,7 @@ Everything is environment-driven; nothing is hardcoded.
 | `GATE_ACL_CACHE_MAX_ENTRIES` | `10000` | ACL cache: most entries kept (least recently used evicted first) |
 | `GATE_PORT` / `GATE_AUTH_PORT` | `8080` / `8081` | public / decision listeners |
 | `GATE_DEFAULT_VIEW_PREFIX` | empty (off) | route prefix of the default plugin view (docs/plugins.md §6), e.g. `/_canvas/`: `^/_[a-z0-9_-]+(/[a-z0-9_-]+)*/$`, never `/_gate/`, `/_plugins/` or `/oauth2-artifacts/`; with it set, `PUBLIC_HOST` must be a lowercase host name with an optional port (the gate refuses to start otherwise) |
+| `GATE_DEFAULT_VIEW_HEALTH_URL` | empty | the default view's plugin health URL, required with `GATE_DEFAULT_VIEW_PREFIX` and refused without it: exactly `http://<DNS name>:<port><prefix>healthz` (no IP literal, no userinfo, no query); the gate redirects only while it answers 2xx (docs/plugins.md §6) |
 | `GATE_PUBLIC_SCHEME` | `https` | scheme of the default view's redirect: `https` or `http` (a plain-HTTP local stack only) |
 
 ### Publisher CLI (`cli/publish.sh`)
@@ -396,7 +401,7 @@ the chart refuses anything else.
 |---|---|---|
 | `ingressRouteAnnotations` | `{}` | annotations on every IngressRoute (artifacts host and plugin routes), e.g. `kubernetes.io/ingress.class: traefik-internal` |
 | `gate.requestCaps.perRequester` / `gate.requestCaps.ownerPending` | `20` / `10` | `GATE_REQUESTER_RATE_LIMIT_MAX` / `GATE_OWNER_PENDING_MAX` of the gate (see the gate table); whole numbers from 1 to 999999, anything else is refused |
-| `plugins[].defaultView` | `false` | a boolean, `true` on at most one plugin: the gate redirects a signed-in visitor's top-level navigation to an HTML artifact to that plugin's page for it, `?raw=1` keeps the plain page (docs/plugins.md §6); renders the gate's `GATE_DEFAULT_VIEW_PREFIX`, nothing when absent or `false` |
+| `plugins[].defaultView` | `false` | a boolean, `true` on at most one plugin: the gate redirects a signed-in visitor's top-level navigation to an HTML artifact to that plugin's page for it while the plugin answers `GET <prefix>healthz`, `?raw=1` keeps the plain page (docs/plugins.md §6); renders the gate's `GATE_DEFAULT_VIEW_PREFIX` and `GATE_DEFAULT_VIEW_HEALTH_URL` (`http://<service>.<namespace>.svc.cluster.local:<port><pathPrefix>healthz`, from the same entry), nothing when absent or `false` |
 | `gate.trustForwardHeader` | `false` | `trustForwardHeader` of the `gate-auth` forwardAuth middleware; `false` makes Traefik set the `X-Forwarded-*` headers the gate decides on from the request itself |
 | `artifactsGate.anonymousPubThroughGate` | `false` | with `artifactsGate.anonymousPubEnabled`: `false` serves `pub/` straight from MinIO (rule 2, `.acl.json` and listings kept off it); `true` makes rule 2 ask the gate's anonymous decision first (middleware `gate-pub-auth`, `/_gate/pub-auth`, `trustForwardHeader` always `false`), so a missing key, a key with an ACL, a listing and an `.acl.json` get the gate's one `404` page and never MinIO's error. `gate-pub-auth` is rendered whenever anonymous `pub/` is on, so turning this on changes routes only; the chart refuses `true` without anonymous `pub/` |
 | `oauth2Proxy.emailDomains` | `[]` | one `--email-domain` per entry; empty renders `--email-domain=*`; an entry `*` is refused |
