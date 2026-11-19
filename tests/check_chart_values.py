@@ -14,9 +14,11 @@ from values), the route that keeps /_gate/plugin/ off the public gate listener, 
 example login-proxy image (digest-pinned, v7.15.5 or newer, the same image the compose stack
 runs), the names written into Traefik rules: artifactsHost, artifactsExtraHosts and
 plugins[].pathPrefix (a safe charset only, so a backtick can never rewrite a rule),
-minio.bucket (an S3 bucket name only, for the same reason), and the gate's request-access
-caps (gate.requestCaps, whole numbers only). Every refusal the chart
-makes for these values is exercised too. Stdlib only.
+minio.bucket (an S3 bucket name only, for the same reason), the gate's request-access
+caps (gate.requestCaps, whole numbers only), and plugins[].defaultView (a boolean on at most
+one plugin; it renders the gate's GATE_DEFAULT_VIEW_PREFIX, nothing when absent or false, and
+the compose stack leaves it off). Every refusal the chart makes for these values is exercised
+too. Stdlib only.
 """
 import json
 import os
@@ -284,6 +286,28 @@ for bucket in ("team-reports.v2", "abc", "a" * 63, "1artifacts9"):
     check(gate_env(documents(out)[("Deployment", "artifact-gate")]).get("GATE_BUCKET") == bucket,
           "set: minio.bucket %s reaches the gate's GATE_BUCKET" % bucket[:20])
 
+# ---- the default plugin view: plugins[].defaultView -> the gate's GATE_DEFAULT_VIEW_PREFIX --
+check("GATE_DEFAULT_VIEW_PREFIX" not in default and "GATE_PUBLIC_SCHEME" not in default,
+      "default: no default plugin view (no GATE_DEFAULT_VIEW_PREFIX, no GATE_PUBLIC_SCHEME)")
+check("GATE_DEFAULT_VIEW_PREFIX" not in ok_render(),
+      "default: no plugins, no default plugin view")
+OTHER = {"name": "other", "pathPrefix": "/_other/v1/", "service": "s", "port": 80}
+for plugins, want in (([dict(PLUGIN[0], defaultView=True)], "/_canvas/"),
+                      ([dict(PLUGIN[0], defaultView=False)], None),
+                      ([dict(PLUGIN[0], defaultView=False), dict(OTHER, defaultView=True)], "/_other/v1/"),
+                      ([dict(PLUGIN[0], defaultView=True), OTHER], "/_canvas/"),
+                      ([PLUGIN[0], dict(OTHER, defaultView=False)], None)):
+    out = ok_render({"plugins": plugins})
+    env = gate_env(documents(out)[("Deployment", "artifact-gate")])
+    check(env.get("GATE_DEFAULT_VIEW_PREFIX") == want and out.count("GATE_DEFAULT_VIEW_PREFIX") == (1 if want else 0),
+          "set: plugins %s render GATE_DEFAULT_VIEW_PREFIX=%s" % (json.dumps(plugins), want))
+    check("GATE_PUBLIC_SCHEME" not in out, "set: the chart never renders GATE_PUBLIC_SCHEME (https)")
+with open(COMPOSE) as f:
+    compose = f.read()
+check("      GATE_DEFAULT_VIEW_PREFIX: ${ARTIFACTS_DEFAULT_VIEW_PREFIX:-}\n" in compose
+      and "      GATE_PUBLIC_SCHEME: http\n" in compose,
+      "compose: default plugin view off unless ARTIFACTS_DEFAULT_VIEW_PREFIX is set; plain-HTTP scheme")
+
 # ---- refusals ----------------------------------------------------------------------------
 OP = "oauth2Proxy"
 refusals = [
@@ -360,6 +384,18 @@ refusals = [
     for b in ("artifacts`) || PathPrefix(`/", "artifacts`) || Host(`evil.example", "artifacts)",
               "artifacts`", "Artifacts", "ab", "a" * 64, "-artifacts", "artifacts-", ".artifacts",
               "art_ifacts", "art ifacts", "artifacts/x", "artifacts\n", "", 123, True, None)
+] + [
+    # plugins[].defaultView: a boolean, true on at most one plugin
+    ({"plugins": [dict(PLUGIN[0], defaultView=v)]}, "defaultView must be a boolean")
+    for v in ("true", "false", "yes", 1, 0, "", [True], {"on": True}, None)
+] + [
+    ({"plugins": [dict(PLUGIN[0], defaultView=True),
+                  {"name": "other", "pathPrefix": "/_other/", "service": "s", "port": 80,
+                   "defaultView": True}]}, "at most one plugin may be the default view"),
+    ({"plugins": [dict(PLUGIN[0], defaultView=True, pathPrefix="/_gate/x/")]},
+     "collides with the reserved core path"),
+    ({"plugins": [dict(PLUGIN[0], defaultView=True, pathPrefix="/_x/`) || PathPrefix(`/")]},
+     "may only hold lowercase letters"),
 ]
 for values, needle in refusals:
     rc, _, err = render(values)

@@ -1955,3 +1955,184 @@ class RefusedIdentityTest(unittest.TestCase):
         for email in ("alice@example.org", "ext@example.org", "a#ex#t@example.org", "#ext@x.org",
                       "", None):
             self.assertFalse(gate.refused_identity(email), email)
+
+
+class DefaultViewTest(unittest.TestCase):
+    """The default plugin view (docs/plugins.md §6): with GATE_DEFAULT_VIEW_PREFIX set, an
+    allowed, signed-in, top-level navigation to an HTML artifact is redirected to that plugin's
+    page for it; every other read, and every refusal, is what it is without it."""
+
+    HOST = "artifacts.example.com"           # PUBLIC_HOST of this suite (the gate's default)
+    BASE = "https://artifacts.example.com/_canvas/artifacts/"
+
+    def _load(self, **env):
+        return ReadSigningUserTest._load(self, **env)
+
+    @staticmethod
+    def hdrs(dest="document", mode="navigate", host=HOST, extra=()):
+        m = http.client.HTTPMessage()
+        for name, value in (("Sec-Fetch-Dest", dest), ("Sec-Fetch-Mode", mode),
+                            ("X-Forwarded-Host", host)):
+            if value is not None:
+                m[name] = value
+        for name, value in extra:
+            m[name] = value                   # appends: a repeated header stays repeated
+        return m
+
+    def loc(self, key, method="GET", uri=None, headers=None, prefix="/_canvas/"):
+        uri = "/artifacts/" + urllib.parse.quote(key, safe="/") if uri is None else uri
+        return gate.default_view_location(method, uri, key,
+                                          self.hdrs() if headers is None else headers,
+                                          prefix=prefix)
+
+    # -- configuration -----------------------------------------------------------------
+    def test_off_by_default(self):
+        self.assertEqual((gate.DEFAULT_VIEW_PREFIX, gate.PUBLIC_SCHEME), ("", "https"))
+        self.assertIsNone(gate.default_view_location(
+            "GET", "/artifacts/u/run/index.html", "u/run/index.html", self.hdrs()))
+
+    def test_config_is_read_and_checked_at_start(self):
+        mod = self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/")
+        self.assertEqual((mod.DEFAULT_VIEW_PREFIX, mod.PUBLIC_SCHEME), ("/_canvas/", "https"))
+        mod = self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/v2/", GATE_PUBLIC_SCHEME="http",
+                         PUBLIC_HOST="127.0.0.1:8080")
+        self.assertEqual((mod.DEFAULT_VIEW_PREFIX, mod.PUBLIC_SCHEME), ("/_canvas/v2/", "http"))
+        self.assertEqual(mod.default_view_location(
+            "GET", "/artifacts/u/run/index.html", "u/run/index.html",
+            self.hdrs(host="127.0.0.1:8080")),
+            "http://127.0.0.1:8080/_canvas/v2/artifacts/u/run/index.html")
+        # a bad PUBLIC_HOST matters only once a default view is set
+        self.assertEqual(self._load(PUBLIC_HOST="Not A Host/x").DEFAULT_VIEW_PREFIX, "")
+        for bad in ("/_gate/", "/_gate/x/", "/_plugins/", "/_plugins/x/", "/_", "/_g", "/_canvas",
+                    "_canvas/", "/canvas/", "/_Canvas/", "/_can vas/", "/_canvas/../", "/_./",
+                    "/_canvas//", "//evil.example/", "/_canvas/\n", " /_canvas/", "/_can.vas/",
+                    "https://evil.example/_canvas/", "/_canvas/?x=", "/_canvas/#", "/_c%61nvas/"):
+            with self.subTest(prefix=bad), self.assertRaises(RuntimeError):
+                self._load(GATE_DEFAULT_VIEW_PREFIX=bad)
+        for bad in ("", "ftp", "HTTPS", "https:", "javascript", "https://evil.example"):
+            with self.subTest(scheme=bad), self.assertRaises(RuntimeError):
+                self._load(GATE_PUBLIC_SCHEME=bad)
+        for bad in ("", "Artifacts.example.com", "evil.example/x", "a@evil.example", "a b",
+                    "artifacts.example.com.", "-a.example.com", "a.example.com:", "[::1]",
+                    "a.example.com:123456"):
+            with self.subTest(host=bad), self.assertRaises(RuntimeError):
+                self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/", PUBLIC_HOST=bad)
+
+    # -- when it redirects ---------------------------------------------------------------
+    def test_redirects_an_html_artifact_under_u_g_and_pub(self):
+        for key in ("u/run/index.html", "u/run/sub/deep/page.html", "g/team-a/run/index.html",
+                    "pub/run/index.html", "pub/flat-0123abcd.html", "u/run/REPORT.HTML",
+                    "u/run/old.htm"):
+            self.assertEqual(self.loc(key), self.BASE + key, key)
+        # the host compare ignores case (DNS); the Location uses PUBLIC_HOST as configured
+        self.assertEqual(self.loc("u/run/index.html", headers=self.hdrs(host="ARTIFACTS.example.COM")),
+                         self.BASE + "u/run/index.html")
+        # no X-Forwarded-Host: the Host header is the request's host
+        m = self.hdrs(host=None)
+        m["Host"] = self.HOST
+        self.assertEqual(self.loc("u/run/index.html", headers=m), self.BASE + "u/run/index.html")
+
+    def test_top_level_navigation_only(self):
+        self.assertTrue(gate.is_top_level_navigation(self.hdrs()))
+        self.assertTrue(gate.is_top_level_navigation(self.hdrs(dest=" document ", mode="navigate ")))
+        for dest, mode in (("iframe", "navigate"), ("frame", "navigate"), ("embed", "no-cors"),
+                           ("object", "no-cors"), ("empty", "cors"), ("document", "cors"),
+                           ("document", "no-cors"), ("document", "same-origin"), ("script", "no-cors"),
+                           ("image", "no-cors"), ("style", "no-cors"), ("Document", "navigate"),
+                           ("document", "Navigate"), ("document", None), (None, "navigate"),
+                           (None, None), ("", ""), ("document,iframe", "navigate")):
+            with self.subTest(dest=dest, mode=mode):
+                self.assertFalse(gate.is_top_level_navigation(self.hdrs(dest=dest, mode=mode)))
+                self.assertIsNone(self.loc("u/run/index.html", headers=self.hdrs(dest=dest, mode=mode)))
+        for extra in ((("Sec-Fetch-Dest", "document"),), (("Sec-Fetch-Dest", "iframe"),),
+                      (("Sec-Fetch-Mode", "navigate"),)):
+            with self.subTest(repeated=extra):     # a repeated header is not one navigation
+                self.assertIsNone(self.loc("u/run/index.html", headers=self.hdrs(extra=extra)))
+        self.assertFalse(gate.is_top_level_navigation(None))
+
+    def test_no_redirect_for_any_other_request(self):
+        key = "u/run/index.html"
+        self.assertEqual(self.loc(key), self.BASE + key)                         # control
+        self.assertIsNone(self.loc(key, prefix=""))                              # feature off
+        for method in ("HEAD", "POST", "PUT", "DELETE", "OPTIONS", "get"):
+            self.assertIsNone(self.loc(key, method=method), method)
+        for q in ("?raw=1", "?raw=0", "?x=1", "?", "?acl"):
+            self.assertIsNone(self.loc(key, uri="/artifacts/u/run/index.html" + q), q)
+        for other in ("u/run/data.json", "u/run/app.css", "u/run/app.js", "u/run/pic.png",
+                      "u/run/pic.svg", "u/run/index.html.txt", "u/run/index.htmlx",
+                      "u/run/index", "u/run/html", "u/run/.html/x.css", "pub/run/report.pdf"):
+            self.assertIsNone(self.loc(other), other)
+        for outside in ("acl/x.html", "x.html", "u/x.html", "g/team-a/x.html", "other/run/x.html",
+                        "_plugins/canvas/u/run/index.html", "_gate/x.html", "_mcp/x.html",
+                        "u/run/.acl.json", "u/run/", "u/run//x.html", "u/run/../x.html"):
+            self.assertIsNone(self.loc(outside), outside)
+        for host in ("evil.example", "artifacts.example.com.evil.example", "", None,
+                     "evil.example, artifacts.example.com", "artifacts.example.com:8443"):
+            self.assertIsNone(self.loc(key, headers=self.hdrs(host=host)), host)
+        # the decided key must be what the path decodes to, once, as valid UTF-8
+        self.assertIsNone(self.loc("u/run/index.html", uri="/artifacts/u/run/other.html"))
+        self.assertIsNone(self.loc("u/run/�.html", uri="/artifacts/u/run/%ff.html"))
+        self.assertIsNone(self.loc("u/run/%69ndex.html", uri="/artifacts/u/run/%69ndex.html"))
+        for uri in ("//evil.example/artifacts/u/run/index.html", "/artifacts/u/run/index.html#x",
+                    "http://evil.example/artifacts/u/run/index.html", "artifacts/u/run/index.html",
+                    "/artifacts/u/run/in dex.html", "/other/u/run/index.html"):
+            self.assertIsNone(self.loc("u/run/index.html", uri=uri), uri)
+
+    def test_location_is_this_host_and_the_decided_key_only(self):
+        # open-redirect shapes in the key itself: the Location keeps PUBLIC_HOST, the plugin
+        # prefix and the bucket, carries no query or fragment, and decodes back to the key
+        keys = ("u/run/@evil.example.html", "u/run/%2F%2Fevil.example.html",
+                "u/run/\\\\evil.example\\x.html", "u/run/a b?c#d.html", "u/run/é ü.html",
+                "u/run/x\r\nSet-Cookie: a=b.html", "u/run/javascript:alert(1).html",
+                "u/run/https:%2F%2Fevil.example.html", "u/run/;x=1.html", "u/run/%00.html",
+                "pub/run/x‮.html", "g/team-a/run/&a=b+c.html")
+        for key in keys:
+            with self.subTest(key=key):
+                loc = self.loc(key)
+                self.assertIsNotNone(loc)
+                self.assertTrue(all("!" <= ch <= "~" for ch in loc), loc)
+                parts = urllib.parse.urlsplit(loc)
+                self.assertEqual((parts.scheme, parts.netloc, parts.query, parts.fragment),
+                                 ("https", self.HOST, "", ""))
+                self.assertTrue(parts.path.startswith("/_canvas/artifacts/"), loc)
+                self.assertEqual(urllib.parse.unquote(parts.path[len("/_canvas/artifacts/"):]), key)
+                self.assertEqual(loc, "https://" + self.HOST + "/_canvas"
+                                 + gate.canonical_artifact_path("/artifacts/" + urllib.parse.quote(key)))
+
+    # -- the opt-out: ?raw=1 -------------------------------------------------------------
+    def test_raw_query_signed_only_with_a_default_view(self):
+        uri = "/artifacts/u/run/index.html?raw=1"
+        self.assertIsNone(gate._allowed_query_pairs("raw=1"))                    # off: refused
+        self.assertIsNone(gate.upstream_auth_headers("GET", "h", uri, "AK", "SK"))
+        with mock.patch.object(gate, "DEFAULT_VIEW_PREFIX", "/_canvas/"):
+            self.assertEqual(gate._allowed_query_pairs("raw=1"), [("raw", "1")])
+            h = gate.upstream_auth_headers("GET", "h", uri, "AK", "SK", amzdate="20260101T000000Z")
+            want = gate.sigv4_headers("GET", "h", "/artifacts/u/run/index.html", [("raw", "1")],
+                                      None, b"", "AK", "SK", amzdate="20260101T000000Z")
+            bare = gate.sigv4_headers("GET", "h", "/artifacts/u/run/index.html", [], None, b"",
+                                      "AK", "SK", amzdate="20260101T000000Z")
+            self.assertEqual(h["Authorization"], want["Authorization"])
+            self.assertNotEqual(h["Authorization"], bare["Authorization"])
+            for q in ("raw=0", "raw=2", "raw=", "raw", "RAW=1", "Raw=1", "raw=01", "raw=1 ",
+                      "raw=%31", "%72aw=1", "raw=1&raw=1", "raw=1&acl", "acl&raw=1", "raw=1;",
+                      "raw=1&", "&raw=1", "raw=1#", "raw=true", "raw=1&lambdaArn=x", ""):
+                self.assertIsNone(gate._allowed_query_pairs(q), repr(q))
+                self.assertIsNone(gate.upstream_auth_headers(
+                    "GET", "h", "/artifacts/u/run/index.html?" + q, "AK", "SK"), repr(q))
+            self.assertEqual(gate._ALLOWED_QUERY_KEYS, frozenset())   # no key allowed besides
+
+    def test_anonymous_pub_decision_takes_raw_only_with_a_default_view(self):
+        m = FakeMinio({"pub/run/index.html": b"x"})
+        gate._acl_cache.clear()
+        self.addCleanup(gate._acl_cache.clear)
+        d = lambda uri: gate.pub_auth_decision("GET", uri, m, NOW, enabled=True)[0::2]
+        self.assertEqual(d("/artifacts/pub/run/index.html"), (True, "pub: anonymous, no ACL"))
+        self.assertEqual(d("/artifacts/pub/run/index.html?raw=1"),
+                         (False, "malformed URI or a query"))
+        with mock.patch.object(gate, "DEFAULT_VIEW_PREFIX", "/_canvas/"):
+            self.assertEqual(d("/artifacts/pub/run/index.html?raw=1"),
+                             (True, "pub: anonymous, no ACL"))
+            for q in ("raw=2", "raw=1&raw=1", "x=1", "", "RAW=1"):
+                self.assertEqual(d("/artifacts/pub/run/index.html?" + q),
+                                 (False, "malformed URI or a query"), q)
+            self.assertEqual(d("/artifacts/pub/run/missing.html?raw=1"), (False, "object missing"))

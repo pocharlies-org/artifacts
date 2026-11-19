@@ -53,6 +53,13 @@ publicExposure). Where that anonymous decision lives depends on the route:
 
 `/_gate/auth` stays the signed-in decision: it never answers 200 without a valid session.
 
+Default plugin view (off unless GATE_DEFAULT_VIEW_PREFIX names a plugin route, docs/plugins.md §6):
+once a read is allowed, a signed-in visitor's top-level navigation (GET, Sec-Fetch-Dest: document,
+Sec-Fetch-Mode: navigate) to an .html/.htm artifact under u/, g/ or pub/, on PUBLIC_HOST, with no
+query, is answered 302 to <scheme>://PUBLIC_HOST<prefix><bucket>/<key> instead of being signed
+(default_view_location). Iframes, subresources, HEAD, clients without Sec-Fetch-*, other files and
+`?raw=1` (then signed and served) are unchanged, and so is every refusal.
+
 The gate also serves the request-access flow (all state in MinIO under `_gate/`, written with the
 gate's own least-privilege S3 user):
 
@@ -190,6 +197,40 @@ ANONYMOUS_PUB_ENABLED = _env("GATE_ANONYMOUS_PUB_ENABLED", "false").lower() in (
 PLUGIN_PREFIX = _env("GATE_PLUGIN_PREFIX", "_plugins")  # plugin storage prefix: never served
 # Reserved for an MCP publisher's own bookkeeping objects: never an artifact, never served.
 MCP_PREFIX = "_mcp"
+# Default plugin view (docs/plugins.md §6): the route prefix of the one plugin that opens HTML
+# artifacts by default (the chart's plugins[].defaultView), e.g. "/_canvas/". Empty (the
+# default): off, and nothing below changes. Set: a signed-in visitor's top-level navigation to
+# an HTML artifact they may read is answered with a redirect to that plugin's page for the same
+# artifact (default_view_location), and `?raw=1` on an artifact read is served as the plain
+# page. GATE_PUBLIC_SCHEME is the scheme of that redirect (`https`; `http` only for a local
+# plain-HTTP stack). Checked at start (_default_view_config): the gate refuses to start on a
+# prefix that is not a plugin route prefix, a scheme other than http/https, or (with a prefix
+# set) a PUBLIC_HOST that is not a lowercase host name with an optional port.
+_PLUGIN_ROUTE_PREFIX_RE = re.compile(r"/_[a-z0-9_-]+(/[a-z0-9_-]+)*/")
+_RESERVED_ROUTE_PREFIXES = ("/_gate/", "/_plugins/", "/oauth2-artifacts/")
+_PUBLIC_HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?")
+
+
+def _default_view_config(prefix, scheme, public_host):
+    """(prefix, scheme) of the default plugin view; prefix "" means off. Raises RuntimeError
+    (the gate does not start) on any value it would not use as given."""
+    if scheme not in ("https", "http"):
+        raise RuntimeError(f"GATE_PUBLIC_SCHEME must be https or http, got {scheme!r}")
+    if not prefix:
+        return "", scheme
+    if (not _PLUGIN_ROUTE_PREFIX_RE.fullmatch(prefix)
+            or any(prefix.startswith(r) or r.startswith(prefix) for r in _RESERVED_ROUTE_PREFIXES)):
+        raise RuntimeError("GATE_DEFAULT_VIEW_PREFIX must be a plugin route prefix "
+                           f"(^/_[a-z0-9_-]+(/[a-z0-9_-]+)*/$, not a core path), got {prefix!r}")
+    if not _PUBLIC_HOST_RE.fullmatch(public_host or ""):
+        raise RuntimeError("PUBLIC_HOST must be a lowercase host name (optional :port) when "
+                           f"GATE_DEFAULT_VIEW_PREFIX is set, got {public_host!r}")
+    return prefix, scheme
+
+
+DEFAULT_VIEW_PREFIX, PUBLIC_SCHEME = _default_view_config(
+    _env("GATE_DEFAULT_VIEW_PREFIX", ""), _env("GATE_PUBLIC_SCHEME", "https"), PUBLIC_HOST)
+
 RATE_LIMIT_MAX = int(_env("GATE_RATE_LIMIT_MAX", "5"))     # access requests per requester + file
 RATE_LIMIT_WINDOW = int(_env("GATE_RATE_LIMIT_WINDOW_SECONDS", "86400"))
 # Access requests one requester may send per window, across every artifact.
@@ -662,6 +703,12 @@ def _bad_key(key):
 # refused with the same 404 as a never-served key. To allow a key later, add its exact raw form
 # here; the parser below still refuses percent-escapes, duplicates and ';' in every key.
 _ALLOWED_QUERY_KEYS = frozenset()
+# The one exception: the opt-out of the default plugin view. While a default view is set
+# (GATE_DEFAULT_VIEW_PREFIX), the query string `raw=1`, exactly this text and nothing else (no
+# other key next to it, no other value, no other spelling), is signed and passed to the store,
+# which ignores it (no S3 or MinIO handler reads a `raw` key); the read is served as the plain
+# page. With no default view it is refused like every other query.
+RAW_VIEW_QUERY = "raw=1"
 
 
 def _allowed_query_pairs(raw_query):
@@ -669,9 +716,12 @@ def _allowed_query_pairs(raw_query):
 
     Fail-closed parsing: keys are compared byte-for-byte as sent (no case folding, no
     percent-decoding: `%61cl`, `acl%00`, `%20acl`, `ACL` are all simply "not allowed"), a key may
-    appear once, and ';' (a separator for some parsers) is refused outright."""
+    appear once, and ';' (a separator for some parsers) is refused outright. RAW_VIEW_QUERY is
+    the one whole query string accepted besides, and only while a default view is set."""
     if raw_query == "" or ";" in raw_query:
         return None
+    if DEFAULT_VIEW_PREFIX and raw_query == RAW_VIEW_QUERY:
+        return [("raw", "1")]
     pairs, seen = [], set()
     for part in raw_query.split("&"):
         k, sep, v = part.partition("=")
@@ -763,7 +813,8 @@ def pub_auth_decision(method, uri, minio, now, header_names=(), enabled=None):
     """(allowed, key, reason) of one anonymous read, as /_gate/pub-auth decides it.
 
     Allowed only while anonymous pub/ is enabled (GATE_ANONYMOUS_PUB_ENABLED, or `enabled`),
-    for a GET or HEAD of /<bucket>/<pub prefix>... with no query and no client x-amz-*/x-minio-*
+    for a GET or HEAD of /<bucket>/<pub prefix>... with no query (or, while a default plugin
+    view is set, exactly RAW_VIEW_QUERY) and no client x-amz-*/x-minio-*
     header (header_names), whose key, decoded once, is a key the gate serves (_bad_key) and
     passes pub_key_refused, whose pub root (acl_key_for) holds NO ACL object, and whose object
     exists. Nothing else is asked: no identity (a session cookie changes nothing here; the
@@ -777,7 +828,8 @@ def pub_auth_decision(method, uri, minio, now, header_names=(), enabled=None):
     if any(str(h).lower().startswith(_REFUSED_HEADER_PREFIXES) for h in header_names):
         return False, None, "client S3 header"
     target = split_forwarded_uri(uri)
-    if target is None or target[1] is not None:
+    if target is None or (target[1] is not None
+                          and not (DEFAULT_VIEW_PREFIX and target[1] == RAW_VIEW_QUERY)):
         return False, None, "malformed URI or a query"
     path = target[0]
     if not path.startswith(BUCKET_PATH):
@@ -807,6 +859,89 @@ def pub_auth_decision(method, uri, minio, now, header_names=(), enabled=None):
     if not exists:
         return False, key, "object missing"
     return True, key, "pub: anonymous, no ACL"
+
+
+# --------------------------------------------------------------------------------------------
+# Default plugin view (docs/plugins.md §6): with GATE_DEFAULT_VIEW_PREFIX set, a signed-in
+# visitor's top-level navigation to an HTML artifact they may read opens that plugin's page for
+# the artifact (e.g. the canvas, which shows the artifact in a sandboxed iframe) instead of the
+# bare file. Decided after the read was allowed, never instead of it.
+# --------------------------------------------------------------------------------------------
+_HTML_SUFFIXES = (".html", ".htm")
+_DEFAULT_VIEW_ROOTS = ("u/", "g/")
+
+
+def _single_header(headers, name):
+    """The value of a header the request carries exactly once (spaces around it removed), else
+    None (absent or repeated)."""
+    values = headers.get_all(name) if headers is not None else None
+    if not values or len(values) != 1:
+        return None
+    return values[0].strip()
+
+
+def is_top_level_navigation(headers):
+    """True for a browser's top-level navigation: exactly one `Sec-Fetch-Dest: document` and
+    exactly one `Sec-Fetch-Mode: navigate`. An iframe (`Sec-Fetch-Dest: iframe`), an embed, a
+    subresource, a fetch, and a client that sends no Sec-Fetch-* header at all (curl, scripts)
+    are not."""
+    return (_single_header(headers, "Sec-Fetch-Dest") == "document"
+            and _single_header(headers, "Sec-Fetch-Mode") == "navigate")
+
+
+def default_view_location(method, uri, key, headers, prefix=None):
+    """The redirect to the default plugin view for one ALLOWED read, or None to serve it as is.
+
+    The caller asks only after the read was allowed: /_gate/auth after decide() allowed it and
+    the object exists, /_gate/pub-auth after its anonymous decision allowed it, and then only
+    for a visitor with a valid session. A refused read never gets here, so its answer is the one
+    it gets with no default view, and the redirect tells nobody that an artifact exists unless
+    they may read it. A redirect needs all of:
+      - a default view (GATE_DEFAULT_VIEW_PREFIX, or `prefix`);
+      - method GET (HEAD and every other method: unchanged);
+      - a forwarded URI with no query (RAW_VIEW_QUERY, `?raw=1`, is the opt-out: the read is
+        served as the plain page; any other query is refused as before);
+      - a key, decoded once (and valid UTF-8), under u/, g/ or a pub prefix, inside an artifact
+        root, never a key the gate does not serve, whose last segment ends in .html or .htm (any
+        case);
+      - a top-level navigation (is_top_level_navigation);
+      - the request's host (X-Forwarded-Host, else Host) is PUBLIC_HOST: never a redirect that
+        moves the visitor to another host.
+    The Location is absolute, because Traefik's forwardAuth resolves a relative one against the
+    gate's own address. It is built from configuration and the decided key only:
+    <GATE_PUBLIC_SCHEME>://<PUBLIC_HOST><prefix><bucket>/<key>, the key percent-encoded once
+    with only '/' kept (as canonical_artifact_path), so the plugin's single decode gives the
+    decided key back. Nothing else from the request (its host, its raw path, a query) is
+    written into it, so it can only ever point at this host's plugin page for this artifact."""
+    prefix = DEFAULT_VIEW_PREFIX if prefix is None else prefix
+    if not prefix or method != "GET":
+        return None
+    target = split_forwarded_uri(uri)
+    if target is None or target[1] is not None:
+        return None
+    path = target[0]
+    if not path.startswith(BUCKET_PATH):
+        return None
+    try:
+        decoded = urllib.parse.unquote(path[len(BUCKET_PATH):], errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if decoded != key or _bad_key(key) or acl_key_for(key) is None:
+        return None
+    if not key.startswith(_DEFAULT_VIEW_ROOTS + PUB_PREFIXES):
+        return None
+    if not key.rsplit("/", 1)[-1].lower().endswith(_HTML_SUFFIXES):
+        return None
+    if not is_top_level_navigation(headers):
+        return None
+    host = (headers.get("X-Forwarded-Host") or headers.get("Host") or "").split(",")[0]
+    if host.strip().lower() != PUBLIC_HOST.lower():
+        return None
+    loc = (f"{PUBLIC_SCHEME}://{PUBLIC_HOST}{prefix}{BUCKET_PATH[1:]}"
+           f"{urllib.parse.quote(key, safe='/')}")
+    if any(not "!" <= ch <= "~" for ch in loc):
+        return None                                   # unreachable: quote() leaves none
+    return loc
 
 
 # The one `reason` a denied visitor is told (docs/plugins.md §1), whatever decide() said:
@@ -1426,6 +1561,15 @@ class GateHandler(BaseHTTPRequestHandler):
         self._display_name = display_name_from_auth_headers(hdrs, email.lower())
         return email.lower(), groups, None
 
+    def _signed_in(self):
+        """True when the request carries a session (or bearer token) the proxy accepts, for an
+        identity the gate does not refuse. Without a Cookie or Authorization header the proxy is
+        not asked; no session, a refused identity and a proxy error are all False. Used only by
+        the default plugin view on /_gate/pub-auth, never for a decision."""
+        if not (self.headers.get("Cookie") or self.headers.get("Authorization")):
+            return False
+        return self._authenticate()[2] is None
+
     # -- pages ---------------------------------------------------------------------
     def _page(self, title, body, status=200):
         return (f"<!doctype html><meta charset=utf-8><title>{html.escape(title)}</title>"
@@ -1516,6 +1660,13 @@ class GateHandler(BaseHTTPRequestHandler):
                                               "<p>S3 request headers are not accepted here.</p>"))
         verdict, key, _acl = self._authz_for(uri)
         if verdict == "allow":
+            # the default plugin view (default_view_location): asked only now, after the read was
+            # allowed for this signed-in visitor, so every refusal below is the same answer as
+            # with no default view. The redirect carries no signature.
+            loc = default_view_location(method, uri, key, self.headers)
+            if loc is not None:
+                LOG.info("authz user=%s key=%s default view -> %s", self._email, key, loc)
+                return self._send(302, b"", "text/plain", extra={"Location": loc})
             # the proxy's upstream read is signed by the gate (see upstream_auth_headers); the
             # Host is the one the proxy will pass through to MinIO
             host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
@@ -1547,7 +1698,13 @@ class GateHandler(BaseHTTPRequestHandler):
         /_gate/auth. Everything else: one uniform answer, the same status, headers and body for
         a missing key, a key whose pub root has an ACL, a listing, an .acl.json, a key outside
         pub/, a malformed path, a write and a client S3 header, GET and HEAD alike, and never
-        a redirect to a login."""
+        a redirect to a login.
+
+        The one other answer is the default plugin view (default_view_location) of an ALLOWED
+        read: a 302 to the plugin's page, only for a visitor whose session is valid (_signed_in,
+        asked only once every other condition holds). The decision itself still asks no
+        identity: a visitor without a session, with a session the proxy refuses or while the
+        proxy fails gets the plain page, as before."""
         allowed, key, reason = pub_auth_decision(method, uri, MINIO, int(time.time()),
                                                  header_names=list(self.headers.keys()))
         if allowed:
@@ -1555,6 +1712,11 @@ class GateHandler(BaseHTTPRequestHandler):
                     or PUBLIC_HOST).split(",")[0].strip()
             sig = upstream_auth_headers(method, host, uri, READ_ACCESS_KEY, READ_SECRET_KEY)
             if sig is not None:
+                loc = default_view_location(method, uri, key, self.headers)
+                if loc is not None and self._signed_in():
+                    LOG.info("pub-auth key=%s allowed=True default view (signed in) -> %s",
+                             key, loc)
+                    return self._send(302, b"", "text/plain", extra={"Location": loc})
                 LOG.info("pub-auth key=%s allowed=True reason=%s", key, reason)
                 return self._send(200, b"ok", "text/plain", extra=sig)
             reason = "not signable"     # unreachable: the decision refuses what this refuses

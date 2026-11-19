@@ -157,6 +157,7 @@ plugins:
     service: artifact-canvas
     port: 8080
     namespace: sso        # optional, defaults to the gate's namespace
+    defaultView: false    # optional boolean, true on at most one plugin: see §6
 ```
 
 - Routes are matched **above** the artifact routes (higher priority), so a plugin owns
@@ -223,6 +224,84 @@ Both read the same config: `ARTIFACTS_PLUGINS="canvas=/_canvas/;other=/_other/"`
 `<read_base><plugin prefix><bucket>/<key>` — the plugin is responsible for what it does
 with the path it receives (it must then authorize it via §1).
 
+## 6. Default view
+
+One plugin may be the **default view** of HTML artifacts: a signed-in visitor who opens an
+HTML artifact lands on that plugin's page for it (the link of §5, `<prefix><bucket>/<key>`)
+instead of the bare file. The canvas uses it so that a report opens with its annotations one
+click away; its page shows the artifact itself in a sandboxed iframe.
+
+```yaml
+plugins:
+  - name: canvas
+    pathPrefix: /_canvas/
+    service: artifact-canvas
+    port: 8080
+    defaultView: true     # a boolean, false when absent; true on at most one plugin
+```
+
+The chart turns it into the gate's `GATE_DEFAULT_VIEW_PREFIX` (the compose stack:
+`ARTIFACTS_DEFAULT_VIEW_PREFIX`), and refuses a value that is not a boolean or a second plugin
+with `true`. Absent or `false` everywhere, the default: the gate renders and answers exactly as
+before.
+
+**When the gate redirects.** The gate answers an artifact read with `302` and
+`Location: https://<PUBLIC_HOST><prefix><bucket>/<key>`, instead of signing it, only when all
+of these hold:
+
+1. the read was **allowed**: the visitor may read the artifact and it exists. The redirect is
+   decided after the ACL, never instead of it;
+2. the visitor has a valid session. An allowed read on the forwardAuth decision
+   (`/_gate/auth`) always has one. On the anonymous `pub/` decision (`/_gate/pub-auth`, when
+   `pub/` goes through the gate) the gate asks the login proxy, and only once every other
+   condition holds; without a session, with a refused one or while the proxy fails, the page
+   is served plain;
+3. the method is `GET`;
+4. the request is a top-level navigation: exactly one `Sec-Fetch-Dest: document` and exactly
+   one `Sec-Fetch-Mode: navigate`;
+5. the key is under `u/`, `g/` or a pub prefix, inside an artifact root, and its last segment
+   ends in `.html` or `.htm` (any case);
+6. the request has no query string;
+7. the request's host (`X-Forwarded-Host`, else `Host`) is `PUBLIC_HOST`.
+
+**Unchanged:** `HEAD`, iframes (`Sec-Fetch-Dest: iframe`, the plugin's own frame of the
+artifact), subresources, fetches, clients that send no `Sec-Fetch-*` (curl, scripts), every
+other file, every other host, visitors without a session (an anonymous `pub/` read stays the
+plain page, since the plugin would ask them to sign in), and every refusal: a denied, missing,
+malformed or refused read gets the answer it gets without a default view, status, headers and
+body alike. So the redirect never tells anyone that an artifact exists unless they may read it.
+
+**Opt-out: `?raw=1`.** While a default view is set, the query string `raw=1`, exactly that text
+and nothing beside it, is signed and passed to the store (which ignores it), and the read is
+served as the plain page. Every other query is still refused (`404`); with no default view
+`raw=1` is refused too. A plugin links to `<artifact link>?raw=1` to offer the original.
+
+**The `Location`** is absolute, because Traefik's forwardAuth resolves a relative one against
+the gate's own address. Its scheme (`GATE_PUBLIC_SCHEME`, `https`; the compose stack sets
+`http`) and host (`PUBLIC_HOST`) are configuration, its prefix is the plugin's route prefix
+(the gate refuses to start on anything else, a core path included), and the rest is the
+decided key, percent-encoded once with only `/` kept: a single decode by the plugin gives the
+key back. Nothing else from the request (its host, its raw path, a query) is written into it.
+The `302` carries `Cache-Control: no-store` and no signature.
+
+**Where it does not apply.** With anonymous `pub/` served straight from the store
+(`artifactsGate.anonymousPubEnabled` with `anonymousPubThroughGate: false`, the chart's
+default) the gate never sees a `pub/` read, so `pub/` artifacts open plain. With
+`anonymousPubThroughGate: true`, or with anonymous `pub/` off, they follow the rules above.
+Browsers send `Sec-Fetch-*` only to HTTPS and `localhost` origins, and browsers without Fetch
+Metadata send none: those visitors get the plain page.
+
+**What the plugin must do.**
+
+- Serve `<prefix><bucket>/<key>` for every HTML artifact a visitor may read, authorizing it
+  through §1 like any other request.
+- Show the artifact in an iframe of `/<bucket>/<key>` (never redirected: `Sec-Fetch-Dest:
+  iframe`) or through its own frame route. Never send the top-level window to the bare artifact
+  link without `?raw=1`: that comes straight back to the plugin.
+- A browser that already holds a fresh cached copy of the artifact may show it on a top-level
+  navigation without asking (the store's own caching headers); the `302` itself is never
+  cached.
+
 ## Rules for plugin authors (summary)
 
 1. Never re-implement the decision. Call `POST /_gate/plugin/authz` (§1).
@@ -232,3 +311,5 @@ with the path it receives (it must then authorize it via §1).
 5. Do not serve artifact content yourself; the core already does, with the CSP sandbox.
 6. Do not trust client-supplied identity headers; identity exists only as far as the
    gate's answer says.
+7. As the default view (§6), serve the artifact in an iframe or your own frame route, and link
+   to `?raw=1` for the plain page; never navigate the top-level window to the bare link.

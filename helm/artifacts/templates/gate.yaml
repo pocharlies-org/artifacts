@@ -55,6 +55,24 @@
 {{- fail (printf "gate.requestCaps.%s must be a whole number from 1 to 999999, got %v" $name $v) }}
 {{- end }}
 {{- end }}
+{{- /* Default plugin view (docs/plugins.md §6): plugins[].defaultView, a boolean, true on at
+       most one plugin. Absent or false everywhere (the default): GATE_DEFAULT_VIEW_PREFIX is not
+       rendered and the gate serves every read as before. The prefix itself is checked by
+       plugins-routes.yaml (same list), and by the gate at start. */ -}}
+{{- $defaultView := "" }}
+{{- range $p := .Values.plugins }}
+{{- if hasKey $p "defaultView" }}
+{{- if not (kindIs "bool" $p.defaultView) }}
+{{- fail (printf "plugin %v: defaultView must be a boolean (true or false), got %v" $p.name $p.defaultView) }}
+{{- end }}
+{{- if $p.defaultView }}
+{{- if $defaultView }}
+{{- fail (printf "plugin %v: defaultView is already true on the plugin with pathPrefix %s; at most one plugin may be the default view" $p.name $defaultView) }}
+{{- end }}
+{{- $defaultView = $p.pathPrefix | toString }}
+{{- end }}
+{{- end }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -110,6 +128,10 @@ spec:
               value: {{ $caps.perRequester | toString | quote }}
             - name: GATE_OWNER_PENDING_MAX
               value: {{ $caps.ownerPending | toString | quote }}
+            {{- with $defaultView }}
+            - name: GATE_DEFAULT_VIEW_PREFIX
+              value: {{ . | quote }}
+            {{- end }}
             - name: MINIO_ACCESS_KEY
               valueFrom:
                 secretKeyRef: {name: {{ .Values.gate.s3SecretName }}, key: access-key}
