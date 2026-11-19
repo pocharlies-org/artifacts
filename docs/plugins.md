@@ -266,8 +266,9 @@ of these hold:
    ends in `.html` or `.htm` (any case);
 6. the request has no query string;
 7. the request's host (`X-Forwarded-Host`, else `Host`) is `PUBLIC_HOST`;
-8. the plugin answered its health check (below). This is asked last, after every other
-   condition, and on `/_gate/pub-auth` after the session.
+8. the plugin answered its health check (below). This is a read of the last result, never a
+   request: on `/_gate/auth` it comes after every other condition; on `/_gate/pub-auth` it
+   comes before the session, so a plugin that is down costs no login-proxy call.
 
 **Unchanged:** `HEAD`, iframes (`Sec-Fetch-Dest: iframe`, the plugin's own frame of the
 artifact), subresources, fetches, clients that send no `Sec-Fetch-*` (curl, scripts), every
@@ -290,14 +291,16 @@ rollout order and after the default view is turned off. Every other query is sti
 - a fixed request: `GET`, no cookie, no `Authorization`, no visitor header of any kind;
 - 2xx is up; any other status, a redirect (never followed), an error, or no status line within
   1 s in total is down. Only the status is used: the body is never read or logged;
-- one probe per 5 s per gate, started by a request that would redirect, in the background:
-  no request waits for it. Until the first result, and while the last one is down or older
-  than 15 s, the read is served plain;
+- one background thread per gate probes every 5 s for as long as the gate runs, whatever the
+  traffic; a request only reads the last result, so none waits and none sends anything.
+  The read is served plain while the last result is down, before the first result (the
+  first moments after the gate starts), and when the last result is older than 15 s (a
+  probe thread that stopped);
 - the gate logs the first result and every change between up and down.
 
 The check proves the plugin is **reachable, not that it is authentic**: a service that answers
-2xx there is trusted exactly as much as without the check. After the plugin goes down, a few
-seconds of redirects to it can still happen (one probe interval).
+2xx there is trusted exactly as much as without the check. After the plugin goes down, up to
+about 6 s of redirects to it can still happen (one probe interval plus the deadline).
 
 **The `Location`** is absolute, because Traefik's forwardAuth resolves a relative one against
 the gate's own address. Its scheme (`GATE_PUBLIC_SCHEME`, `https`; the compose stack sets

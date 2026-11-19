@@ -58,7 +58,8 @@ once a read is allowed, a signed-in visitor's top-level navigation (GET, Sec-Fet
 Sec-Fetch-Mode: navigate) to an .html/.htm artifact under u/, g/ or pub/, on PUBLIC_HOST, with no
 query, is answered 302 to <scheme>://PUBLIC_HOST<prefix><bucket>/<key> instead of being signed
 (default_view_location), while that plugin answers GET <prefix>healthz on its Service
-(DefaultViewHealth: 1 s, cached 5 s; down or unknown means the plain page). Iframes, subresources,
+(DefaultViewHealth: probed every 5 s by a background thread, 1 s deadline; down or unknown means
+the plain page). Iframes, subresources,
 HEAD, clients without Sec-Fetch-*, other files and every refusal are unchanged. `?raw=1`, exactly,
 is signed and served as the plain page, with or without a default view.
 
@@ -968,36 +969,39 @@ def default_view_location(method, uri, key, headers, prefix=None):
 
 
 # Health of the default view's plugin (docs/plugins.md §6). Times in seconds.
-DEFAULT_VIEW_HEALTH_TTL = 5.0        # a result is used this long before a new probe starts
+DEFAULT_VIEW_HEALTH_TTL = 5.0        # the refresher probes this often
 DEFAULT_VIEW_HEALTH_DEADLINE = 1.0   # total time one probe may take, connect to status line
 DEFAULT_VIEW_HEALTH_MAX_AGE = 15.0   # a result older than this is unknown (the plain page)
-DEFAULT_VIEW_HEALTH_MAX_WORKERS = 4  # probe threads alive at once; above it: down
+DEFAULT_VIEW_HEALTH_MAX_WORKERS = 4  # probe I/O threads alive at once; above it: down
 # How long the default view waits for the login proxy on /_gate/pub-auth (_signed_in): shorter
 # than a decision's 10 s, because the read it would redirect needs no session at all.
 SIGNED_IN_TIMEOUT = 2
 
 
 class DefaultViewHealth:
-    """Whether the default view's plugin answers its health check: a cached answer, never a wait.
+    """Whether the default view's plugin answers its health check, kept fresh by one background
+    thread so that no request ever waits for it.
 
-    available() answers from the last probe result and, when that result is older than `ttl`,
-    starts one new probe in the background: at most one probe per `ttl` (single flight; a caller
-    that cannot take the lock at once, or finds a probe started less than `ttl` ago, starts
-    nothing and uses the last result). With no result yet (the first requests after start-up),
-    or a result older than `max_age`, the answer is False: unknown means the plain page. No
-    request ever waits for a probe, and nothing is probed until a request would redirect.
+    start() runs ONE daemon refresher thread (main() starts it when a default view is set; a
+    second call does nothing). It probes at once, then every `ttl` seconds, for as long as the
+    gate runs, whatever the traffic. A pass that raises is recorded as down and the loop goes
+    on. available() is a plain read of the last result: True only when it was up and is younger
+    than `max_age`. So the answer is False (unknown: the plain page) only in the first moments
+    after start, and again if the refresher stopped (max_age is the guard against a dead or
+    stuck refresher).
 
-    One probe is `GET <path>` to http://<host>:<port>, all three from configuration
-    (GATE_DEFAULT_VIEW_HEALTH_URL), nothing from a request: no Cookie, Authorization,
-    X-Forwarded-* or other visitor header, only Host, Accept-Encoding and a fixed User-Agent.
-    http.client follows no redirect and uses no proxy from the environment, so a 3xx is simply
-    not a 2xx. Only the status line and headers are read; the body never is, and is never
-    logged. 2xx is up; any other status, any exception, and no status within `deadline` seconds
-    IN TOTAL are down: the request runs in a worker thread the prober joins for `deadline`,
-    then the prober shuts the socket down, so a server that drips one byte at a time cannot hold
-    it longer. At most `max_workers` worker threads are alive at once; above that the answer is
-    down until they end. The first result and every change of state are logged (up or down,
-    with the status code or the exception class); nothing else is.
+    One probe (probe_once) is `GET <path>` to http://<host>:<port>, all three from
+    configuration (GATE_DEFAULT_VIEW_HEALTH_URL), nothing from a request: no Cookie,
+    Authorization, X-Forwarded-* or other visitor header, only Host, Accept-Encoding and a fixed
+    User-Agent. http.client follows no redirect and uses no proxy from the environment, so a
+    3xx is simply not a 2xx. Only the status line and headers are read; the body never is, and
+    is never logged. 2xx is up; any other status, any exception, and no status within `deadline`
+    seconds IN TOTAL are down: the request runs in a worker thread joined for `deadline`, then
+    its socket is shut down (or the worker drops it, if it connects later), so a server that
+    drips one byte at a time cannot hold it longer. At most `max_workers` worker threads are
+    alive at once; above that a probe is down without a request. The first result and every
+    change of state are logged (up or down, with the status code or the exception class);
+    nothing else is.
 
     This proves the plugin is reachable, not that it is authentic: a service that answers 2xx
     there is trusted exactly as much as with no health check."""
@@ -1011,11 +1015,12 @@ class DefaultViewHealth:
         self._max_workers = DEFAULT_VIEW_HEALTH_MAX_WORKERS if max_workers is None else max_workers
         self._clock = clock
         self._lock = threading.Lock()
-        self._state = None          # (up, monotonic start time of the probe that found it)
-        self._started = None        # start time of the last probe
-        self._seq = self._done = 0  # last probe started / last probe whose result was kept
+        self._state = None          # (up, clock() when the probe that found it started)
         self._workers = 0
+        self._refresher = None
+        self._stop = threading.Event()
         self.probes = 0             # probes started (for tests and debugging)
+        self.results = 0            # results recorded
 
     def target(self):
         return f"http://{self._host}:{self._port}{self._path}"
@@ -1026,49 +1031,54 @@ class DefaultViewHealth:
         return None if st is None else (st[0], self._clock() - st[1])
 
     def available(self):
-        now = self._clock()
         st = self._state
-        if st is None or now - st[1] >= self._ttl:
-            self._maybe_start(now)
-        return bool(st is not None and st[0] and now - st[1] < self._max_age)
+        return bool(st is not None and st[0] and self._clock() - st[1] < self._max_age)
 
-    def _maybe_start(self, now):
-        if not self._lock.acquire(blocking=False):
-            return
-        try:
-            if self._started is not None and now - self._started < self._ttl:
-                return
-            self._started = now
-            self._seq += 1
-            seq = self._seq
-            stuck = self._workers >= self._max_workers
-            if not stuck:
-                self._workers += 1
-                self.probes += 1
-        finally:
-            self._lock.release()
-        if stuck:
-            self._record(seq, now, False, "earlier probes still running")
-            return
-        try:
-            threading.Thread(target=self._probe, args=(seq, now), name="default-view-health",
-                             daemon=True).start()
-        except RuntimeError as e:                    # no thread to spare: down, never raise
-            self._worker_done()
-            self._record(seq, now, False, type(e).__name__)
-
-    def _worker_done(self):
+    def start(self):
+        """Start the refresher thread (once)."""
         with self._lock:
-            self._workers -= 1
+            if self._refresher is not None:
+                return
+            self._refresher = threading.Thread(target=self._refresh_loop,
+                                               name="default-view-health-refresh", daemon=True)
+        self._refresher.start()
 
-    def _probe(self, seq, started):
-        box = {}
+    def stop(self):
+        """Stop the refresher after its current pass (tests; the gate never stops it)."""
+        self._stop.set()
+
+    def _refresh_loop(self):
+        while True:
+            self.refresh_once()
+            if self._stop.wait(self._ttl):
+                return
+
+    def refresh_once(self):
+        """One probe, recorded. Never raises."""
+        started = self._clock()
+        try:
+            up, why = self.probe_once()
+        except Exception as e:  # noqa: BLE001 - the refresher must outlive any failure
+            up, why = False, type(e).__name__
+        self._record(started, up, why)
+
+    def probe_once(self):
+        """(up, why) of one health request; see the class docstring."""
+        with self._lock:
+            if self._workers >= self._max_workers:
+                return False, "earlier probes still running"
+            self._workers += 1
+            self.probes += 1
+        box, abandoned = {}, threading.Event()
         conn = http.client.HTTPConnection(self._host, self._port, timeout=self._deadline)
 
         def work():
             try:
+                conn.connect()
+                if abandoned.is_set():
+                    return                                  # connected after the deadline
                 conn.request("GET", self._path, headers={"User-Agent": "artifact-gate"})
-                box["status"] = conn.getresponse().status       # the body is never read
+                box["status"] = conn.getresponse().status   # the body is never read
             except Exception as e:  # noqa: BLE001 - every failure means down
                 box["error"] = type(e).__name__
             finally:
@@ -1078,38 +1088,32 @@ class DefaultViewHealth:
         worker = threading.Thread(target=work, name="default-view-health-io", daemon=True)
         try:
             worker.start()
-        except RuntimeError as e:
+        except RuntimeError as e:                           # no thread to spare: down
             self._worker_done()
-            self._record(seq, started, False, type(e).__name__)
-            return
+            return False, type(e).__name__
         worker.join(self._deadline)
         if worker.is_alive():
-            self._record(seq, started, False, f"no answer within {self._deadline:g} s")
-            self._shutdown(conn)
-            worker.join(self._deadline)      # a connect still under way ends by its own timeout
-            self._shutdown(conn)
-            return
+            abandoned.set()
+            sock = getattr(conn, "sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            return False, f"no answer within {self._deadline:g} s"
         if "status" in box:
-            self._record(seq, started, 200 <= box["status"] < 300, f"HTTP {box['status']}")
-        else:
-            self._record(seq, started, False, box.get("error", "error"))
+            return 200 <= box["status"] < 300, f"HTTP {box['status']}"
+        return False, box.get("error", "error")
 
-    @staticmethod
-    def _shutdown(conn):
-        sock = getattr(conn, "sock", None)
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-
-    def _record(self, seq, started, up, why):
+    def _worker_done(self):
         with self._lock:
-            if seq <= self._done:
-                return                                   # a newer probe already answered
-            self._done = seq
+            self._workers -= 1
+
+    def _record(self, started, up, why):
+        with self._lock:
             before = self._state
             self._state = (up, started)
+            self.results += 1
         if before is None or before[0] != up:
             (LOG.info if up else LOG.warning)("default view target %s %s (%s)", self.target(),
                                               "up" if up else "down", why)
@@ -1120,9 +1124,9 @@ DEFAULT_VIEW_HEALTH = (DefaultViewHealth(*DEFAULT_VIEW_HEALTH_TARGET)
 
 
 def default_view_available():
-    """True when the default view's plugin answered its health check recently (see
-    DefaultViewHealth); False when there is no default view, while it is down, and while
-    unknown. Called last, only for a read that would otherwise be redirected."""
+    """True when the default view's plugin answered its last health check, recently (see
+    DefaultViewHealth); False when there is no default view, while it is down and while
+    unknown. A read of the refresher's last result: it never waits and sends nothing."""
     health = DEFAULT_VIEW_HEALTH
     return health is not None and health.available()
 
@@ -1847,9 +1851,9 @@ class GateHandler(BaseHTTPRequestHandler):
         if verdict == "allow":
             # the default plugin view (default_view_location): asked only now, after the read was
             # allowed for this signed-in visitor, so every refusal below is the same answer as
-            # with no default view; its plugin's health last (default_view_available), and
-            # while it is down or unknown the read is served plain. The redirect carries no
-            # signature.
+            # with no default view; then its plugin's health (default_view_available, the
+            # refresher's last result), and while it is down or unknown the read is served
+            # plain. The redirect carries no signature.
             loc = default_view_location(method, uri, key, self.headers)
             if loc is not None and default_view_available():
                 LOG.info("authz user=%s key=%s default view -> %s", self._email, key, loc)
@@ -1888,12 +1892,13 @@ class GateHandler(BaseHTTPRequestHandler):
         a redirect to a login.
 
         The one other answer is the default plugin view (default_view_location) of an ALLOWED
-        read: a 302 to the plugin's page, only for a visitor whose session is valid (_signed_in,
-        asked only once every other condition holds, at most SIGNED_IN_TIMEOUT seconds) and only
-        while the plugin answers its health check (asked last). The decision itself still asks
-        no identity: a visitor without a session, with a session the proxy refuses, while the
-        proxy fails or is slow, and while the plugin is down get the plain page, as before. The
-        redirect is best effort."""
+        read: a 302 to the plugin's page, only while the plugin answers its health check (a read
+        of the refresher's last result, asked first, so a plugin that is down costs no
+        login-proxy call) and only for a visitor whose session is valid (_signed_in, asked last,
+        at most SIGNED_IN_TIMEOUT seconds). The decision itself still asks no identity: a
+        visitor without a session, with a session the proxy refuses, while the proxy fails or is
+        slow, and while the plugin is down get the plain page, as before. The redirect is best
+        effort."""
         allowed, key, reason = pub_auth_decision(method, uri, MINIO, int(time.time()),
                                                  header_names=list(self.headers.keys()))
         if allowed:
@@ -1902,7 +1907,7 @@ class GateHandler(BaseHTTPRequestHandler):
             sig = upstream_auth_headers(method, host, uri, READ_ACCESS_KEY, READ_SECRET_KEY)
             if sig is not None:
                 loc = default_view_location(method, uri, key, self.headers)
-                if loc is not None and self._signed_in() and default_view_available():
+                if loc is not None and default_view_available() and self._signed_in():
                     LOG.info("pub-auth key=%s allowed=True default view (signed in) -> %s",
                              key, loc)
                     return self._send(302, b"", "text/plain", extra={"Location": loc})
@@ -2680,6 +2685,12 @@ def main():
              ANONYMOUS_PUB_ENABLED, PLUGIN_PREFIX)
     # Two listeners (see module docstring): the decision endpoint lives ONLY on the auth one.
     public_server, auth_server = _build_servers()
+    if DEFAULT_VIEW_HEALTH is not None:
+        # the default view's health check: one refresher thread, from the start, whatever the
+        # traffic (DefaultViewHealth); until its first result every read is served plain
+        LOG.info("default view: prefix=%s health=%s every %gs (deadline %gs)", DEFAULT_VIEW_PREFIX,
+                 DEFAULT_VIEW_HEALTH.target(), DEFAULT_VIEW_HEALTH_TTL, DEFAULT_VIEW_HEALTH_DEADLINE)
+        DEFAULT_VIEW_HEALTH.start()
     threading.Thread(target=auth_server.serve_forever, daemon=True).start()
     LOG.info("listening: public=%d (request-access) forwardAuth=%d (decision endpoint)",
              LISTEN_PORT, AUTH_LISTEN_PORT)
