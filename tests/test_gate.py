@@ -713,6 +713,31 @@ class ConditionalGrantTest(unittest.TestCase):
                              (False, "acl unreadable: malformed JSON"), (field, value))
             self.assertEqual(m.puts, [], (field, value))
 
+    def test_expires_the_gate_cannot_read_takes_no_grant(self):
+        # an `expires` that is set but not a readable date makes the ACL unusable for the write
+        # path too: nothing written, whatever its type
+        for value in ("garbage", "2020/01/01", 1577836800, True, ["2020-01-01"],
+                      {"date": "2020-01-01"}):
+            acl = {"owner": "o@x.com", "users": [], "groups": [], "expires": value}
+            m = FakeMinio({"u/x/.acl.json": json.dumps(acl).encode()})
+            self.assertEqual(gate.grant_access(m, "/artifacts/u/x/a.html", "n@x.com"),
+                             (False, "acl unreadable: malformed JSON"), value)
+            self.assertEqual(m.puts, [], value)
+
+    def test_acl_nested_too_deep_to_parse_takes_no_grant(self):
+        # json.loads raises RecursionError (not a ValueError) past its nesting limit: the write
+        # path reads that like any ACL that is not JSON
+        deep = b'{"owner": ' + b"[" * 100_000 + b"]" * 100_000 + b"}"
+        m = FakeMinio({"u/x/.acl.json": deep})
+        self.assertEqual(gate.read_acl_for_write(m, "u/x/.acl.json"),
+                         (None, None, gate.ACL_MALFORMED))
+        with mock.patch.object(gate.json, "loads", side_effect=RecursionError):
+            self.assertEqual(gate.read_acl_for_write(m, "u/x/.acl.json"),
+                             (None, None, gate.ACL_MALFORMED))
+            self.assertEqual(gate.grant_access(m, "/artifacts/u/x/a.html", "n@x.com"),
+                             (False, "acl unreadable: malformed JSON"))
+        self.assertEqual(m.puts, [])
+
     def test_no_etag_means_no_write(self):
         class NoEtag(FakeMinio):
             def get_with_etag(self, key):
@@ -1557,6 +1582,39 @@ class AclRootTest(unittest.TestCase):
             else:
                 self.assertEqual(got, (acl, None), (field, value))
                 gate.decide("a@x.com", ["g"], "u/r/x.html", got[0], NOW)     # never raises
+
+    def test_read_acl_refuses_an_expires_it_cannot_read(self):
+        # `expires` set but not a date _parse_expires reads (any other type, or a string in
+        # another format): (None, ACL_MALFORMED), so it closes the artifact instead of being
+        # ignored as "no expiry"; unset, empty and readable values are read as before
+        bad = [5, 1577836800, 1.5, True, ["2020-01-01"], {"date": "2020-01-01"}, "garbage",
+               "never", "0", "2020/01/01", "01-01-2020", "2020-13-01", " 2020-01-01",
+               "2020-01-01 "]
+        good = [(None, (True, "user")), ("", (True, "user")), (0, (True, "user")),
+                (False, (True, "user")), ("2020-01-01", (False, "expired")),
+                ("2999-12-31", (True, "user")), ("2999-12-31T10:00:00+02:00", (True, "user")),
+                ("2999-12-31T10:00:00", (True, "user"))]
+        for value, want in [(v, None) for v in bad] + good:
+            acl = {"owner": "o@x.com", "users": ["a@x.com"], "groups": ["g"], "expires": value}
+            m = FakeMinio({"u/r/.acl.json": json.dumps(acl).encode()})
+            got = gate.read_acl(m, "u/r/x.html", NOW, bypass_cache=True)
+            if want is None:
+                self.assertEqual(got, (None, gate.ACL_MALFORMED), value)
+            else:
+                self.assertEqual(got, (acl, None), value)
+                self.assertEqual(gate.decide("a@x.com", [], "u/r/x.html", got[0], NOW),
+                                 want, value)
+
+    def test_read_acl_refuses_an_acl_nested_too_deep_to_parse(self):
+        # json.loads raises RecursionError, not ValueError, past its nesting limit; that ACL is
+        # unusable like one that is not JSON, never an error that ends the request
+        deep = b'{"owner": ' + b"[" * 100_000 + b"]" * 100_000 + b"}"
+        m = FakeMinio({"u/r/.acl.json": deep})
+        self.assertEqual(gate.read_acl(m, "u/r/x.html", NOW, bypass_cache=True),
+                         (None, gate.ACL_MALFORMED))
+        with mock.patch.object(gate.json, "loads", side_effect=RecursionError):
+            self.assertEqual(gate.read_acl(m, "u/r/x.html", NOW, bypass_cache=True),
+                             (None, gate.ACL_MALFORMED))
 
     def test_read_acl_reads_the_root_never_a_nested_acl(self):
         m = FakeMinio({"u/r/.acl.json": json.dumps(self.ROOT_ACL).encode(),
