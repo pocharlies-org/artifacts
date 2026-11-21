@@ -155,6 +155,9 @@ gate:
 #       service: artifact-canvas
 #       port: 8080
 #       namespace: sso            # optional; defaults to namespaces.sso
+#       defaultView: false        # optional boolean, true on at most one plugin: a signed-in
+#                                 # visitor opening an HTML artifact lands on this plugin's page
+#                                 # for it (docs/plugins.md §6); `?raw=1` keeps the plain page
 plugins: []
 
 # ---- bootstrap Job (bucket, ILM, policies, users) ---------------------------------------

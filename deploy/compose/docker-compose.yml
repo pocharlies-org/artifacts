@@ -14,6 +14,11 @@
 #   GATE_ACL_CACHE_SECONDS   gate ACL cache (default 15; plugins testing revocation lower it)
 #   ARTIFACTS_PUB_MODE       anonymous pub/ route: direct (default, straight to MinIO) or gate
 #                            (the gate's anonymous decision first; e2e.sh checks either)
+#   ARTIFACTS_DEFAULT_VIEW_PREFIX  the route prefix of the plugin that opens HTML artifacts by
+#                            default (e.g. /_canvas/; empty = off), docs/plugins.md §6
+#   ARTIFACTS_DEFAULT_VIEW_HEALTH_URL  that plugin's health URL, set with the prefix:
+#                            http://<service>:<port><prefix>healthz (e.g.
+#                            http://canvas:8080/_canvas/healthz)
 name: artifacts
 services:
   minio:
@@ -125,6 +130,10 @@ services:
       GATE_ANONYMOUS_PUB_ENABLED: "true"
       GATE_AUTH_PORT: "8081"
       GATE_ACL_CACHE_SECONDS: ${GATE_ACL_CACHE_SECONDS:-15}
+      # default plugin view (off when empty); this stack is plain HTTP, so its redirect is http://
+      GATE_DEFAULT_VIEW_PREFIX: ${ARTIFACTS_DEFAULT_VIEW_PREFIX:-}
+      GATE_DEFAULT_VIEW_HEALTH_URL: ${ARTIFACTS_DEFAULT_VIEW_HEALTH_URL:-}
+      GATE_PUBLIC_SCHEME: http
       HMAC_KEY_FILE: /secrets/hmac-key
     volumes:
       - ../../gate/gate.py:/app/gate.py:ro

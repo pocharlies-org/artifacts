@@ -55,6 +55,40 @@
 {{- fail (printf "gate.requestCaps.%s must be a whole number from 1 to 999999, got %v" $name $v) }}
 {{- end }}
 {{- end }}
+{{- /* Default plugin view (docs/plugins.md §6): plugins[].defaultView, a boolean, true on at
+       most one plugin. Absent or false everywhere (the default): neither GATE_DEFAULT_VIEW_PREFIX
+       nor GATE_DEFAULT_VIEW_HEALTH_URL is rendered. Set: the prefix, and the plugin Service's
+       health URL http://<service>.<namespace>.svc.cluster.local:<port><pathPrefix>healthz the
+       gate checks before it redirects (built from the same entry, no new value). The prefix is
+       checked by plugins-routes.yaml (same list), and both by the gate at start. */ -}}
+{{- $defaultView := "" }}
+{{- $defaultViewHealth := "" }}
+{{- range $p := .Values.plugins }}
+{{- if hasKey $p "defaultView" }}
+{{- if not (kindIs "bool" $p.defaultView) }}
+{{- fail (printf "plugin %v: defaultView must be a boolean (true or false), got %v" $p.name $p.defaultView) }}
+{{- end }}
+{{- if $p.defaultView }}
+{{- if $defaultView }}
+{{- fail (printf "plugin %v: defaultView is already true on the plugin with pathPrefix %s; at most one plugin may be the default view" $p.name $defaultView) }}
+{{- end }}
+{{- $defaultView = $p.pathPrefix | toString }}
+{{- $svc := $p.service | default "" | toString }}
+{{- $ns := default $.Values.namespaces.sso $p.namespace | toString }}
+{{- $port := $p.port | default "" | toString }}
+{{- if not (regexMatch "^[a-z]([a-z0-9-]*[a-z0-9])?$" $svc) }}
+{{- fail (printf "plugin %v: defaultView needs service to be a Service name (^[a-z]([a-z0-9-]*[a-z0-9])?$), got %q" $p.name $svc) }}
+{{- end }}
+{{- if not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $ns) }}
+{{- fail (printf "plugin %v: defaultView needs namespace to be a namespace name, got %q" $p.name $ns) }}
+{{- end }}
+{{- if not (and (regexMatch "^[1-9][0-9]{0,4}$" $port) (le (atoi $port) 65535)) }}
+{{- fail (printf "plugin %v: defaultView needs port to be a port number (1-65535), got %q" $p.name $port) }}
+{{- end }}
+{{- $defaultViewHealth = printf "http://%s.%s.svc.cluster.local:%s%shealthz" $svc $ns $port $defaultView }}
+{{- end }}
+{{- end }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -110,6 +144,12 @@ spec:
               value: {{ $caps.perRequester | toString | quote }}
             - name: GATE_OWNER_PENDING_MAX
               value: {{ $caps.ownerPending | toString | quote }}
+            {{- if $defaultView }}
+            - name: GATE_DEFAULT_VIEW_PREFIX
+              value: {{ $defaultView | quote }}
+            - name: GATE_DEFAULT_VIEW_HEALTH_URL
+              value: {{ $defaultViewHealth | quote }}
+            {{- end }}
             - name: MINIO_ACCESS_KEY
               valueFrom:
                 secretKeyRef: {name: {{ .Values.gate.s3SecretName }}, key: access-key}

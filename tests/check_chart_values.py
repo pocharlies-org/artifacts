@@ -14,9 +14,12 @@ from values), the route that keeps /_gate/plugin/ off the public gate listener, 
 example login-proxy image (digest-pinned, v7.15.5 or newer, the same image the compose stack
 runs), the names written into Traefik rules: artifactsHost, artifactsExtraHosts and
 plugins[].pathPrefix (a safe charset only, so a backtick can never rewrite a rule),
-minio.bucket (an S3 bucket name only, for the same reason), and the gate's request-access
-caps (gate.requestCaps, whole numbers only). Every refusal the chart
-makes for these values is exercised too. Stdlib only.
+minio.bucket (an S3 bucket name only, for the same reason), the gate's request-access
+caps (gate.requestCaps, whole numbers only), and plugins[].defaultView (a boolean on at most
+one plugin; it renders the gate's GATE_DEFAULT_VIEW_PREFIX and GATE_DEFAULT_VIEW_HEALTH_URL,
+the plugin Service's healthz, nothing when absent or false, and the compose stack leaves it
+off). Every refusal the chart makes for these values is exercised
+too. Stdlib only.
 """
 import json
 import os
@@ -284,6 +287,39 @@ for bucket in ("team-reports.v2", "abc", "a" * 63, "1artifacts9"):
     check(gate_env(documents(out)[("Deployment", "artifact-gate")]).get("GATE_BUCKET") == bucket,
           "set: minio.bucket %s reaches the gate's GATE_BUCKET" % bucket[:20])
 
+# ---- the default plugin view: plugins[].defaultView -> the gate's GATE_DEFAULT_VIEW_PREFIX --
+check(not any(v in default for v in ("GATE_DEFAULT_VIEW_PREFIX", "GATE_DEFAULT_VIEW_HEALTH_URL",
+                                     "GATE_PUBLIC_SCHEME")),
+      "default: no default plugin view (no prefix, no health URL, no GATE_PUBLIC_SCHEME)")
+check("GATE_DEFAULT_VIEW" not in ok_render(),
+      "default: no plugins, no default plugin view")
+OTHER = {"name": "other", "pathPrefix": "/_other/v1/", "service": "o-svc", "port": 80,
+         "namespace": "plugins"}
+CANVAS_HEALTH = "http://artifact-canvas.sso.svc.cluster.local:8080/_canvas/healthz"
+OTHER_HEALTH = "http://o-svc.plugins.svc.cluster.local:80/_other/v1/healthz"
+for plugins, want, health in (
+        ([dict(PLUGIN[0], defaultView=True)], "/_canvas/", CANVAS_HEALTH),
+        ([dict(PLUGIN[0], defaultView=False)], None, None),
+        ([dict(PLUGIN[0], defaultView=False), dict(OTHER, defaultView=True)], "/_other/v1/", OTHER_HEALTH),
+        ([dict(PLUGIN[0], defaultView=True), OTHER], "/_canvas/", CANVAS_HEALTH),
+        ([dict(PLUGIN[0], defaultView=True, namespace="artifacts")], "/_canvas/",
+         "http://artifact-canvas.artifacts.svc.cluster.local:8080/_canvas/healthz"),
+        ([PLUGIN[0], dict(OTHER, defaultView=False)], None, None)):
+    out = ok_render({"plugins": plugins})
+    env = gate_env(documents(out)[("Deployment", "artifact-gate")])
+    check(env.get("GATE_DEFAULT_VIEW_PREFIX") == want and out.count("GATE_DEFAULT_VIEW_PREFIX") == (1 if want else 0),
+          "set: plugins %s render GATE_DEFAULT_VIEW_PREFIX=%s" % (json.dumps(plugins), want))
+    check(env.get("GATE_DEFAULT_VIEW_HEALTH_URL") == health
+          and out.count("GATE_DEFAULT_VIEW_HEALTH_URL") == (1 if health else 0),
+          "set: and GATE_DEFAULT_VIEW_HEALTH_URL=%s (the same plugin's Service healthz)" % health)
+    check("GATE_PUBLIC_SCHEME" not in out, "set: the chart never renders GATE_PUBLIC_SCHEME (https)")
+with open(COMPOSE) as f:
+    compose = f.read()
+check("      GATE_DEFAULT_VIEW_PREFIX: ${ARTIFACTS_DEFAULT_VIEW_PREFIX:-}\n" in compose
+      and "      GATE_DEFAULT_VIEW_HEALTH_URL: ${ARTIFACTS_DEFAULT_VIEW_HEALTH_URL:-}\n" in compose
+      and "      GATE_PUBLIC_SCHEME: http\n" in compose,
+      "compose: default plugin view off unless ARTIFACTS_DEFAULT_VIEW_PREFIX is set; plain-HTTP scheme")
+
 # ---- refusals ----------------------------------------------------------------------------
 OP = "oauth2Proxy"
 refusals = [
@@ -360,6 +396,29 @@ refusals = [
     for b in ("artifacts`) || PathPrefix(`/", "artifacts`) || Host(`evil.example", "artifacts)",
               "artifacts`", "Artifacts", "ab", "a" * 64, "-artifacts", "artifacts-", ".artifacts",
               "art_ifacts", "art ifacts", "artifacts/x", "artifacts\n", "", 123, True, None)
+] + [
+    # plugins[].defaultView: a boolean, true on at most one plugin
+    ({"plugins": [dict(PLUGIN[0], defaultView=v)]}, "defaultView must be a boolean")
+    for v in ("true", "false", "yes", 1, 0, "", [True], {"on": True}, None)
+] + [
+    ({"plugins": [dict(PLUGIN[0], defaultView=True),
+                  {"name": "other", "pathPrefix": "/_other/", "service": "s", "port": 80,
+                   "defaultView": True}]}, "at most one plugin may be the default view"),
+    ({"plugins": [dict(PLUGIN[0], defaultView=True, pathPrefix="/_gate/x/")]},
+     "collides with the reserved core path"),
+    ({"plugins": [dict(PLUGIN[0], defaultView=True, pathPrefix="/_x/`) || PathPrefix(`/")]},
+     "may only hold lowercase letters"),
+] + [
+    # the health URL is built from the same entry: a Service name, a namespace, a port
+    ({"plugins": [dict(PLUGIN[0], defaultView=True, service=v)]}, "defaultView needs service")
+    for v in ("Artifact-Canvas", "canvas.evil.example", "canvas:80", "canvas/x", "canvas@evil",
+              "-canvas", "1canvas")
+] + [
+    ({"plugins": [dict(PLUGIN[0], defaultView=True, namespace=v)]}, "defaultView needs namespace")
+    for v in ("Sso", "sso.evil", "sso/x", "-sso")
+] + [
+    ({"plugins": [dict(PLUGIN[0], defaultView=True, port=v)]}, "defaultView needs port")
+    for v in (0, 65536, -1, "80/x", "http", 80.5)
 ]
 for values, needle in refusals:
     rc, _, err = render(values)

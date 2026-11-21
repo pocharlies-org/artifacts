@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+import socket
 import sys
 import tempfile
 import threading
@@ -1955,3 +1956,523 @@ class RefusedIdentityTest(unittest.TestCase):
         for email in ("alice@example.org", "ext@example.org", "a#ex#t@example.org", "#ext@x.org",
                       "", None):
             self.assertFalse(gate.refused_identity(email), email)
+
+
+class DefaultViewTest(unittest.TestCase):
+    """The default plugin view (docs/plugins.md §6): with GATE_DEFAULT_VIEW_PREFIX set, an
+    allowed, signed-in, top-level navigation to an HTML artifact is redirected to that plugin's
+    page for it; every other read, and every refusal, is what it is without it."""
+
+    HOST = "artifacts.example.com"           # PUBLIC_HOST of this suite (the gate's default)
+    BASE = "https://artifacts.example.com/_canvas/artifacts/"
+
+    def _load(self, **env):
+        return ReadSigningUserTest._load(self, **env)
+
+    @staticmethod
+    def hdrs(dest="document", mode="navigate", host=HOST, extra=()):
+        m = http.client.HTTPMessage()
+        for name, value in (("Sec-Fetch-Dest", dest), ("Sec-Fetch-Mode", mode),
+                            ("X-Forwarded-Host", host)):
+            if value is not None:
+                m[name] = value
+        for name, value in extra:
+            m[name] = value                   # appends: a repeated header stays repeated
+        return m
+
+    def loc(self, key, method="GET", uri=None, headers=None, prefix="/_canvas/"):
+        uri = "/artifacts/" + urllib.parse.quote(key, safe="/") if uri is None else uri
+        return gate.default_view_location(method, uri, key,
+                                          self.hdrs() if headers is None else headers,
+                                          prefix=prefix)
+
+    # -- configuration -----------------------------------------------------------------
+    HEALTH = "http://artifact-canvas.sso.svc.cluster.local:8080/_canvas/healthz"
+
+    def test_off_by_default(self):
+        self.assertEqual((gate.DEFAULT_VIEW_PREFIX, gate.PUBLIC_SCHEME), ("", "https"))
+        self.assertEqual((gate.DEFAULT_VIEW_HEALTH_TARGET, gate.DEFAULT_VIEW_HEALTH), (None, None))
+        self.assertFalse(gate.default_view_available())
+        self.assertIsNone(gate.default_view_location(
+            "GET", "/artifacts/u/run/index.html", "u/run/index.html", self.hdrs()))
+
+    def test_config_is_read_and_checked_at_start(self):
+        mod = self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/", GATE_DEFAULT_VIEW_HEALTH_URL=self.HEALTH)
+        self.assertEqual((mod.DEFAULT_VIEW_PREFIX, mod.PUBLIC_SCHEME), ("/_canvas/", "https"))
+        self.assertEqual(mod.DEFAULT_VIEW_HEALTH_TARGET,
+                         ("artifact-canvas.sso.svc.cluster.local", 8080, "/_canvas/healthz"))
+        self.assertEqual(mod.DEFAULT_VIEW_HEALTH.target(), self.HEALTH)
+        self.assertEqual(mod.DEFAULT_VIEW_HEALTH.probes, 0)            # nothing probed at start
+        mod = self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/v2/", GATE_PUBLIC_SCHEME="http",
+                         PUBLIC_HOST="127.0.0.1:8080",
+                         GATE_DEFAULT_VIEW_HEALTH_URL="http://canvas:8080/_canvas/v2/healthz")
+        self.assertEqual((mod.DEFAULT_VIEW_PREFIX, mod.PUBLIC_SCHEME), ("/_canvas/v2/", "http"))
+        self.assertEqual(mod.default_view_location(
+            "GET", "/artifacts/u/run/index.html", "u/run/index.html",
+            self.hdrs(host="127.0.0.1:8080")),
+            "http://127.0.0.1:8080/_canvas/v2/artifacts/u/run/index.html")
+        # a bad PUBLIC_HOST matters only once a default view is set
+        self.assertEqual(self._load(PUBLIC_HOST="Not A Host/x").DEFAULT_VIEW_PREFIX, "")
+        for bad in ("/_gate/", "/_gate/x/", "/_plugins/", "/_plugins/x/", "/_", "/_g", "/_canvas",
+                    "_canvas/", "/canvas/", "/_Canvas/", "/_can vas/", "/_canvas/../", "/_./",
+                    "/_canvas//", "//evil.example/", "/_canvas/\n", " /_canvas/", "/_can.vas/",
+                    "https://evil.example/_canvas/", "/_canvas/?x=", "/_canvas/#", "/_c%61nvas/"):
+            with self.subTest(prefix=bad), self.assertRaises(RuntimeError):
+                self._load(GATE_DEFAULT_VIEW_PREFIX=bad, GATE_DEFAULT_VIEW_HEALTH_URL=self.HEALTH)
+        for bad in ("", "ftp", "HTTPS", "https:", "javascript", "https://evil.example"):
+            with self.subTest(scheme=bad), self.assertRaises(RuntimeError):
+                self._load(GATE_PUBLIC_SCHEME=bad)
+        for bad in ("", "Artifacts.example.com", "evil.example/x", "a@evil.example", "a b",
+                    "artifacts.example.com.", "-a.example.com", "a.example.com:", "[::1]",
+                    "a.example.com:123456"):
+            with self.subTest(host=bad), self.assertRaises(RuntimeError):
+                self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/", PUBLIC_HOST=bad,
+                           GATE_DEFAULT_VIEW_HEALTH_URL=self.HEALTH)
+
+    def test_health_url_is_checked_at_start(self):
+        # http://<DNS name>:<port><prefix>healthz exactly: never an IP literal, userinfo, another
+        # path (/readyz), a query, a fragment, another scheme or a missing port
+        ok = ("http://canvas:8080/_canvas/healthz", "http://a-b.c-d.svc.cluster.local:1/_canvas/healthz",
+              "http://canvas.example:65535/_canvas/healthz")
+        for url in ok:
+            self.assertEqual(self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/",
+                                        GATE_DEFAULT_VIEW_HEALTH_URL=url).DEFAULT_VIEW_HEALTH.target(), url)
+        for bad in ("", "https://canvas:8080/_canvas/healthz", "HTTP://canvas:8080/_canvas/healthz",
+                    "http://canvas/_canvas/healthz", "http://canvas:/_canvas/healthz",
+                    "http://canvas:0/_canvas/healthz", "http://canvas:65536/_canvas/healthz",
+                    "http://canvas:123456/_canvas/healthz", "http://10.0.0.1:8080/_canvas/healthz",
+                    "http://127.0.0.1:8080/_canvas/healthz", "http://[::1]:8080/_canvas/healthz",
+                    "http://u:p@canvas:8080/_canvas/healthz", "http://u@canvas:8080/_canvas/healthz",
+                    "http://Canvas:8080/_canvas/healthz", "http://canvas.:8080/_canvas/healthz",
+                    "http://-canvas:8080/_canvas/healthz", "http://canvas:8080/_canvas/readyz",
+                    "http://canvas:8080/healthz", "http://canvas:8080/_canvas/healthz/",
+                    "http://canvas:8080/_other/healthz", "http://canvas:8080/_canvas/healthz?x=1",
+                    "http://canvas:8080/_canvas/healthz#x", "http://canvas:8080/_canvas/../healthz",
+                    "http://canvas:8080/_canvas/healthz\n", " http://canvas:8080/_canvas/healthz",
+                    "http://evil.example@canvas:8080/_canvas/healthz", "//canvas:8080/_canvas/healthz",
+                    "file:///_canvas/healthz"):
+            with self.subTest(url=bad), self.assertRaises(RuntimeError):
+                self._load(GATE_DEFAULT_VIEW_PREFIX="/_canvas/", GATE_DEFAULT_VIEW_HEALTH_URL=bad)
+        with self.assertRaises(RuntimeError):            # a health URL without a default view
+            self._load(GATE_DEFAULT_VIEW_HEALTH_URL="http://canvas:8080/_canvas/healthz")
+
+    # -- when it redirects ---------------------------------------------------------------
+    def test_redirects_an_html_artifact_under_u_g_and_pub(self):
+        for key in ("u/run/index.html", "u/run/sub/deep/page.html", "g/team-a/run/index.html",
+                    "pub/run/index.html", "pub/flat-0123abcd.html", "u/run/REPORT.HTML",
+                    "u/run/old.htm"):
+            self.assertEqual(self.loc(key), self.BASE + key, key)
+        # the host compare ignores case (DNS); the Location uses PUBLIC_HOST as configured
+        self.assertEqual(self.loc("u/run/index.html", headers=self.hdrs(host="ARTIFACTS.example.COM")),
+                         self.BASE + "u/run/index.html")
+        # no X-Forwarded-Host: the Host header is the request's host
+        m = self.hdrs(host=None)
+        m["Host"] = self.HOST
+        self.assertEqual(self.loc("u/run/index.html", headers=m), self.BASE + "u/run/index.html")
+
+    def test_top_level_navigation_only(self):
+        self.assertTrue(gate.is_top_level_navigation(self.hdrs()))
+        self.assertTrue(gate.is_top_level_navigation(self.hdrs(dest=" document ", mode="navigate ")))
+        for dest, mode in (("iframe", "navigate"), ("frame", "navigate"), ("embed", "no-cors"),
+                           ("object", "no-cors"), ("empty", "cors"), ("document", "cors"),
+                           ("document", "no-cors"), ("document", "same-origin"), ("script", "no-cors"),
+                           ("image", "no-cors"), ("style", "no-cors"), ("Document", "navigate"),
+                           ("document", "Navigate"), ("document", None), (None, "navigate"),
+                           (None, None), ("", ""), ("document,iframe", "navigate")):
+            with self.subTest(dest=dest, mode=mode):
+                self.assertFalse(gate.is_top_level_navigation(self.hdrs(dest=dest, mode=mode)))
+                self.assertIsNone(self.loc("u/run/index.html", headers=self.hdrs(dest=dest, mode=mode)))
+        for extra in ((("Sec-Fetch-Dest", "document"),), (("Sec-Fetch-Dest", "iframe"),),
+                      (("Sec-Fetch-Mode", "navigate"),)):
+            with self.subTest(repeated=extra):     # a repeated header is not one navigation
+                self.assertIsNone(self.loc("u/run/index.html", headers=self.hdrs(extra=extra)))
+        self.assertFalse(gate.is_top_level_navigation(None))
+
+    def test_no_redirect_for_any_other_request(self):
+        key = "u/run/index.html"
+        self.assertEqual(self.loc(key), self.BASE + key)                         # control
+        self.assertIsNone(self.loc(key, prefix=""))                              # feature off
+        for method in ("HEAD", "POST", "PUT", "DELETE", "OPTIONS", "get"):
+            self.assertIsNone(self.loc(key, method=method), method)
+        for q in ("?raw=1", "?raw=0", "?x=1", "?", "?acl"):
+            self.assertIsNone(self.loc(key, uri="/artifacts/u/run/index.html" + q), q)
+        for other in ("u/run/data.json", "u/run/app.css", "u/run/app.js", "u/run/pic.png",
+                      "u/run/pic.svg", "u/run/index.html.txt", "u/run/index.htmlx",
+                      "u/run/index", "u/run/html", "u/run/.html/x.css", "pub/run/report.pdf"):
+            self.assertIsNone(self.loc(other), other)
+        for outside in ("acl/x.html", "x.html", "u/x.html", "g/team-a/x.html", "other/run/x.html",
+                        "_plugins/canvas/u/run/index.html", "_gate/x.html", "_mcp/x.html",
+                        "u/run/.acl.json", "u/run/", "u/run//x.html", "u/run/../x.html"):
+            self.assertIsNone(self.loc(outside), outside)
+        for host in ("evil.example", "artifacts.example.com.evil.example", "", None,
+                     "evil.example, artifacts.example.com", "artifacts.example.com:8443"):
+            self.assertIsNone(self.loc(key, headers=self.hdrs(host=host)), host)
+        # the decided key must be what the path decodes to, once, as valid UTF-8
+        self.assertIsNone(self.loc("u/run/index.html", uri="/artifacts/u/run/other.html"))
+        self.assertIsNone(self.loc("u/run/�.html", uri="/artifacts/u/run/%ff.html"))
+        self.assertIsNone(self.loc("u/run/%69ndex.html", uri="/artifacts/u/run/%69ndex.html"))
+        for uri in ("//evil.example/artifacts/u/run/index.html", "/artifacts/u/run/index.html#x",
+                    "http://evil.example/artifacts/u/run/index.html", "artifacts/u/run/index.html",
+                    "/artifacts/u/run/in dex.html", "/other/u/run/index.html"):
+            self.assertIsNone(self.loc("u/run/index.html", uri=uri), uri)
+
+    def test_location_is_this_host_and_the_decided_key_only(self):
+        # open-redirect shapes in the key itself: the Location keeps PUBLIC_HOST, the plugin
+        # prefix and the bucket, carries no query or fragment, and decodes back to the key
+        keys = ("u/run/@evil.example.html", "u/run/%2F%2Fevil.example.html",
+                "u/run/\\\\evil.example\\x.html", "u/run/a b?c#d.html", "u/run/é ü.html",
+                "u/run/x\r\nSet-Cookie: a=b.html", "u/run/javascript:alert(1).html",
+                "u/run/https:%2F%2Fevil.example.html", "u/run/;x=1.html", "u/run/%00.html",
+                "pub/run/x‮.html", "g/team-a/run/&a=b+c.html")
+        for key in keys:
+            with self.subTest(key=key):
+                loc = self.loc(key)
+                self.assertIsNotNone(loc)
+                self.assertTrue(all("!" <= ch <= "~" for ch in loc), loc)
+                parts = urllib.parse.urlsplit(loc)
+                self.assertEqual((parts.scheme, parts.netloc, parts.query, parts.fragment),
+                                 ("https", self.HOST, "", ""))
+                self.assertTrue(parts.path.startswith("/_canvas/artifacts/"), loc)
+                self.assertEqual(urllib.parse.unquote(parts.path[len("/_canvas/artifacts/"):]), key)
+                self.assertEqual(loc, "https://" + self.HOST + "/_canvas"
+                                 + gate.canonical_artifact_path("/artifacts/" + urllib.parse.quote(key)))
+
+    # -- the opt-out: ?raw=1 -------------------------------------------------------------
+    def test_raw_query_is_the_one_signed_query_whatever_the_flag(self):
+        # `raw=1`, exactly, is signed with or without a default view (a plugin's link to the
+        # plain page must keep working in any rollout order); nothing else is, either way
+        uri = "/artifacts/u/run/index.html?raw=1"
+        for prefix in ("", "/_canvas/"):
+            with self.subTest(default_view=prefix), \
+                    mock.patch.object(gate, "DEFAULT_VIEW_PREFIX", prefix):
+                self.assertEqual(gate._allowed_query_pairs("raw=1"), [("raw", "1")])
+                h = gate.upstream_auth_headers("GET", "h", uri, "AK", "SK", amzdate="20260101T000000Z")
+                want = gate.sigv4_headers("GET", "h", "/artifacts/u/run/index.html", [("raw", "1")],
+                                          None, b"", "AK", "SK", amzdate="20260101T000000Z")
+                bare = gate.sigv4_headers("GET", "h", "/artifacts/u/run/index.html", [], None, b"",
+                                          "AK", "SK", amzdate="20260101T000000Z")
+                self.assertEqual(h["Authorization"], want["Authorization"])
+                self.assertNotEqual(h["Authorization"], bare["Authorization"])
+                for q in ("raw=0", "raw=2", "raw=", "raw", "RAW=1", "Raw=1", "raw=01", "raw=1 ",
+                          "raw=%31", "%72aw=1", "raw=1&raw=1", "raw=1&acl", "acl&raw=1", "raw=1;",
+                          "raw=1&", "&raw=1", "raw=1#", "raw=true", "raw=1&lambdaArn=x", "",
+                          "raw= 1", "raw=1%26a", "raw=1;x", "response-content-type=text/plain",
+                          "raw=1&response-content-type=text/plain", "X-Amz-Expires=60"):
+                    self.assertIsNone(gate._allowed_query_pairs(q), repr(q))
+                    self.assertIsNone(gate.upstream_auth_headers(
+                        "GET", "h", "/artifacts/u/run/index.html?" + q, "AK", "SK"), repr(q))
+                self.assertEqual(gate._ALLOWED_QUERY_KEYS, frozenset())   # no key allowed besides
+
+    def test_anonymous_pub_decision_takes_raw_whatever_the_flag(self):
+        m = FakeMinio({"pub/run/index.html": b"x"})
+        gate._acl_cache.clear()
+        self.addCleanup(gate._acl_cache.clear)
+        d = lambda uri: gate.pub_auth_decision("GET", uri, m, NOW, enabled=True)[0::2]
+        self.assertEqual(d("/artifacts/pub/run/index.html"), (True, "pub: anonymous, no ACL"))
+        for prefix in ("", "/_canvas/"):
+            with self.subTest(default_view=prefix), \
+                    mock.patch.object(gate, "DEFAULT_VIEW_PREFIX", prefix):
+                self.assertEqual(d("/artifacts/pub/run/index.html?raw=1"),
+                                 (True, "pub: anonymous, no ACL"))
+                for q in ("raw=2", "raw=1&raw=1", "x=1", "", "RAW=1", "raw=%31", "&raw=1",
+                          "raw=1&acl", "raw"):
+                    self.assertEqual(d("/artifacts/pub/run/index.html?" + q),
+                                     (False, "malformed URI or a query"), q)
+                self.assertEqual(d("/artifacts/pub/run/missing.html?raw=1"),
+                                 (False, "object missing"))
+
+
+class _StubPlugin:
+    """A local stand-in for the default view's plugin Service: answers GET <path> the way `mode`
+    says and records every request it gets (method, path, headers)."""
+
+    def __init__(self, mode="up", location=None):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.mode, self.location, self.requests, self.ended = mode, location, [], []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):  # noqa: N802
+                outer.requests.append((self.command, self.path, dict(self.headers)))
+                try:
+                    getattr(outer, "_" + outer.mode.replace("-", "_"))(self)
+                except OSError:
+                    pass
+                finally:
+                    outer.ended.append(time.monotonic())
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+            def handle_error(self, request, client_address):
+                pass                      # a probe that hangs up is expected here
+
+        self.server = Server(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    @staticmethod
+    def _reply(h, status, extra=(), body=b'{"ok":true}'):
+        h.send_response(status)
+        for k, v in extra:
+            h.send_header(k, v)
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+
+    def _up(self, h):
+        h.close_connection = True
+        self._reply(h, 200)
+
+    def _slow_up(self, h):
+        time.sleep(0.3)
+        self._up(h)
+
+    def _down(self, h):
+        self._reply(h, 503, body=b"not ready")
+
+    def _redirect(self, h):
+        self._reply(h, 302, extra=(("Location", self.location),), body=b"")
+
+    def _drip(self, h):
+        # a status line, then one header line every 0.3 s for up to 10 s, never the end
+        h.wfile.write(b"HTTP/1.1 200 OK\r\n")
+        for _ in range(33):
+            h.wfile.write(b"X-Drip: 1\r\n")
+            time.sleep(0.3)
+
+    def _endless_body(self, h):
+        # a 2xx whose body would take minutes: the probe must not wait for it
+        h.send_response(200)
+        h.send_header("Content-Length", str(10 ** 9))
+        h.end_headers()
+        for _ in range(100):
+            h.wfile.write(b"x" * 64)
+            time.sleep(0.1)
+
+
+def _wait_for(cond, timeout=4.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return cond()
+
+
+class DefaultViewHealthTest(unittest.TestCase):
+    """The default view's health check (DefaultViewHealth, docs/plugins.md §6): one refresher
+    thread probes every TTL whatever the traffic; available() only reads its last result. URL
+    from configuration only, fixed GET, no redirect followed, status only, a total deadline,
+    a log line only on a change of state, max_age as the guard against a dead refresher."""
+
+    PATH = "/_canvas/healthz"
+
+    def stub(self, mode="up", **kw):
+        s = _StubPlugin(mode, **kw)
+        self.addCleanup(s.close)
+        return s
+
+    def health(self, stub_or_port, **kw):
+        port = stub_or_port if isinstance(stub_or_port, int) else stub_or_port.port
+        kw.setdefault("deadline", 1.0)
+        h = gate.DefaultViewHealth("127.0.0.1", port, self.PATH, **kw)
+        self.addCleanup(h.stop)
+        return h
+
+    def refreshers(self):
+        return [t for t in threading.enumerate()
+                if t.name == "default-view-health-refresh" and t.is_alive()]
+
+    # -- one probe ---------------------------------------------------------------------
+    def test_up_and_the_request_it_sends(self):
+        s = self.stub("up")
+        h = self.health(s)
+        self.assertEqual((h.probes, h.state()), (0, None))   # nothing probed until started
+        self.assertFalse(h.available())                       # unknown: the plain page
+        self.assertEqual(h.probe_once(), (True, "HTTP 200"))
+        method, path, headers = s.requests[0]
+        self.assertEqual((method, path), ("GET", self.PATH))  # GET of the configured path only
+        self.assertEqual(sorted(k.lower() for k in headers),
+                         ["accept-encoding", "host", "user-agent"])   # nothing of a visitor
+        self.assertEqual(headers["Host"], f"127.0.0.1:{s.port}")
+
+    def test_down_answers(self):
+        free = socket.socket()
+        free.bind(("127.0.0.1", 0))
+        closed_port = free.getsockname()[1]
+        free.close()
+        self.assertEqual(self.health(self.stub("down")).probe_once(), (False, "HTTP 503"))
+        self.assertEqual(self.health(closed_port).probe_once(), (False, "ConnectionRefusedError"))
+        h = gate.DefaultViewHealth("no-such-host.invalid", 8080, self.PATH, deadline=0.5)
+        self.assertFalse(h.probe_once()[0])                   # a name that does not resolve
+
+    def test_redirect_is_down_and_never_followed(self):
+        other = self.stub("up")
+        s = self.stub("redirect", location=f"http://127.0.0.1:{other.port}{self.PATH}")
+        self.assertEqual(self.health(s).probe_once(), (False, "HTTP 302"))
+        self.assertEqual((len(s.requests), len(other.requests)), (1, 0))   # target saw nothing
+
+    def test_slow_drip_is_cut_at_the_total_deadline(self):
+        s = self.stub("drip")
+        h = self.health(s, deadline=1.0)
+        t0 = time.monotonic()
+        self.assertEqual(h.probe_once(), (False, "no answer within 1 s"))
+        self.assertLess(time.monotonic() - t0, 1.3)           # 1 s in total, not per read
+        # the connection is cut, so the stub's handler ends and no worker is left behind
+        self.assertTrue(_wait_for(lambda: s.ended and h._workers == 0, 3.0))
+        self.assertLess(s.ended[0] - t0, 2.5)
+
+    def test_a_2xx_is_up_without_reading_the_body(self):
+        h = self.health(self.stub("endless-body"))
+        t0 = time.monotonic()
+        self.assertEqual(h.probe_once(), (True, "HTTP 200"))
+        self.assertLess(time.monotonic() - t0, 0.8)
+
+    def test_stuck_probes_are_bounded_and_nothing_raises(self):
+        s = self.stub("up")
+        h = self.health(s, max_workers=2)
+        with h._lock:
+            h._workers = 2                                    # two probes still alive
+        self.assertEqual(h.probe_once(), (False, "earlier probes still running"))
+        self.assertEqual((h.probes, len(s.requests)), (0, 0)) # no third one started
+        with h._lock:
+            h._workers = 0
+        with mock.patch.object(gate.threading.Thread, "start", side_effect=RuntimeError("x")):
+            self.assertEqual(h.probe_once(), (False, "RuntimeError"))
+        self.assertEqual(h._workers, 0)
+
+    # -- the refresher -------------------------------------------------------------------
+    def test_refresher_probes_on_a_timer_without_any_request(self):
+        s = self.stub("up")
+        h = self.health(s, ttl=0.2)
+        h.start()
+        h.start()                                             # once: one thread
+        self.assertTrue(_wait_for(lambda: h.probes > 3, 1.5), h.probes)
+        self.assertEqual(len(self.refreshers()), 1)
+        self.assertTrue(h.available())                        # the first candidate redirects
+        h.stop()
+        self.assertTrue(_wait_for(lambda: not self.refreshers(), 2.0))
+
+    def test_idle_longer_than_max_age_still_redirects(self):
+        # the gate has been idle for minutes: the refresher kept the result fresh, so a
+        # candidate after 60 s with no other request finds the plugin up (fake clock, real thread)
+        clock = [1000.0]
+        s = self.stub("up")
+        h = self.health(s, ttl=0.02, max_age=15.0, clock=lambda: clock[0])
+        h.start()
+        self.assertTrue(_wait_for(lambda: h.results >= 1))
+        for _ in range(6):
+            clock[0] += 60.0
+            n = h.results
+            self.assertTrue(_wait_for(lambda: h.results >= n + 2))   # a pass after the jump
+            self.assertTrue(h.available())
+
+    def test_down_is_seen_within_a_ttl_and_up_again(self):
+        s = self.stub("up")
+        h = self.health(s, ttl=0.2, deadline=0.5)
+        with self.assertLogs("artifact-gate", "INFO") as logs:
+            h.start()
+            self.assertTrue(_wait_for(h.available))
+            s.mode = "down"
+            t0 = time.monotonic()
+            self.assertTrue(_wait_for(lambda: not h.available(), 2.0))
+            self.assertLess(time.monotonic() - t0, 0.2 + 0.5 + 0.3)   # ttl + deadline
+            n = h.results
+            self.assertTrue(_wait_for(lambda: h.results >= n + 3))    # still down: not logged again
+            s.mode = "up"
+            self.assertTrue(_wait_for(h.available, 2.0))
+            n = h.results
+            self.assertTrue(_wait_for(lambda: h.results >= n + 3))
+        self.assertEqual(["up" if " up (" in m else "down" for m in logs.output], ["up", "down", "up"])
+        self.assertTrue(all("http://127.0.0.1:%d%s" % (s.port, self.PATH) in m for m in logs.output))
+        self.assertTrue(all('"ok"' not in m and "not ready" not in m for m in logs.output))  # no body
+
+    def test_dead_refresher_goes_stale_then_plain(self):
+        clock = [1000.0]
+        s = self.stub("up")
+        h = self.health(s, ttl=0.02, max_age=15.0, clock=lambda: clock[0])
+        h.start()
+        self.assertTrue(_wait_for(h.available))
+        h.stop()
+        self.assertTrue(_wait_for(lambda: not self.refreshers(), 2.0))
+        n = h.results
+        clock[0] += 10.0
+        self.assertTrue(h.available())                        # stale, still within max_age
+        self.assertEqual(h.state(), (True, h.state()[1]))
+        clock[0] += 5.5
+        self.assertFalse(h.available())                       # older than max_age: plain
+        self.assertEqual(h.results, n)                        # nothing probed meanwhile
+
+    def test_refresher_survives_exceptions(self):
+        s = self.stub("up")
+        h = self.health(s, ttl=0.05)
+        calls, real = [], h.probe_once
+
+        def flaky():
+            calls.append(1)
+            if len(calls) <= 2:
+                raise ValueError("boom")
+            return real()
+        h.probe_once = flaky
+        with self.assertLogs("artifact-gate", "INFO") as logs:
+            h.start()
+            self.assertTrue(_wait_for(h.available, 2.0))
+        self.assertEqual(len(self.refreshers()), 1)           # still running
+        self.assertEqual(len(logs.output), 2, logs.output)    # down once, then up once
+        self.assertIn("down (ValueError)", logs.output[0])
+        self.assertIn("up (HTTP 200)", logs.output[1])
+
+
+class MainStartsTheRefresherTest(unittest.TestCase):
+    """main() starts the default view's refresher once, before it serves, and only when a default
+    view is configured; importing the module starts nothing."""
+
+    def run_main(self, health):
+        class Server:
+            gate_mode, served = None, 0
+
+            def serve_forever(self):
+                self.served += 1
+
+        servers = (Server(), Server())
+        with mock.patch.object(gate, "_build_servers", return_value=servers), \
+                mock.patch.object(gate, "DEFAULT_VIEW_HEALTH", health), \
+                mock.patch.object(gate.logging, "basicConfig"):
+            gate.main()
+        return servers
+
+    def test_started_only_when_configured(self):
+        health = mock.Mock(spec=gate.DefaultViewHealth)
+        health.target.return_value = "http://canvas:8080/_canvas/healthz"
+        servers = self.run_main(health)
+        self.assertEqual(health.start.call_count, 1)
+        self.assertEqual(servers[0].served, 1)
+        self.assertIsNone(gate.DEFAULT_VIEW_HEALTH)           # off in this suite: nothing to start
+        self.run_main(None)                                   # and main() runs without one
+        mod = ReadSigningUserTest._load(self, GATE_DEFAULT_VIEW_PREFIX="/_canvas/",
+                                        GATE_DEFAULT_VIEW_HEALTH_URL="http://canvas:8080/_canvas/healthz")
+        self.assertEqual((mod.DEFAULT_VIEW_HEALTH.probes, mod.DEFAULT_VIEW_HEALTH._refresher),
+                         (0, None))                           # import alone starts nothing
+
+
+class BucketNameTest(unittest.TestCase):
+    """GATE_BUCKET is an S3 bucket name, as the chart requires; the gate refuses anything else."""
+
+    def test_checked_at_start(self):
+        for ok in ("artifacts", "team-reports.v2", "abc", "a" * 63, "1artifacts9"):
+            self.assertEqual(ReadSigningUserTest._load(self, GATE_BUCKET=ok).BUCKET, ok)
+        for bad in ("", "ab", "a" * 64, "Artifacts", "-artifacts", "artifacts-", ".artifacts",
+                    "art_ifacts", "art ifacts", "artifacts/x", "artifacts/", "/artifacts",
+                    "artifacts\n", "artifacts`) || PathPrefix(`/"):
+            with self.subTest(bucket=bad), self.assertRaises(RuntimeError):
+                ReadSigningUserTest._load(self, GATE_BUCKET=bad)
