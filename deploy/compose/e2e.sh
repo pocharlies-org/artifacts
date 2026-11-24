@@ -65,7 +65,7 @@ PUB_URL="$BASE/artifacts/pub/$RUN/index.html"
 
 # ---- anonymous pub/ read ---------------------------------------------------------------
 check "anonymous pub read" 200 "$(curl -s -o /dev/null -w '%{http_code}' "$PUB_URL")"
-check "pub CSP sandbox" "sandbox allow-scripts" \
+check "pub CSP sandbox" "sandbox allow-scripts allow-downloads" \
   "$(curl -sI "$PUB_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-security-policy"{print $2}' | tr -d '\r')"
 check "pub nosniff" "nosniff" \
   "$(curl -sI "$PUB_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-content-type-options"{print $2}')"
@@ -134,7 +134,7 @@ if [[ "$PUB_MODE" == gate ]]; then
   ref_head=$(answer HEAD "$MISSING")
   check "gate mode: a missing pub/ key answers 404" 1 "$(printf '%s\n' "$ref_get" | head -1 | grep -c ' 404')"
   check "gate mode: the 404 is the gate's page (text/html)" 1 "$(printf '%s\n' "$ref_get" | grep -ci '^content-type: text/html')"
-  check "gate mode: the 404 carries the sandbox CSP" 1 "$(printf '%s\n' "$ref_get" | grep -ci '^content-security-policy: sandbox allow-scripts$')"
+  check "gate mode: the 404 carries the sandbox CSP" 1 "$(printf '%s\n' "$ref_get" | grep -ci '^content-security-policy: sandbox allow-scripts allow-downloads$')"
   check "gate mode: nothing from MinIO (NoSuchKey, XML, server: MinIO)" 0 "$(printf '%s\n' "$ref_get" | grep -ciE 'NoSuchKey|<\?xml|^server: minio')"
   check "gate mode: no login redirect" 0 "$(printf '%s\n' "$ref_get" | grep -ci '^location:')"
   # (not pub/$RUN/index.html: it was read before its stray ACL was seeded, and the gate's ACL
@@ -201,7 +201,7 @@ for n in 2 3; do
 done
 check "gated read with Bearer id_token" 200 "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL")"
 check "gated HEAD with Bearer id_token" 200 "$(curl -s -o /dev/null -I -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$GATED_URL")"
-check "gated CSP sandbox" "sandbox allow-scripts" \
+check "gated CSP sandbox" "sandbox allow-scripts allow-downloads" \
   "$(curl -sI -H "Authorization: Bearer $TOKEN" "$GATED_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-security-policy"{print $2}')"
 check "gated nosniff" "nosniff" \
   "$(curl -sI -H "Authorization: Bearer $TOKEN" "$GATED_URL" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-content-type-options"{print $2}')"

@@ -17,7 +17,7 @@ the gate is one stdlib-only Python file, and the whole stack runs on plain Kuber
  visitor ──HTTPS── reverse proxy (Traefik / Caddy)
                      ├── /artifacts/**  reads ──forwardAuth──> gate :8081 /_gate/auth ──> oauth2-proxy /auth
                      │        │ allowed ──> MinIO, signed by the gate   denied ──> 302 /oauth2/sign_in
-                     │        └ every response: CSP `sandbox allow-scripts` (opaque origin), nosniff, no-referrer
+                     │        └ every response: CSP `sandbox allow-scripts allow-downloads` (opaque origin), nosniff, no-referrer
                      ├── POST /artifacts/** ──> gate :8080  (request-access, approve, deny)
                      ├── /_gate/** (except auth, healthz, plugin/) ──> gate :8080
                      ├── /oauth2/{sign_in,start,callback,sign_out,static/*} ──> oauth2-proxy (allow-list; rest 404)
@@ -409,10 +409,12 @@ the chart refuses anything else.
 | `oauth2Proxy.extraArgs` | `[]` | only `--allowed-group=<id>` (non-empty id, one entry per group), appended last; any other flag is refused (`--email-domain` and `--trusted-proxy-ip` have their own values) |
 | `gate.resources`, `oauth2Proxy.resources`, `bootstrap.resources` | today's requests and limits | container resources; add `ephemeral-storage` under `requests` and `limits` to bound local disk |
 
-The `artifacts-csp` middleware sends `Content-Security-Policy: sandbox allow-scripts`,
+The `artifacts-csp` middleware sends `Content-Security-Policy: sandbox allow-scripts allow-downloads`,
 `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer` on every artifact read
 (nosniff makes the browser keep the stored `Content-Type`, so publish scripts and styles with
-their real types).
+their real types). A page of an artifact can start downloads (a link to a zip or csv saves the
+file), and it still has no same-origin access (no cookies, storage or same-origin requests), no
+popups and no top navigation.
 
 ## Security notes
 

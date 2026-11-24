@@ -103,8 +103,12 @@ spec:
       # No HTML/JS of an artifact may run in the origin of the host or reach its cookies.
       # `sandbox` alone (no allow-same-origin) blocks same-origin fetch, cookies and storage;
       # allow-scripts is set because artifacts here are self-contained reports with inline JS.
+      # allow-downloads is set so that a link to a file in an artifact (zip, csv, png) saves it.
+      # A download adds no origin access: the page still has no same-origin fetch, cookies or
+      # storage, and no popups or top navigation. allow-same-origin, allow-popups and
+      # allow-top-navigation are NOT set.
       # allow-forms is NOT set, so the gate deny page keeps its own CSP and its form works.
-      Content-Security-Policy: sandbox allow-scripts
+      Content-Security-Policy: sandbox allow-scripts allow-downloads
       X-Content-Type-Options: nosniff
       Referrer-Policy: no-referrer
 ---

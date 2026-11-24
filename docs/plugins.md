@@ -175,8 +175,11 @@ plugins:
 - The core never proxies plugin traffic itself beyond this route, and never rewrites it.
   WebSockets are the plugin's business (the chart route is plain pass-through).
 - A plugin's own pages must not weaken the artifact isolation: artifact content is
-  served with `Content-Security-Policy: sandbox allow-scripts` (opaque origin). Plugin
-  pages hold the user's session; artifact iframes must not gain access to them.
+  served with `Content-Security-Policy: sandbox allow-scripts allow-downloads` (opaque origin).
+  A page of an artifact can start downloads and still has no same-origin access, no popups and
+  no top navigation. Plugin pages hold the user's session; artifact iframes must not gain
+  access to them. A plugin's own frame is not covered by this header: a frame that stays
+  `allow-scripts` only cannot start downloads.
 
 **Local compose stack.** `deploy/compose/` renders the same route with Caddy: a plugin's
 compose file sets `ARTIFACTS_CADDY_PLUGINS="import plugin /_<name>/ <service>:<port>"` (and

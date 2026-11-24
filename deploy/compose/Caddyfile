@@ -40,7 +40,7 @@
 		# never matched and pub/<run>/.acl.json was served anonymously.
 		@pubbad path_regexp bad `\.acl\.json$|/$`
 		respond @pubbad 404
-		header Content-Security-Policy "sandbox allow-scripts"
+		header Content-Security-Policy "sandbox allow-scripts allow-downloads"
 		# `>` sets the header once the upstream has answered, replacing its value: MinIO sends
 		# its own X-Content-Type-Options, which would otherwise appear twice (Traefik's
 		# customResponseHeaders replace it the same way)
@@ -65,7 +65,7 @@
 (pub-gate) {
 	@pub path /artifacts/pub/*
 	handle @pub {
-		header >Content-Security-Policy "sandbox allow-scripts"
+		header >Content-Security-Policy "sandbox allow-scripts allow-downloads"
 		header >X-Content-Type-Options "nosniff"
 		header >Referrer-Policy "no-referrer"
 		forward_auth gate:8081 {
@@ -113,7 +113,7 @@
 				redir "http://127.0.0.1:8080/oauth2/sign_in?rd={uri}" 302
 			}
 		}
-		header Content-Security-Policy "sandbox allow-scripts"
+		header Content-Security-Policy "sandbox allow-scripts allow-downloads"
 		header >X-Content-Type-Options "nosniff"
 		header >Referrer-Policy "no-referrer"
 		reverse_proxy minio:9000 {

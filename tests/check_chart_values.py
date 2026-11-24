@@ -8,9 +8,10 @@ Covered values: ingressRouteAnnotations (on every IngressRoute, plugin routes in
 gate.trustForwardHeader (gate-auth forwardAuth, default false), oauth2Proxy.emailDomains,
 oauth2Proxy.trustedProxyIPs and oauth2Proxy.extraArgs (login proxy flags; no
 --email-domain=* once a domain list is set; extraArgs accepts only a non-empty
---allowed-group), the artifacts-csp response headers, the
-container resources of the gate, the login proxy and the bootstrap Job (ephemeral-storage
-from values), the route that keeps /_gate/plugin/ off the public gate listener, and the
+--allowed-group), the artifacts-csp response headers (its sandbox tokens are checked in
+every successful render), the container resources of the gate, the login proxy and the
+bootstrap Job (ephemeral-storage from values), the route that keeps /_gate/plugin/ off the
+public gate listener, and the
 example login-proxy image (digest-pinned, v7.15.5 or newer, the same image the compose stack
 runs), the names written into Traefik rules: artifactsHost, artifactsExtraHosts and
 plugins[].pathPrefix (a safe charset only, so a backtick can never rewrite a rule),
@@ -48,6 +49,8 @@ def render(values=None):
             json.dump(values, f)          # JSON is YAML: no YAML library needed
         args += ["-f", path]
     p = subprocess.run(args, capture_output=True, text=True)
+    if p.returncode == 0:
+        check_sandbox(p.stdout)
     return p.returncode, p.stdout, p.stderr
 
 
@@ -88,6 +91,37 @@ def block(doc, key, indent):
                 body.append(nxt)
             return body
     return None
+
+
+SANDBOX_TOKENS = ["allow-downloads", "allow-scripts"]   # the whole sandbox policy, nothing more
+csp_renders = 0
+
+
+def check_sandbox(text):
+    """Token ratchet, run on every render that succeeds: the artifacts-csp sandbox policy has
+    exactly the tokens in SANDBOX_TOKENS. The exact string is checked below. This check also
+    fails when a token such as allow-popups is added to the policy and the exact list is
+    edited to match it."""
+    global csp_renders
+    doc = documents(text).get(("Middleware", "artifacts-csp"))
+    if doc is None:
+        sys.exit("FAIL: a render has no Middleware artifacts-csp")
+    lines = block(doc, "customResponseHeaders", 4) or []
+    csp = [ln.strip()[len("Content-Security-Policy:"):].strip() for ln in lines
+           if ln.strip().startswith("Content-Security-Policy:")]
+    if len(csp) != 1:
+        sys.exit("FAIL: artifacts-csp has %d Content-Security-Policy headers, want 1" % len(csp))
+    tokens = csp[0].split()
+    if not tokens or tokens[0] != "sandbox":
+        sys.exit("FAIL: artifacts-csp Content-Security-Policy is not a sandbox policy: %r" % csp[0])
+    policy = tokens[1:]
+    if sorted(policy) != SANDBOX_TOKENS:
+        extra = [t for t in policy if t not in SANDBOX_TOKENS]
+        missing = [t for t in SANDBOX_TOKENS if t not in policy]
+        sys.exit("FAIL: artifacts-csp sandbox tokens are %r, want exactly %r "
+                 "(unexpected: %s; missing: %s)"
+                 % (policy, SANDBOX_TOKENS, ", ".join(extra) or "none", ", ".join(missing) or "none"))
+    csp_renders += 1
 
 
 def annotations(doc):
@@ -172,8 +206,8 @@ check("    trustForwardHeader: false\n" in docs[("Middleware", "gate-auth")],
       "default: gate-auth trustForwardHeader is false")
 csp = block(docs[("Middleware", "artifacts-csp")], "customResponseHeaders", 4)
 check([ln.strip() for ln in csp if not ln.strip().startswith("#")]
-      == ["Content-Security-Policy: sandbox allow-scripts", "X-Content-Type-Options: nosniff",
-          "Referrer-Policy: no-referrer"],
+      == ["Content-Security-Policy: sandbox allow-scripts allow-downloads",
+          "X-Content-Type-Options: nosniff", "Referrer-Policy: no-referrer"],
       "artifacts-csp sends exactly the sandbox CSP, nosniff and no-referrer")
 args = proxy_args(default)
 check([a for a in args if a.startswith("--email-domain")] == ["--email-domain=*"],
@@ -423,4 +457,6 @@ refusals = [
 for values, needle in refusals:
     rc, _, err = render(values)
     check(rc != 0 and needle in err, "refused: %s" % json.dumps(values))
+check(csp_renders > 0, "artifacts-csp sandbox tokens are exactly allow-scripts and allow-downloads "
+                       "in all %d successful renders" % csp_renders)
 print("chart values: all checks passed")
